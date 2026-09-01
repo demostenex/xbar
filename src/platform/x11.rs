@@ -67,6 +67,7 @@ pub struct X11Platform {
     popups: Vec<PopupWindow>,
     audio_popup: Option<AudioPopupWindow>,
     bluetooth_popup: Option<BluetoothPopupWindow>,
+    notification: Option<NotificationWindow>,
     pointer_grabbed: bool,
     bar_hits: Vec<BarHitMap>,
 }
@@ -78,6 +79,7 @@ struct Atoms {
     strut_partial: Atom,
     state: Atom,
     above: Atom,
+    notification: Atom,
     wm_protocols: Atom,
     wm_delete: Atom,
     gtk_unique_bus_name: Atom,
@@ -112,6 +114,11 @@ struct BluetoothPopupWindow {
     rect: layout::MenuRect,
     power: layout::MenuRect,
     devices: Vec<(String, layout::MenuRect)>,
+}
+struct NotificationWindow {
+    window: u32,
+    width: u16,
+    height: u16,
 }
 type BarHitMap = (
     u32,
@@ -151,6 +158,7 @@ pub enum RenderTarget {
     DockRight,
     DockRightPopup,
     Popup,
+    Notification,
     All,
 }
 
@@ -179,6 +187,8 @@ impl RenderTarget {
             (Self::Dock, Self::Popup) | (Self::Popup, Self::Dock) => Self::All,
             (Self::Dock, Self::Dock) => Self::Dock,
             (Self::Popup, Self::Popup) => Self::Popup,
+            (Self::Notification, Self::Notification) => Self::Notification,
+            (Self::Notification, _) | (_, Self::Notification) => Self::All,
         }
     }
 }
@@ -197,6 +207,7 @@ impl X11Platform {
             strut_partial: intern(b"_NET_WM_STRUT_PARTIAL")?,
             state: intern(b"_NET_WM_STATE")?,
             above: intern(b"_NET_WM_STATE_ABOVE")?,
+            notification: intern(b"_NET_WM_WINDOW_TYPE_NOTIFICATION")?,
             wm_protocols: intern(b"WM_PROTOCOLS")?,
             wm_delete: intern(b"WM_DELETE_WINDOW")?,
             instance: intern(b"_XBAR_INSTANCE")?,
@@ -233,6 +244,7 @@ impl X11Platform {
             popups: Vec::new(),
             audio_popup: None,
             bluetooth_popup: None,
+            notification: None,
             pointer_grabbed: false,
             bar_hits: Vec::new(),
         })
@@ -781,8 +793,124 @@ impl X11Platform {
                 self.render_audio_popup(state)?;
             }
         }
+        if matches!(target, RenderTarget::Notification | RenderTarget::All) {
+            self.render_notification(state)?;
+        }
         self.conn.flush()?;
         self.text.flush();
+        Ok(())
+    }
+
+    fn render_notification(&mut self, state: &State) -> Result<(), Box<dyn Error>> {
+        let Some(notification) = state.notifications.last() else {
+            if let Some(notification) = self.notification.take() {
+                self.text.release_drawable(notification.window);
+                self.conn.destroy_window(notification.window)?.check()?;
+            }
+            return Ok(());
+        };
+        let output = state.outputs.first().ok_or("no output for notification")?;
+        let width = 360_u16.min(output.width.max(1));
+        let summary = single_line(&notification.summary);
+        let body = single_line(&notification.body);
+        let height = if body.is_empty() { 64 } else { 88 };
+        let x =
+            (output.x as i32 + output.width as i32 - width as i32 - 10).max(output.x as i32) as i16;
+        let y = output.y + BAR_HEIGHT as i16 + 8;
+        let window = if let Some(window) = &self.notification {
+            window.window
+        } else {
+            let window = self.conn.generate_id()?;
+            self.conn
+                .create_window(
+                    x11rb::COPY_FROM_PARENT as u8,
+                    window,
+                    self.root,
+                    x,
+                    y,
+                    width,
+                    height,
+                    1,
+                    WindowClass::INPUT_OUTPUT,
+                    x11rb::COPY_FROM_PARENT,
+                    &xproto::CreateWindowAux::new()
+                        .background_pixel(BAR_STYLE.popup_background)
+                        .override_redirect(1)
+                        .event_mask(EventMask::EXPOSURE),
+                )?
+                .check()?;
+            self.conn
+                .change_property32(
+                    xproto::PropMode::REPLACE,
+                    window,
+                    self.atoms.window_type,
+                    AtomEnum::ATOM,
+                    &[self.atoms.notification],
+                )?
+                .check()?;
+            self.conn.map_window(window)?.check()?;
+            window
+        };
+        if self
+            .notification
+            .as_ref()
+            .is_some_and(|old| old.width != width || old.height != height)
+        {
+            self.conn
+                .configure_window(
+                    window,
+                    &xproto::ConfigureWindowAux::new()
+                        .x(x as i32)
+                        .y(y as i32)
+                        .width(width as u32)
+                        .height(height as u32),
+                )?
+                .check()?;
+        }
+        self.notification = Some(NotificationWindow {
+            window,
+            width,
+            height,
+        });
+        let geometry = self.conn.get_geometry(window)?.reply()?;
+        let attrs = self.conn.get_window_attributes(window)?.reply()?;
+        self.text
+            .prepare_drawable(window, attrs.visual, geometry.depth)?;
+        let gc = self.conn.generate_id()?;
+        self.conn
+            .create_gc(
+                gc,
+                window,
+                &xproto::CreateGCAux::new().foreground(BAR_STYLE.popup_background),
+            )?
+            .check()?;
+        self.conn.poly_fill_rectangle(
+            window,
+            gc,
+            &[xproto::Rectangle {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }],
+        )?;
+        self.conn.poly_rectangle(
+            window,
+            gc,
+            &[xproto::Rectangle {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }],
+        )?;
+        self.text
+            .draw_popup_utf8(&summary, 12, 25, BAR_STYLE.popup_foreground)?;
+        if !body.is_empty() {
+            self.text
+                .draw_popup_utf8(&body, 12, 52, BAR_STYLE.popup_foreground)?;
+        }
+        self.conn.free_gc(gc)?.check()?;
         Ok(())
     }
 
@@ -2176,6 +2304,15 @@ fn tray_hit(items: &[view::TrayVisualItem], x: i16, y: i16) -> Option<StatusNoti
                 && y < item.rect.y + item.rect.height as i16
         })
         .map(|item| item.endpoint.clone())
+}
+
+fn single_line(text: &str) -> String {
+    text.lines()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(42)
+        .collect()
 }
 
 fn is_xbar_owned_window(

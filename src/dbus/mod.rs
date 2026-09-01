@@ -1,11 +1,12 @@
 use crate::core::{
     format_notifier_item_id, parse_notifier_item_id, BluetoothDevice, BluetoothPendingAction,
     BluetoothState, Event, GtkMenuEndpoint, MenuActionTarget, MenuRegistry, MenuSource,
-    NetworkConnectivity, NetworkLinkKind, NetworkState, StatusNotifierAction,
+    NetworkConnectivity, NetworkLinkKind, NetworkState, NotificationId, StatusNotifierAction,
     StatusNotifierEndpoint, StatusNotifierIcon, StatusNotifierItem, StatusNotifierStatus,
 };
 mod gmenu;
 mod menu;
+use crate::notifications::{self, SharedStore, SharedTimer, REASON_CLOSED, REASON_EXPIRED};
 use async_channel::{Receiver, Sender};
 use futures_lite::StreamExt;
 use std::collections::VecDeque;
@@ -25,6 +26,8 @@ const SNI_NAME: &str = "org.kde.StatusNotifierWatcher";
 const SNI_PATH: &str = "/StatusNotifierWatcher";
 const SNI_INTERFACE: &str = "org.kde.StatusNotifierWatcher";
 const DBUSMENU_INTERFACE: &str = "com.canonical.dbusmenu";
+const NOTIFICATIONS_NAME: &str = "org.freedesktop.Notifications";
+const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 
 #[derive(Clone, Debug)]
 struct LayoutRequest {
@@ -231,6 +234,7 @@ enum Request {
     BluetoothSetPowered(bool),
     BluetoothConnectDevice(String),
     BluetoothDisconnectDevice(String),
+    NotificationTimerFired,
 }
 
 type EventQueue = Arc<Mutex<VecDeque<Event>>>;
@@ -244,6 +248,7 @@ pub struct DbusBridge {
     events: EventQueue,
     _thread: JoinHandle<()>,
     requests: Sender<Request>,
+    notification_timer: SharedTimer,
 }
 
 impl DbusBridge {
@@ -253,13 +258,19 @@ impl DbusBridge {
         writer.set_nonblocking(true)?;
         let events = Arc::new(Mutex::new(VecDeque::new()));
         let (requests, request_receiver) = async_channel::unbounded();
+        let notification_timer = Arc::new(Mutex::new(notifications::DeadlineTimer::new()?));
+        let timer_for_thread = Arc::clone(&notification_timer);
         let thread_events = Arc::clone(&events);
         let thread = thread::Builder::new()
             .name("xbar-dbus".into())
             .spawn(move || {
-                if let Err(error) =
-                    zbus::block_on(run(thread_events, writer, registry, request_receiver))
-                {
+                if let Err(error) = zbus::block_on(run(
+                    thread_events,
+                    writer,
+                    registry,
+                    request_receiver,
+                    timer_for_thread,
+                )) {
                     eprintln!("xbar: DBus adapter stopped: {error}");
                 }
             })?;
@@ -268,11 +279,23 @@ impl DbusBridge {
             events,
             _thread: thread,
             requests,
+            notification_timer,
         })
     }
 
     pub fn raw_fd(&self) -> RawFd {
         self.reader.as_raw_fd()
+    }
+
+    pub fn notification_timer_raw_fd(&self) -> RawFd {
+        self.notification_timer
+            .lock()
+            .expect("notification timer poisoned")
+            .as_raw_fd()
+    }
+
+    pub fn notification_timer_fired(&self) {
+        let _ = self.requests.try_send(Request::NotificationTimerFired);
     }
 
     pub fn drain_events(&mut self) -> io::Result<Vec<Event>> {
@@ -410,6 +433,83 @@ struct Registrar {
     events: EventQueue,
     wake: Arc<Mutex<UnixStream>>,
     registry: Arc<Mutex<MenuRegistry>>,
+}
+
+struct NotificationServer {
+    store: SharedStore,
+    timer: SharedTimer,
+    events: EventQueue,
+    wake: Arc<Mutex<UnixStream>>,
+}
+
+impl NotificationServer {
+    fn publish(&self) {
+        notifications::publish(&self.store, &self.timer, &self.events, &self.wake);
+    }
+}
+
+#[zbus::interface(name = "org.freedesktop.Notifications")]
+impl NotificationServer {
+    async fn get_capabilities(&self) -> Vec<String> {
+        vec!["body".into()]
+    }
+
+    async fn get_server_information(&self) -> (String, String, String, String) {
+        (
+            "xbar".into(),
+            "Demostenes Albert".into(),
+            env!("CARGO_PKG_VERSION").into(),
+            "1.2".into(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn notify(
+        &self,
+        app_name: String,
+        replaces_id: u32,
+        _app_icon: String,
+        summary: String,
+        body: String,
+        _actions: Vec<String>,
+        _hints: HashMap<String, OwnedValue>,
+        expire_timeout: i32,
+    ) -> zbus::fdo::Result<u32> {
+        let id = self
+            .store
+            .lock()
+            .expect("notification store poisoned")
+            .notify(replaces_id, app_name, summary, body, expire_timeout);
+        self.publish();
+        Ok(id.0)
+    }
+
+    async fn close_notification(
+        &self,
+        id: u32,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        let id = NotificationId(id);
+        if self
+            .store
+            .lock()
+            .expect("notification store poisoned")
+            .close(id)
+        {
+            self.publish();
+            NotificationServer::notification_closed(&emitter, id.0, REASON_CLOSED)
+                .await
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[zbus(signal)]
+    async fn notification_closed(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+        id: u32,
+        reason: u32,
+    ) -> zbus::Result<()>;
 }
 
 async fn setup_status_notifier(
@@ -1169,8 +1269,10 @@ async fn run(
     writer: UnixStream,
     registry: Arc<Mutex<MenuRegistry>>,
     requests: Receiver<Request>,
+    notification_timer: SharedTimer,
 ) -> zbus::Result<()> {
     let wake = Arc::new(Mutex::new(writer));
+    let notification_store = Arc::new(Mutex::new(notifications::Store::default()));
     let probe = zbus::Connection::session().await?;
     let probe_dbus = zbus::fdo::DBusProxy::new(&probe).await?;
     let watcher_name: zbus::names::BusName<'_> = SNI_NAME.try_into()?;
@@ -1184,6 +1286,15 @@ async fn run(
             events: Arc::clone(&events),
             wake: Arc::clone(&wake),
             registry: Arc::clone(&registry),
+        },
+    )?;
+    builder = builder.serve_at(
+        NOTIFICATIONS_PATH,
+        NotificationServer {
+            store: Arc::clone(&notification_store),
+            timer: Arc::clone(&notification_timer),
+            events: Arc::clone(&events),
+            wake: Arc::clone(&wake),
         },
     )?;
     if !watcher_exists {
@@ -1202,6 +1313,7 @@ async fn run(
     }
     let connection = builder
         .name(REGISTRAR_NAME)?
+        .name(NOTIFICATIONS_NAME)?
         .allow_name_replacements(false)
         .replace_existing_names(false)
         .build()
@@ -1570,6 +1682,20 @@ async fn run(
                     }
                 } else {
                     eprintln!("xbar: BlueZ Disconnect skipped: system bus unavailable");
+                }
+            }
+            Either::Request(Ok(Request::NotificationTimerFired)) => {
+                let ids =
+                    notifications::expire(&notification_store, &notification_timer, &events, &wake);
+                if !ids.is_empty() {
+                    let emitter = zbus::object_server::SignalEmitter::new(
+                        &connection,
+                        "/org/freedesktop/Notifications",
+                    )?;
+                    for id in ids {
+                        NotificationServer::notification_closed(&emitter, id.0, REASON_EXPIRED)
+                            .await?;
+                    }
                 }
             }
         }
@@ -1955,7 +2081,7 @@ fn install_gmenu_signal_watcher(
         .detach();
 }
 
-fn push_event(events: &EventQueue, wake: &Arc<Mutex<UnixStream>>, event: Event) {
+pub(crate) fn push_event(events: &EventQueue, wake: &Arc<Mutex<UnixStream>>, event: Event) {
     events
         .lock()
         .expect("DBus event queue poisoned")

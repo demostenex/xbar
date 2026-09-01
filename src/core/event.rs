@@ -117,6 +117,7 @@ pub enum Event {
     BluetoothConnectDevice(String),
     BluetoothDisconnectDevice(String),
     BluetoothActionFinished(BluetoothPendingAction),
+    NotificationsSnapshot(Vec<super::Notification>),
     AudioPopupToggled,
     AudioTrackChanged {
         input: bool,

@@ -708,6 +708,14 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.bluetooth_pending.retain(|pending| pending != &action);
             before != state.bluetooth_pending.len()
         }
+        Event::NotificationsSnapshot(notifications) => {
+            if state.notifications == notifications {
+                false
+            } else {
+                state.notifications = notifications;
+                true
+            }
+        }
         Event::AudioUnavailable => {
             let audio = super::AudioState::default();
             let popup_changed = state.audio_popup_open || state.audio_dragging;

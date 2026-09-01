@@ -3,6 +3,7 @@ mod clock;
 mod core;
 mod dbus;
 mod i3;
+mod notifications;
 mod platform;
 mod ui;
 
@@ -102,6 +103,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: dbus.notification_timer_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
         if result < 0 {
@@ -129,6 +135,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         if fds[4].revents & libc::POLLIN != 0 {
             events.extend(audio.drain_events()?);
+        }
+        if fds[5].revents & libc::POLLIN != 0 {
+            dbus.notification_timer_fired();
         }
 
         if events
@@ -926,6 +935,7 @@ fn render_target_for(
         | Event::BluetoothConnectDevice(_)
         | Event::BluetoothDisconnectDevice(_)
         | Event::BluetoothActionFinished(_) => Some(RenderTarget::Popup),
+        Event::NotificationsSnapshot(_) => Some(RenderTarget::Notification),
         Event::StatusNotifierActionRequested { .. } => None,
         _ => Some(RenderTarget::All),
     }

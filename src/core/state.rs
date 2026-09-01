@@ -85,6 +85,17 @@ pub enum BluetoothPendingAction {
     DisconnectDevice(String),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NotificationId(pub u32);
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Notification {
+    pub id: NotificationId,
+    pub app_name: String,
+    pub summary: String,
+    pub body: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum NetworkConnectivity {
     #[default]
@@ -138,6 +149,7 @@ pub struct State {
     pub bluetooth_pending: Vec<BluetoothPendingAction>,
     pub bluetooth_popup_open: bool,
     pub audio_popup_open: bool,
+    pub notifications: Vec<Notification>,
     pub audio_dragging: bool,
     pub audio_drag_input: bool,
     pub status_notifiers: super::StatusNotifierRegistry,
