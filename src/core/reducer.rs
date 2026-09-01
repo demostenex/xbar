@@ -182,6 +182,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.audio_drag_input = false;
             state.audio_drag_input = false;
             state.bluetooth_popup_open = false;
+            state.network_popup_open = false;
             true
         }
         Event::WindowFocusedWithApp { window, app_name } => {
@@ -197,6 +198,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.audio_dragging = false;
             state.audio_drag_input = false;
             state.bluetooth_popup_open = false;
+            state.network_popup_open = false;
             true
         }
         Event::MenuRegistered {
@@ -408,6 +410,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.audio_popup_open = false;
             state.audio_dragging = false;
             state.audio_drag_input = false;
+            state.bluetooth_popup_open = false;
+            state.network_popup_open = false;
             if matches!(state.menu, MenuState::TrayLoaded { .. }) {
                 let Some((window_id, endpoint, model)) = state.global_menu_model.clone() else {
                     state.menu = MenuState::NoMenu;
@@ -515,22 +519,27 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             if state.menu_interaction.open_root.is_some()
                 || state.audio_popup_open
                 || state.bluetooth_popup_open
+                || state.network_popup_open
             {
                 state.menu_interaction = Default::default();
                 state.audio_popup_open = false;
                 state.audio_dragging = false;
                 state.audio_drag_input = false;
                 state.bluetooth_popup_open = false;
+                state.network_popup_open = false;
                 true
             } else {
                 false
             }
         }
         Event::TrayMenuOpenRequested { .. } => {
-            let changed =
-                state.audio_popup_open || state.audio_dragging || state.bluetooth_popup_open;
+            let changed = state.audio_popup_open
+                || state.audio_dragging
+                || state.bluetooth_popup_open
+                || state.network_popup_open;
             state.audio_popup_open = false;
             state.bluetooth_popup_open = false;
+            state.network_popup_open = false;
             state.audio_dragging = false;
             state.audio_drag_input = false;
             changed
@@ -663,8 +672,34 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 false
             } else {
                 state.network = network;
-                visual_before != visual_after
+                visual_before != visual_after || state.network_popup_open
             }
+        }
+        Event::NetworkPopupToggled => {
+            state.network_popup_open = !state.network_popup_open;
+            if state.network_popup_open {
+                state.audio_popup_open = false;
+                state.audio_dragging = false;
+                state.audio_drag_input = false;
+                state.bluetooth_popup_open = false;
+                state.menu = MenuState::NoMenu;
+                state.menu_interaction = Default::default();
+            }
+            true
+        }
+        Event::NetworkSetWireless(enabled) => {
+            let action = super::NetworkPendingAction::SetWireless(enabled);
+            if state.network_pending.contains(&action) {
+                false
+            } else {
+                state.network_pending.push(action);
+                true
+            }
+        }
+        Event::NetworkActionFinished(action) => {
+            let before = state.network_pending.len();
+            state.network_pending.retain(|pending| pending != &action);
+            before != state.network_pending.len()
         }
         Event::BluetoothSnapshotReceived(bluetooth) => {
             let before = bluetooth_visual_state(&state.bluetooth);
@@ -691,6 +726,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.audio_drag_input = false;
                 state.menu = MenuState::NoMenu;
                 state.menu_interaction = Default::default();
+                state.network_popup_open = false;
             }
             true
         }
@@ -735,6 +771,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.audio_dragging = false;
             state.audio_drag_input = false;
             if state.audio_popup_open {
+                state.bluetooth_popup_open = false;
+                state.network_popup_open = false;
                 state.menu = MenuState::NoMenu;
                 state.menu_interaction = Default::default();
             }
@@ -1011,6 +1049,71 @@ mod tests {
             &mut registry
         ));
         assert!(state.bluetooth_pending.is_empty());
+    }
+
+    #[test]
+    fn network_popup_is_exclusive_and_wireless_pending_is_not_authoritative() {
+        let mut state = State {
+            audio_popup_open: true,
+            bluetooth_popup_open: true,
+            ..Default::default()
+        };
+        let mut registry = MenuRegistry::default();
+        assert!(reduce(
+            &mut state,
+            Event::NetworkPopupToggled,
+            &mut registry
+        ));
+        assert!(state.network_popup_open);
+        assert!(!state.audio_popup_open);
+        assert!(!state.bluetooth_popup_open);
+
+        state.network.wireless_enabled = true;
+        assert!(reduce(
+            &mut state,
+            Event::NetworkSetWireless(false),
+            &mut registry
+        ));
+        assert_eq!(state.network_pending.len(), 1);
+        assert!(state.network.wireless_enabled);
+        assert!(!reduce(
+            &mut state,
+            Event::NetworkSetWireless(false),
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::NetworkActionFinished(super::super::NetworkPendingAction::SetWireless(false)),
+            &mut registry
+        ));
+        assert!(state.network_pending.is_empty());
+    }
+
+    #[test]
+    fn every_interactive_popup_transition_leaves_one_owner() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let count = |state: &State| {
+            [
+                state.network_popup_open,
+                state.bluetooth_popup_open,
+                state.audio_popup_open,
+            ]
+            .into_iter()
+            .filter(|open| *open)
+            .count()
+        };
+
+        reduce(&mut state, Event::NetworkPopupToggled, &mut registry);
+        assert_eq!(count(&state), 1);
+        reduce(&mut state, Event::BluetoothPopupToggled, &mut registry);
+        assert_eq!(count(&state), 1);
+        reduce(&mut state, Event::AudioPopupToggled, &mut registry);
+        assert_eq!(count(&state), 1);
+        reduce(&mut state, Event::NetworkPopupToggled, &mut registry);
+        assert_eq!(count(&state), 1);
+        reduce(&mut state, Event::NetworkPopupToggled, &mut registry);
+        assert_eq!(count(&state), 0);
     }
 
     #[test]

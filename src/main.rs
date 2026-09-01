@@ -334,6 +334,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 ) => Event::BluetoothPopupToggled,
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::Network),
+                ) => Event::NetworkPopupToggled,
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::NetworkWireless),
+                ) => Event::NetworkSetWireless(!state.network.wireless_enabled),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::BluetoothPower),
                 ) => Event::BluetoothSetPowered(!state.bluetooth.powered),
                 (
@@ -457,6 +465,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { .. }),
                     Some(platform::x11::HitTarget::BluetoothInside),
+                ) => event.clone(),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { .. }),
+                    Some(platform::x11::HitTarget::NetworkInside),
+                )
+                | (
+                    Event::X11(platform::x11::X11Event::ButtonPress { .. }),
+                    Some(platform::x11::HitTarget::Network),
                 ) => event.clone(),
                 (
                     Event::X11(platform::x11::X11Event::MotionNotify { .. }),
@@ -635,7 +651,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     dbus.bluetooth_disconnect_device(path.clone())
                 }
+                Event::NetworkSetWireless(enabled) => {
+                    if trace {
+                        eprintln!("xbar trace: NetworkCommand SetWireless enabled={enabled}");
+                    }
+                    dbus.network_set_wireless(enabled)
+                }
                 _ => {}
+            }
+            if matches!(translated, Event::NetworkPopupToggled) && state.network_popup_open {
+                dbus.network_scan();
             }
             if matches!(
                 translated,
@@ -653,6 +678,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 translated,
                 Event::BluetoothSnapshotReceived(_) | Event::BluetoothUnavailable
             ) && state.bluetooth_popup_open
+            {
+                render_target = Some(match render_target {
+                    Some(current) => current.merge(RenderTarget::Popup),
+                    None => RenderTarget::Popup,
+                });
+            }
+            if matches!(
+                translated,
+                Event::NetworkSnapshotReceived(_) | Event::NetworkActionFinished(_)
+            ) && state.network_popup_open
             {
                 render_target = Some(match render_target {
                     Some(current) => current.merge(RenderTarget::Popup),
@@ -935,6 +970,9 @@ fn render_target_for(
             Some(HitTarget::BluetoothPower)
             | Some(HitTarget::BluetoothInside)
             | Some(HitTarget::Bluetooth) => None,
+            Some(HitTarget::NetworkWireless)
+            | Some(HitTarget::NetworkInside)
+            | Some(HitTarget::Network) => None,
         },
         Event::MenuClickedOutside => Some(RenderTarget::Popup),
         Event::MenuAboutToShowRequested { .. } => Some(RenderTarget::Popup),
@@ -960,6 +998,9 @@ fn render_target_for(
         | Event::BluetoothConnectDevice(_)
         | Event::BluetoothDisconnectDevice(_)
         | Event::BluetoothActionFinished(_) => Some(RenderTarget::Popup),
+        Event::NetworkPopupToggled
+        | Event::NetworkSetWireless(_)
+        | Event::NetworkActionFinished(_) => Some(RenderTarget::Popup),
         Event::NotificationsSnapshot(_) => Some(RenderTarget::Notification),
         Event::WindowAttentionChanged { .. } => None,
         Event::StatusNotifierActionRequested { .. } => None,

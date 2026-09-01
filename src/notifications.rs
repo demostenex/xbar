@@ -336,7 +336,10 @@ mod tests {
         store.attention(window, "Editor".into(), true);
         store.attention(window, "Editor".into(), true);
         assert_eq!(store.snapshot().len(), 1);
-        assert_eq!(store.snapshot()[0].source, NotificationSource::WindowAttention);
+        assert_eq!(
+            store.snapshot()[0].source,
+            NotificationSource::WindowAttention
+        );
         store.attention(window, "Editor".into(), false);
         assert!(store.snapshot().is_empty());
     }

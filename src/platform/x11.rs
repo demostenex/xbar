@@ -72,6 +72,7 @@ pub struct X11Platform {
     popups: Vec<PopupWindow>,
     audio_popup: Option<AudioPopupWindow>,
     bluetooth_popup: Option<BluetoothPopupWindow>,
+    network_popup: Option<NetworkPopupWindow>,
     notification: Option<NotificationWindow>,
     pointer_grabbed: bool,
     bar_hits: Vec<BarHitMap>,
@@ -125,6 +126,12 @@ struct BluetoothPopupWindow {
     power: layout::MenuRect,
     devices: Vec<(String, layout::MenuRect)>,
 }
+struct NetworkPopupWindow {
+    window: u32,
+    rect: layout::MenuRect,
+    wireless: layout::MenuRect,
+    access_points: Vec<(String, layout::MenuRect)>,
+}
 struct NotificationWindow {
     window: u32,
     width: u16,
@@ -137,6 +144,7 @@ type BarHitMap = (
     i16,
     Vec<view::MenuVisualItem>,
     Vec<view::TrayVisualItem>,
+    Option<view::NetworkVisual>,
     Option<view::AudioVisual>,
     Option<view::BluetoothVisual>,
 );
@@ -158,6 +166,9 @@ pub enum HitTarget {
     BluetoothPower,
     BluetoothDevice(String),
     BluetoothInside,
+    Network,
+    NetworkWireless,
+    NetworkInside,
     Outside,
 }
 
@@ -259,6 +270,7 @@ impl X11Platform {
             popups: Vec::new(),
             audio_popup: None,
             bluetooth_popup: None,
+            network_popup: None,
             notification: None,
             pointer_grabbed: false,
             bar_hits: Vec::new(),
@@ -352,6 +364,10 @@ impl X11Platform {
                 .is_some_and(|popup| popup.window == window)
             || self
                 .bluetooth_popup
+                .as_ref()
+                .is_some_and(|popup| popup.window == window)
+            || self
+                .network_popup
                 .as_ref()
                 .is_some_and(|popup| popup.window == window)
     }
@@ -598,6 +614,10 @@ impl X11Platform {
             .notification
             .as_ref()
             .is_some_and(|notification| notification.window == window)
+            || self
+                .network_popup
+                .as_ref()
+                .is_some_and(|popup| popup.window == window)
     }
 
     pub fn discover_gmenu_windows(
@@ -878,7 +898,8 @@ impl X11Platform {
             target,
             RenderTarget::Popup | RenderTarget::DockRightPopup | RenderTarget::All
         ) {
-            if !state.audio_popup_open && !state.bluetooth_popup_open {
+            self.reconcile_interactive_popup_surfaces(state)?;
+            if !state.audio_popup_open && !state.bluetooth_popup_open && !state.network_popup_open {
                 self.render_popups(state)?;
             } else {
                 self.destroy_popup_suffix(0)?;
@@ -888,6 +909,11 @@ impl X11Platform {
                     self.close_popups(Some(state))?;
                 }
                 self.render_bluetooth_popup(state)?;
+            } else if state.network_popup_open {
+                if self.audio_popup.is_some() || self.bluetooth_popup.is_some() {
+                    self.close_popups(Some(state))?;
+                }
+                self.render_network_popup(state)?;
             } else {
                 self.render_audio_popup(state)?;
             }
@@ -897,6 +923,59 @@ impl X11Platform {
         }
         self.conn.flush()?;
         self.text.flush();
+        Ok(())
+    }
+
+    fn reconcile_interactive_popup_surfaces(
+        &mut self,
+        state: &State,
+    ) -> Result<(), Box<dyn Error>> {
+        let desired = if state.audio_popup_open {
+            "Audio"
+        } else if state.bluetooth_popup_open {
+            "Bluetooth"
+        } else if state.network_popup_open {
+            "Network"
+        } else if state.menu_interaction.open_root.is_some() {
+            "Menu"
+        } else {
+            "None"
+        };
+        let wrong_surface = match desired {
+            "Audio" => {
+                self.bluetooth_popup.is_some()
+                    || self.network_popup.is_some()
+                    || !self.popups.is_empty()
+            }
+            "Bluetooth" => {
+                self.audio_popup.is_some()
+                    || self.network_popup.is_some()
+                    || !self.popups.is_empty()
+            }
+            "Network" => {
+                self.audio_popup.is_some()
+                    || self.bluetooth_popup.is_some()
+                    || !self.popups.is_empty()
+            }
+            "Menu" => {
+                self.audio_popup.is_some()
+                    || self.bluetooth_popup.is_some()
+                    || self.network_popup.is_some()
+            }
+            "None" => {
+                self.audio_popup.is_some()
+                    || self.bluetooth_popup.is_some()
+                    || self.network_popup.is_some()
+                    || !self.popups.is_empty()
+            }
+            _ => false,
+        };
+        if wrong_surface {
+            if std::env::var_os("XBAR_TRACE").is_some() {
+                eprintln!("xbar trace: popup reconciliation desired={desired} action=close-stale");
+            }
+            self.close_popups(Some(state))?;
+        }
         Ok(())
     }
 
@@ -1111,6 +1190,7 @@ impl X11Platform {
                 output.y,
                 context.menu.clone(),
                 context.tray.clone(),
+                context.network.clone(),
                 context.audio.clone(),
                 context.bluetooth.clone(),
             ));
@@ -1361,6 +1441,16 @@ impl X11Platform {
         if let Some(popup) = self.bluetooth_popup.take() {
             self.text.release_drawable(popup.window);
             self.conn.destroy_window(popup.window)?.check()?;
+            if std::env::var_os("XBAR_TRACE").is_some() {
+                eprintln!("xbar trace: UNMAP popup=Bluetooth xid={}", popup.window);
+            }
+        }
+        if let Some(popup) = self.network_popup.take() {
+            self.text.release_drawable(popup.window);
+            self.conn.destroy_window(popup.window)?.check()?;
+            if std::env::var_os("XBAR_TRACE").is_some() {
+                eprintln!("xbar trace: UNMAP popup=Network xid={}", popup.window);
+            }
         }
         if self.pointer_grabbed {
             if std::env::var_os("XBAR_TRACE").is_some() {
@@ -1852,6 +1942,195 @@ impl X11Platform {
         Ok(())
     }
 
+    fn render_network_popup(&mut self, state: &State) -> Result<(), Box<dyn Error>> {
+        if !state.network_popup_open || !state.network.available {
+            if self.network_popup.is_some() {
+                self.close_popups(Some(state))?;
+            }
+            return Ok(());
+        }
+        let output = state.outputs.first().ok_or("no output for network popup")?;
+        let rows: Vec<_> = state
+            .network
+            .access_points
+            .iter()
+            .take(8)
+            .enumerate()
+            .map(|(index, access_point)| {
+                (
+                    access_point.ssid.clone(),
+                    layout::MenuRect {
+                        x: output.x + output.width as i16 - 350 + 10,
+                        y: output.y + 26 + 82 + index as i16 * 24,
+                        width: 330,
+                        height: 22,
+                    },
+                )
+            })
+            .collect();
+        let rect = layout::MenuRect {
+            x: (output.x + output.width as i16 - 350).max(output.x),
+            y: output.y + 26,
+            width: 350,
+            height: (78 + rows.len() as u16 * 24 + 10)
+                .min(output.height.saturating_sub(26).max(120)),
+        };
+        let wireless = layout::MenuRect {
+            x: rect.x + rect.width as i16 - 100,
+            y: rect.y + 8,
+            width: 84,
+            height: 28,
+        };
+        let window = if let Some(popup) = &self.network_popup {
+            popup.window
+        } else {
+            let window = self.conn.generate_id()?;
+            self.conn
+                .create_window(
+                    x11rb::COPY_FROM_PARENT as u8,
+                    window,
+                    self.root,
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    1,
+                    WindowClass::INPUT_OUTPUT,
+                    x11rb::COPY_FROM_PARENT,
+                    &xproto::CreateWindowAux::new()
+                        .background_pixel(BAR_STYLE.popup_background)
+                        .override_redirect(1)
+                        .event_mask(
+                            EventMask::EXPOSURE
+                                | EventMask::BUTTON_PRESS
+                                | EventMask::POINTER_MOTION,
+                        ),
+                )?
+                .check()?;
+            self.conn.map_window(window)?.check()?;
+            window
+        };
+        let resize = self
+            .network_popup
+            .as_ref()
+            .is_some_and(|popup| popup.rect != rect);
+        self.network_popup = Some(NetworkPopupWindow {
+            window,
+            rect,
+            wireless,
+            access_points: rows.clone(),
+        });
+        if resize {
+            self.conn
+                .configure_window(
+                    window,
+                    &xproto::ConfigureWindowAux::new()
+                        .x(rect.x as i32)
+                        .y(rect.y as i32)
+                        .width(rect.width as u32)
+                        .height(rect.height as u32),
+                )?
+                .check()?;
+        }
+        let geometry = self.conn.get_geometry(window)?.reply()?;
+        let attrs = self.conn.get_window_attributes(window)?.reply()?;
+        self.text
+            .prepare_drawable(window, attrs.visual, geometry.depth)?;
+        let gc = self.conn.generate_id()?;
+        self.conn
+            .create_gc(
+                gc,
+                window,
+                &xproto::CreateGCAux::new().foreground(BAR_STYLE.popup_foreground),
+            )?
+            .check()?;
+        self.conn
+            .poly_rectangle(
+                window,
+                gc,
+                &[xproto::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: rect.width,
+                    height: rect.height,
+                }],
+            )?
+            .check()?;
+        let wireless_label = state
+            .network_pending
+            .iter()
+            .map(|pending| match pending {
+                crate::core::NetworkPendingAction::SetWireless(enabled) => {
+                    if *enabled {
+                        "Ligando..."
+                    } else {
+                        "Desligando..."
+                    }
+                }
+            })
+            .next()
+            .unwrap_or(if state.network.wireless_enabled {
+                "ON"
+            } else {
+                "OFF"
+            });
+        self.text.draw_popup_utf8(
+            &format!("Wi-Fi                         {wireless_label}"),
+            12,
+            25,
+            BAR_STYLE.popup_foreground,
+        )?;
+        self.text.draw_popup_utf8(
+            &if state.network.link_kind == crate::core::NetworkLinkKind::Ethernet {
+                "Ethernet                 Connected".to_string()
+            } else if state.network.connectivity == crate::core::NetworkConnectivity::Connected {
+                format!(
+                    "Conectado: {}",
+                    state.network.display_name.as_deref().unwrap_or("Wi-Fi")
+                )
+            } else {
+                "Desconectado".to_string()
+            },
+            12,
+            50,
+            BAR_STYLE.popup_foreground,
+        )?;
+        self.text
+            .draw_popup_utf8("Redes disponíveis", 12, 74, BAR_STYLE.popup_foreground)?;
+        for (index, (ssid, _)) in rows.iter().enumerate() {
+            let strength = state
+                .network
+                .access_points
+                .iter()
+                .find(|access_point| access_point.ssid == *ssid)
+                .map_or(0, |access_point| access_point.strength);
+            self.text.draw_popup_utf8(
+                &format!("{ssid:<28} {strength:>3}%"),
+                14,
+                98 + index as i32 * 24,
+                BAR_STYLE.popup_foreground,
+            )?;
+        }
+        self.conn.free_gc(gc)?.check()?;
+        if !self.pointer_grabbed {
+            let grab = self
+                .conn
+                .grab_pointer(
+                    false,
+                    self.root,
+                    EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+                    xproto::GrabMode::ASYNC,
+                    xproto::GrabMode::ASYNC,
+                    x11rb::NONE,
+                    x11rb::NONE,
+                    0_u32,
+                )?
+                .reply()?;
+            self.pointer_grabbed = grab.status == xproto::GrabStatus::SUCCESS;
+        }
+        Ok(())
+    }
+
     fn draw_audio_slider(
         &self,
         window: u32,
@@ -1937,7 +2216,7 @@ impl X11Platform {
         let anchor = self
             .bar_hits
             .iter()
-            .find_map(|(_, output_id, _, _, items, tray, _, _)| {
+            .find_map(|(_, output_id, _, _, items, tray, _, _, _)| {
                 if let Some(endpoint) = tray_endpoint {
                     tray.iter()
                         .find(|item| item.endpoint.service == endpoint.service)
@@ -2218,8 +2497,8 @@ impl X11Platform {
             | X11Event::MotionNotify { window, x, y } => (*window, *x, *y, *x, *y),
             _ => return HitTarget::Outside,
         };
-        if let Some((_bar, _, ox, oy, items, tray, audio, bluetooth)) =
-            self.bar_hits.iter().find(|(bar, _, _, _, _, _, _, _)| {
+        if let Some((_bar, _, ox, oy, items, tray, network, audio, bluetooth)) =
+            self.bar_hits.iter().find(|(bar, _, _, _, _, _, _, _, _)| {
                 *bar == window || (self.root == window && root_y < BAR_HEIGHT as i16)
             })
         {
@@ -2240,6 +2519,15 @@ impl X11Platform {
             }
             let root_x = bar_x;
             let root_y = bar_y;
+            if let Some(network) = network {
+                if root_x >= network.rect.x
+                    && root_x < network.rect.x + network.rect.width as i16
+                    && root_y >= network.rect.y
+                    && root_y < network.rect.y + network.rect.height as i16
+                {
+                    return HitTarget::Network;
+                }
+            }
             if let Some(audio) = audio {
                 if root_x >= audio.rect.x
                     && root_x < audio.rect.x + audio.rect.width as i16
@@ -2361,6 +2649,42 @@ impl X11Platform {
                     return HitTarget::BluetoothDevice(path.clone());
                 }
                 return HitTarget::BluetoothInside;
+            }
+        }
+        if let Some(popup) = &self.network_popup {
+            let inside = popup.window == window
+                || (self.root == window
+                    && root_x >= popup.rect.x
+                    && root_x < popup.rect.x + popup.rect.width as i16
+                    && root_y >= popup.rect.y
+                    && root_y < popup.rect.y + popup.rect.height as i16);
+            if inside {
+                let rx = if popup.window == window {
+                    x + popup.rect.x
+                } else {
+                    root_x
+                };
+                let ry = if popup.window == window {
+                    y + popup.rect.y
+                } else {
+                    root_y
+                };
+                if rx >= popup.wireless.x
+                    && rx < popup.wireless.x + popup.wireless.width as i16
+                    && ry >= popup.wireless.y
+                    && ry < popup.wireless.y + popup.wireless.height as i16
+                {
+                    return HitTarget::NetworkWireless;
+                }
+                if popup.access_points.iter().any(|(_, rect)| {
+                    rx >= rect.x
+                        && rx < rect.x + rect.width as i16
+                        && ry >= rect.y
+                        && ry < rect.y + rect.height as i16
+                }) {
+                    return HitTarget::Network;
+                }
+                return HitTarget::NetworkInside;
             }
         }
         for (level, popup) in self.popups.iter().enumerate() {

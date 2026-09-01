@@ -51,13 +51,26 @@ pub struct AudioState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct NetworkAccessPoint {
+    pub ssid: String,
+    pub strength: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NetworkPendingAction {
+    SetWireless(bool),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct NetworkState {
     pub available: bool,
+    pub wireless_enabled: bool,
     pub connectivity: NetworkConnectivity,
     pub link_kind: NetworkLinkKind,
     pub interface: Option<String>,
     pub display_name: Option<String>,
     pub signal_percent: Option<u8>,
+    pub access_points: Vec<NetworkAccessPoint>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -156,9 +169,11 @@ pub struct State {
     pub clock: Option<ClockState>,
     pub audio: AudioState,
     pub network: NetworkState,
+    pub network_pending: Vec<NetworkPendingAction>,
     pub bluetooth: BluetoothState,
     pub bluetooth_pending: Vec<BluetoothPendingAction>,
     pub bluetooth_popup_open: bool,
+    pub network_popup_open: bool,
     pub audio_popup_open: bool,
     pub notifications: Vec<Notification>,
     pub audio_dragging: bool,

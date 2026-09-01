@@ -1,7 +1,8 @@
 use super::{
     AudioDevice, AudioState, BluetoothPendingAction, ClockState, MenuItemId,
-    MenuItemPropertiesUpdate, MenuModel, MenuSource, NetworkState, OutputState,
-    StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierItem, WindowId, WorkspaceState,
+    MenuItemPropertiesUpdate, MenuModel, MenuSource, NetworkPendingAction, NetworkState,
+    OutputState, StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierItem, WindowId,
+    WorkspaceState,
 };
 use crate::platform::x11::X11Event;
 
@@ -110,6 +111,9 @@ pub enum Event {
     AudioSelectInput(String),
     AudioUnavailable,
     NetworkSnapshotReceived(NetworkState),
+    NetworkPopupToggled,
+    NetworkSetWireless(bool),
+    NetworkActionFinished(NetworkPendingAction),
     BluetoothSnapshotReceived(super::BluetoothState),
     BluetoothUnavailable,
     BluetoothPopupToggled,

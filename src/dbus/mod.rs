@@ -1,8 +1,9 @@
 use crate::core::{
     format_notifier_item_id, parse_notifier_item_id, BluetoothDevice, BluetoothPendingAction,
     BluetoothState, Event, GtkMenuEndpoint, MenuActionTarget, MenuRegistry, MenuSource,
-    NetworkConnectivity, NetworkLinkKind, NetworkState, NotificationId, StatusNotifierAction,
-    StatusNotifierEndpoint, StatusNotifierIcon, StatusNotifierItem, StatusNotifierStatus,
+    NetworkAccessPoint, NetworkConnectivity, NetworkLinkKind, NetworkPendingAction, NetworkState,
+    NotificationId, StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierIcon,
+    StatusNotifierItem, StatusNotifierStatus,
 };
 mod gmenu;
 mod menu;
@@ -234,6 +235,8 @@ enum Request {
     BluetoothSetPowered(bool),
     BluetoothConnectDevice(String),
     BluetoothDisconnectDevice(String),
+    NetworkSetWireless(bool),
+    NetworkScan,
     NotificationTimerFired,
     WindowAttention {
         window: crate::core::WindowId,
@@ -444,6 +447,12 @@ impl DbusBridge {
         let _ = self
             .requests
             .try_send(Request::BluetoothDisconnectDevice(path));
+    }
+    pub fn network_set_wireless(&self, enabled: bool) {
+        let _ = self.requests.try_send(Request::NetworkSetWireless(enabled));
+    }
+    pub fn network_scan(&self) {
+        let _ = self.requests.try_send(Request::NetworkScan);
     }
 }
 
@@ -947,6 +956,7 @@ async fn network_snapshot(connection: &zbus::Connection) -> zbus::Result<Network
     let iface = "org.freedesktop.NetworkManager";
     let proxy = zbus::Proxy::new(connection, "org.freedesktop.NetworkManager", path, iface).await?;
     let state: u32 = proxy.get_property("State").await?;
+    let wireless_enabled: bool = proxy.get_property("WirelessEnabled").await.unwrap_or(true);
     let connectivity: u32 = proxy.get_property("Connectivity").await.unwrap_or(0);
     let primary: OwnedObjectPath = proxy.get_property("PrimaryConnection").await?;
     let connected = state == 70;
@@ -962,6 +972,7 @@ async fn network_snapshot(connection: &zbus::Connection) -> zbus::Result<Network
     let devices: Vec<OwnedObjectPath> = proxy.get_property("Devices").await?;
     let mut result = NetworkState {
         available: true,
+        wireless_enabled,
         connectivity: if !connected {
             if state > 20 {
                 NetworkConnectivity::Connecting
@@ -975,6 +986,62 @@ async fn network_snapshot(connection: &zbus::Connection) -> zbus::Result<Network
         },
         ..Default::default()
     };
+    let mut access_points = HashMap::<String, u8>::new();
+    for device_path in &devices {
+        let device = zbus::Proxy::new(
+            connection,
+            "org.freedesktop.NetworkManager",
+            device_path.as_str(),
+            "org.freedesktop.NetworkManager.Device",
+        )
+        .await?;
+        let device_type: u32 = device.get_property("DeviceType").await.unwrap_or(0);
+        if device_type != 2 {
+            continue;
+        }
+        let wireless = zbus::Proxy::new(
+            connection,
+            "org.freedesktop.NetworkManager",
+            device_path.as_str(),
+            "org.freedesktop.NetworkManager.Device.Wireless",
+        )
+        .await?;
+        let paths: Vec<OwnedObjectPath> = wireless
+            .get_property("AccessPoints")
+            .await
+            .unwrap_or_default();
+        for ap_path in paths {
+            let ap = zbus::Proxy::new(
+                connection,
+                "org.freedesktop.NetworkManager",
+                ap_path.as_str(),
+                "org.freedesktop.NetworkManager.AccessPoint",
+            )
+            .await?;
+            let ssid = ap.get_property::<Vec<u8>>("Ssid").await.unwrap_or_default();
+            let ssid = String::from_utf8_lossy(&ssid).into_owned();
+            if ssid.is_empty() {
+                continue;
+            }
+            let strength = ap.get_property::<u8>("Strength").await.unwrap_or(0);
+            access_points
+                .entry(ssid)
+                .and_modify(|old| *old = (*old).max(strength))
+                .or_insert(strength);
+        }
+    }
+    result.access_points = access_points
+        .into_iter()
+        .map(|(ssid, strength)| NetworkAccessPoint { ssid, strength })
+        .collect();
+    result.access_points.sort_by(|a, b| {
+        b.strength
+            .cmp(&a.strength)
+            .then_with(|| a.ssid.cmp(&b.ssid))
+    });
+    if !wireless_enabled {
+        result.access_points.clear();
+    }
     if !is_default {
         return Ok(result);
     }
@@ -1088,19 +1155,102 @@ async fn watch_network(
     let Ok(mut removed) = proxy.receive_signal("DeviceRemoved").await else {
         return;
     };
+    let properties_rule = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.NetworkManager")
+        .expect("valid NetworkManager sender")
+        .interface("org.freedesktop.DBus.Properties")
+        .expect("valid Properties interface")
+        .member("PropertiesChanged")
+        .expect("valid PropertiesChanged member")
+        .build();
+    let Ok(mut properties) =
+        MessageStream::for_match_rule(properties_rule, &connection, Some(32)).await
+    else {
+        return;
+    };
     loop {
-        let state_signal = async { state_changes.next().await };
-        let add_signal = async { added.next().await };
-        let remove_signal = async { removed.next().await };
+        let state_signal = async { state_changes.next().await.map(|_| ()) };
+        let add_signal = async { added.next().await.map(|_| ()) };
+        let remove_signal = async { removed.next().await.map(|_| ()) };
         let _ = futures_lite::future::race(
-            futures_lite::future::race(state_signal, add_signal),
-            remove_signal,
+            futures_lite::future::race(
+                futures_lite::future::race(state_signal, add_signal),
+                remove_signal,
+            ),
+            async { properties.next().await.map(|_| ()) },
         )
         .await;
         if let Ok(snapshot) = network_snapshot(&connection).await {
             push_event(&events, &wake, Event::NetworkSnapshotReceived(snapshot));
         }
     }
+}
+
+async fn network_set_wireless(connection: &zbus::Connection, enabled: bool) -> Result<(), String> {
+    let proxy = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.NetworkManager",
+        "/org/freedesktop/NetworkManager",
+        "org.freedesktop.NetworkManager",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    proxy
+        .set_property("WirelessEnabled", &enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn network_request_scan(connection: &zbus::Connection) -> Result<(), String> {
+    let manager = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.NetworkManager",
+        "/org/freedesktop/NetworkManager",
+        "org.freedesktop.NetworkManager",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let devices: Vec<OwnedObjectPath> = manager
+        .get_property("Devices")
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut device_path = None;
+    for candidate in devices {
+        let device = zbus::Proxy::new(
+            connection,
+            "org.freedesktop.NetworkManager",
+            candidate.as_str(),
+            "org.freedesktop.NetworkManager.Device",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let device_type: u32 = device
+            .get_property("DeviceType")
+            .await
+            .map_err(|e| e.to_string())?;
+        if device_type == 2 {
+            device_path = Some(candidate);
+            break;
+        }
+    }
+    let Some(device_path) = device_path else {
+        return Ok(());
+    };
+    let proxy = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.NetworkManager",
+        device_path.as_str(),
+        "org.freedesktop.NetworkManager.Device.Wireless",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let options: HashMap<String, OwnedValue> = HashMap::new();
+    let _: () = proxy
+        .call("RequestScan", &(options,))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn bluetooth_string(properties: &HashMap<String, OwnedValue>, name: &str) -> String {
@@ -1700,6 +1850,51 @@ async fn run(
                     }
                 } else {
                     eprintln!("xbar: BlueZ Disconnect skipped: system bus unavailable");
+                }
+            }
+            Either::Request(Ok(Request::NetworkSetWireless(enabled))) => {
+                if let Some((system, executor)) = &system_connection {
+                    let action = NetworkPendingAction::SetWireless(enabled);
+                    let system = system.clone();
+                    let events = Arc::clone(&events);
+                    let wake = Arc::clone(&wake);
+                    executor.spawn(async move {
+                        if let Err(error) = network_set_wireless(&system, enabled).await {
+                            eprintln!("xbar: NetworkManager WirelessEnabled update failed: {error}");
+                        }
+                        push_event(&events, &wake, Event::NetworkActionFinished(action));
+                        if let Ok(snapshot) = network_snapshot(&system).await {
+                            push_event(&events, &wake, Event::NetworkSnapshotReceived(snapshot));
+                        }
+                    }, "xbar-network-command").detach();
+                }
+            }
+            Either::Request(Ok(Request::NetworkScan)) => {
+                if let Some((system, executor)) = &system_connection {
+                    let system = system.clone();
+                    let events = Arc::clone(&events);
+                    let wake = Arc::clone(&wake);
+                    executor
+                        .spawn(
+                            async move {
+                                if let Err(error) = network_request_scan(&system).await {
+                                    if std::env::var_os("XBAR_TRACE").is_some() {
+                                        eprintln!(
+                                            "xbar trace: NetworkManager scan failed: {error}"
+                                        );
+                                    }
+                                }
+                                if let Ok(snapshot) = network_snapshot(&system).await {
+                                    push_event(
+                                        &events,
+                                        &wake,
+                                        Event::NetworkSnapshotReceived(snapshot),
+                                    );
+                                }
+                            },
+                            "xbar-network-scan",
+                        )
+                        .detach();
                 }
             }
             Either::Request(Ok(Request::NotificationTimerFired)) => {
