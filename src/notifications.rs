@@ -1,4 +1,4 @@
-use crate::core::{Event, Notification, NotificationId};
+use crate::core::{Event, Notification, NotificationId, NotificationSource, WindowId};
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
@@ -50,6 +50,8 @@ impl Store {
             Record {
                 notification: Notification {
                     id,
+                    source: NotificationSource::Freedesktop,
+                    window_id: None,
                     app_name,
                     summary,
                     body,
@@ -58,6 +60,43 @@ impl Store {
             },
         );
         id
+    }
+
+    pub fn attention(&mut self, window: WindowId, app_name: String, active: bool) {
+        let existing = self.records.iter().find_map(|(id, record)| {
+            (record.notification.source == NotificationSource::WindowAttention
+                && record.notification.window_id == Some(window))
+            .then_some(*id)
+        });
+        match (active, existing) {
+            (true, Some(id)) => {
+                if let Some(record) = self.records.get_mut(&id) {
+                    record.notification.app_name = app_name.clone();
+                    record.notification.summary = format!("{app_name} needs attention");
+                }
+            }
+            (true, None) => {
+                let id = self.allocate_id();
+                self.records.insert(
+                    id,
+                    Record {
+                        notification: Notification {
+                            id,
+                            source: NotificationSource::WindowAttention,
+                            window_id: Some(window),
+                            app_name: app_name.clone(),
+                            summary: format!("{app_name} needs attention"),
+                            body: "A window is requesting attention".into(),
+                        },
+                        deadline: None,
+                    },
+                );
+            }
+            (false, Some(id)) => {
+                self.records.remove(&id);
+            }
+            (false, None) => {}
+        }
     }
 
     fn allocate_id(&mut self) -> NotificationId {
@@ -288,5 +327,25 @@ mod tests {
         let id = store.notify(0, "app".into(), "one".into(), String::new(), 0);
         assert!(store.close(id));
         assert!(!store.close(id));
+    }
+
+    #[test]
+    fn attention_is_deduplicated_by_window_and_cleared() {
+        let mut store = Store::default();
+        let window = WindowId(77);
+        store.attention(window, "Editor".into(), true);
+        store.attention(window, "Editor".into(), true);
+        assert_eq!(store.snapshot().len(), 1);
+        assert_eq!(store.snapshot()[0].source, NotificationSource::WindowAttention);
+        store.attention(window, "Editor".into(), false);
+        assert!(store.snapshot().is_empty());
+    }
+
+    #[test]
+    fn attention_windows_have_distinct_notifications() {
+        let mut store = Store::default();
+        store.attention(WindowId(1), "One".into(), true);
+        store.attention(WindowId(2), "Two".into(), true);
+        assert_eq!(store.snapshot().len(), 2);
     }
 }

@@ -55,6 +55,11 @@ pub enum X11Event {
     GtkWindowChanged(WindowId),
     GtkWindowsChanged,
     GtkWindowDestroyed(WindowId),
+    WindowAttentionChanged {
+        window: WindowId,
+        app_name: String,
+        attention: bool,
+    },
     Close,
 }
 pub struct X11Platform {
@@ -82,6 +87,11 @@ struct Atoms {
     notification: Atom,
     wm_protocols: Atom,
     wm_delete: Atom,
+    net_wm_state: Atom,
+    demands_attention: Atom,
+    wm_hints: Atom,
+    net_wm_name: Atom,
+    wm_name: Atom,
     gtk_unique_bus_name: Atom,
     gtk_menubar_object_path: Atom,
     gtk_app_menu_object_path: Atom,
@@ -210,6 +220,11 @@ impl X11Platform {
             notification: intern(b"_NET_WM_WINDOW_TYPE_NOTIFICATION")?,
             wm_protocols: intern(b"WM_PROTOCOLS")?,
             wm_delete: intern(b"WM_DELETE_WINDOW")?,
+            net_wm_state: intern(b"_NET_WM_STATE")?,
+            demands_attention: intern(b"_NET_WM_STATE_DEMANDS_ATTENTION")?,
+            wm_hints: intern(b"WM_HINTS")?,
+            net_wm_name: intern(b"_NET_WM_NAME")?,
+            wm_name: intern(b"WM_NAME")?,
             instance: intern(b"_XBAR_INSTANCE")?,
             gtk_unique_bus_name: intern(b"_GTK_UNIQUE_BUS_NAME")?,
             gtk_menubar_object_path: intern(b"_GTK_MENUBAR_OBJECT_PATH")?,
@@ -430,21 +445,15 @@ impl X11Platform {
                 if self.is_xbar_owned_window(event.window) {
                     return Ok(None);
                 }
-                if self.select_property_events(event.window, "create")? {
-                    Some(X11Event::GtkWindowChanged(WindowId(event.window)))
-                } else {
-                    None
-                }
+                self.select_property_events(event.window, "create")?
+                    .then_some(X11Event::GtkWindowChanged(WindowId(event.window)))
             }
             Some(Event::MapNotify(event)) => {
                 if self.is_xbar_owned_window(event.window) {
                     return Ok(None);
                 }
-                if self.select_property_events(event.window, "map")? {
-                    Some(X11Event::GtkWindowChanged(WindowId(event.window)))
-                } else {
-                    None
-                }
+                self.select_property_events(event.window, "map")?
+                    .then_some(X11Event::GtkWindowChanged(WindowId(event.window)))
             }
             Some(Event::DestroyNotify(event)) => {
                 Some(X11Event::GtkWindowDestroyed(WindowId(event.window)))
@@ -453,6 +462,11 @@ impl X11Platform {
                 if event.window == self.root && event.atom == self.atoms.net_client_list =>
             {
                 Some(X11Event::GtkWindowsChanged)
+            }
+            Some(Event::PropertyNotify(event))
+                if event.atom == self.atoms.net_wm_state || event.atom == self.atoms.wm_hints =>
+            {
+                self.attention_event(event.window)?
             }
             Some(Event::PropertyNotify(event)) if self.is_gtk_atom(event.atom) => {
                 Some(X11Event::GtkWindowChanged(WindowId(event.window)))
@@ -466,6 +480,58 @@ impl X11Platform {
             Some(_) => None,
             None => None,
         })
+    }
+
+    fn attention_event(&self, window: u32) -> Result<Option<X11Event>, Box<dyn Error>> {
+        if self.is_xbar_owned_window(window) {
+            return Ok(None);
+        }
+        let states = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms.net_wm_state,
+                AtomEnum::ATOM,
+                0,
+                u32::MAX,
+            )?
+            .reply()?
+            .value32()
+            .map(|values| values.collect::<Vec<_>>())
+            .unwrap_or_default();
+        let urgency = self
+            .conn
+            .get_property(false, window, self.atoms.wm_hints, AtomEnum::ANY, 0, 9)?
+            .reply()?
+            .value32()
+            .and_then(|mut values| values.next())
+            .is_some_and(|flags| flags & (1 << 8) != 0);
+        Ok(Some(X11Event::WindowAttentionChanged {
+            window: WindowId(window),
+            app_name: self.window_name(window),
+            attention: states.contains(&self.atoms.demands_attention) || urgency,
+        }))
+    }
+
+    fn window_name(&self, window: u32) -> String {
+        for atom in [self.atoms.net_wm_name, self.atoms.wm_name] {
+            if let Ok(cookie) =
+                self.conn
+                    .get_property(false, window, atom, AtomEnum::ANY, 0, u32::MAX)
+            {
+                if let Ok(reply) = cookie.reply() {
+                    let name = String::from_utf8_lossy(&reply.value)
+                        .trim_end_matches('\0')
+                        .trim()
+                        .to_string();
+                    if !name.is_empty() {
+                        return name;
+                    }
+                }
+            }
+        }
+        format!("Window {window}")
     }
 
     fn select_property_events(&self, window: u32, reason: &str) -> Result<bool, Box<dyn Error>> {
@@ -528,7 +594,10 @@ impl X11Platform {
             self.instance_window,
             self.windows.iter().map(|bar| bar.window),
             self.popups.iter().map(|popup| popup.window),
-        )
+        ) || self
+            .notification
+            .as_ref()
+            .is_some_and(|notification| notification.window == window)
     }
 
     pub fn discover_gmenu_windows(
@@ -564,6 +633,36 @@ impl X11Platform {
         }
         self.conn.flush()?;
         Ok(discovered)
+    }
+
+    pub fn discover_attention_windows(&mut self) -> Result<Vec<X11Event>, Box<dyn Error>> {
+        let client_list = self
+            .conn
+            .get_property(
+                false,
+                self.root,
+                self.atoms.net_client_list,
+                AtomEnum::WINDOW,
+                0,
+                u32::MAX,
+            )?
+            .reply()?
+            .value32()
+            .map(|values| values.collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut events = Vec::new();
+        for window in client_list {
+            if self.is_xbar_owned_window(window) {
+                continue;
+            }
+            if self.select_property_events(window, "attention-startup")? {
+                if let Some(event) = self.attention_event(window)? {
+                    events.push(event);
+                }
+            }
+        }
+        self.conn.flush()?;
+        Ok(events)
     }
 
     pub fn discover_gmenu_window(

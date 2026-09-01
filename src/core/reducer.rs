@@ -716,6 +716,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 true
             }
         }
+        Event::WindowAttentionChanged { .. } => false,
         Event::AudioUnavailable => {
             let audio = super::AudioState::default();
             let popup_changed = state.audio_popup_open || state.audio_dragging;
@@ -810,6 +811,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         | Event::X11(crate::platform::x11::X11Event::GtkWindowDestroyed(_))
         | Event::X11(crate::platform::x11::X11Event::InstanceLost) => false,
         Event::X11(crate::platform::x11::X11Event::Close) => false,
+        Event::X11(crate::platform::x11::X11Event::WindowAttentionChanged { .. }) => false,
     }
 }
 

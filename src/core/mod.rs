@@ -14,7 +14,8 @@ pub use reducer::reduce;
 pub use state::{
     AboutToShowPending, AudioDevice, AudioState, BluetoothDevice, BluetoothPendingAction,
     BluetoothState, ClockState, MenuState, NetworkConnectivity, NetworkLinkKind, NetworkState,
-    Notification, NotificationId, OutputId, OutputState, State, WindowId, WorkspaceState,
+    Notification, NotificationId, NotificationSource, OutputId, OutputState, State, WindowId,
+    WorkspaceState,
 };
 pub use status_notifier::{
     format_notifier_item_id, parse_notifier_item_id, StatusNotifierAction, StatusNotifierEndpoint,

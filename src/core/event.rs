@@ -118,6 +118,11 @@ pub enum Event {
     BluetoothDisconnectDevice(String),
     BluetoothActionFinished(BluetoothPendingAction),
     NotificationsSnapshot(Vec<super::Notification>),
+    WindowAttentionChanged {
+        window: WindowId,
+        app_name: String,
+        attention: bool,
+    },
     AudioPopupToggled,
     AudioTrackChanged {
         input: bool,

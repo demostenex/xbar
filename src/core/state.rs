@@ -91,9 +91,20 @@ pub struct NotificationId(pub u32);
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Notification {
     pub id: NotificationId,
+    pub source: NotificationSource,
+    pub window_id: Option<WindowId>,
     pub app_name: String,
     pub summary: String,
     pub body: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum NotificationSource {
+    #[default]
+    Freedesktop,
+    WindowAttention,
+    #[allow(dead_code)]
+    Internal,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

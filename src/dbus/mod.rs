@@ -235,6 +235,11 @@ enum Request {
     BluetoothConnectDevice(String),
     BluetoothDisconnectDevice(String),
     NotificationTimerFired,
+    WindowAttention {
+        window: crate::core::WindowId,
+        app_name: String,
+        attention: bool,
+    },
 }
 
 type EventQueue = Arc<Mutex<VecDeque<Event>>>;
@@ -296,6 +301,19 @@ impl DbusBridge {
 
     pub fn notification_timer_fired(&self) {
         let _ = self.requests.try_send(Request::NotificationTimerFired);
+    }
+
+    pub fn window_attention(
+        &self,
+        window: crate::core::WindowId,
+        app_name: String,
+        attention: bool,
+    ) {
+        let _ = self.requests.try_send(Request::WindowAttention {
+            window,
+            app_name,
+            attention,
+        });
     }
 
     pub fn drain_events(&mut self) -> io::Result<Vec<Event>> {
@@ -1697,6 +1715,17 @@ async fn run(
                             .await?;
                     }
                 }
+            }
+            Either::Request(Ok(Request::WindowAttention {
+                window,
+                app_name,
+                attention,
+            })) => {
+                notification_store
+                    .lock()
+                    .expect("notification store poisoned")
+                    .attention(window, app_name, attention);
+                notifications::publish(&notification_store, &notification_timer, &events, &wake);
             }
         }
     }

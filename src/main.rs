@@ -73,6 +73,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             &mut registry.lock().expect("registry poisoned"),
         );
     }
+    for event in x11.discover_attention_windows()? {
+        if let platform::x11::X11Event::WindowAttentionChanged {
+            window,
+            app_name,
+            attention,
+        } = event
+        {
+            dbus.window_attention(window, app_name, attention);
+        }
+    }
     x11.sync_windows(&state.outputs)?;
     x11.render(&state, RenderTarget::All)?;
 
@@ -152,6 +162,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut render_target: Option<RenderTarget> = None;
         for event in events {
             let event = match event {
+                Event::X11(platform::x11::X11Event::WindowAttentionChanged {
+                    window,
+                    app_name,
+                    attention,
+                }) => {
+                    dbus.window_attention(window, app_name.clone(), attention);
+                    Event::WindowAttentionChanged {
+                        window,
+                        app_name,
+                        attention,
+                    }
+                }
+                Event::X11(platform::x11::X11Event::GtkWindowDestroyed(window_id)) => {
+                    dbus.window_attention(window_id, String::new(), false);
+                    registry
+                        .lock()
+                        .expect("registry poisoned")
+                        .gtk(window_id)
+                        .cloned()
+                        .map(|endpoint| Event::GtkMenuRemoved {
+                            window_id,
+                            endpoint,
+                        })
+                        .unwrap_or(Event::X11(platform::x11::X11Event::GtkWindowDestroyed(
+                            window_id,
+                        )))
+                }
                 Event::X11(platform::x11::X11Event::GtkWindowChanged(window_id)) => {
                     match x11.discover_gmenu_window(window_id.0)? {
                         Some(endpoint) => Event::GtkMenuDiscovered {
@@ -195,18 +232,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                         })
                         .unwrap_or(Event::X11(platform::x11::X11Event::GtkWindowsChanged))
                 }
-                Event::X11(platform::x11::X11Event::GtkWindowDestroyed(window_id)) => registry
-                    .lock()
-                    .expect("registry poisoned")
-                    .gtk(window_id)
-                    .cloned()
-                    .map(|endpoint| Event::GtkMenuRemoved {
-                        window_id,
-                        endpoint,
-                    })
-                    .unwrap_or(Event::X11(platform::x11::X11Event::GtkWindowDestroyed(
-                        window_id,
-                    ))),
                 event => event,
             };
             let previous_active_source =
@@ -936,6 +961,7 @@ fn render_target_for(
         | Event::BluetoothDisconnectDevice(_)
         | Event::BluetoothActionFinished(_) => Some(RenderTarget::Popup),
         Event::NotificationsSnapshot(_) => Some(RenderTarget::Notification),
+        Event::WindowAttentionChanged { .. } => None,
         Event::StatusNotifierActionRequested { .. } => None,
         _ => Some(RenderTarget::All),
     }
