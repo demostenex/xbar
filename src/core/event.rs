@@ -1,7 +1,7 @@
 use super::{
-    AudioDevice, AudioState, ClockState, MenuItemId, MenuItemPropertiesUpdate, MenuModel,
-    MenuSource, NetworkState, OutputState, StatusNotifierAction, StatusNotifierEndpoint,
-    StatusNotifierItem, WindowId, WorkspaceState,
+    AudioDevice, AudioState, BluetoothPendingAction, ClockState, MenuItemId,
+    MenuItemPropertiesUpdate, MenuModel, MenuSource, NetworkState, OutputState,
+    StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierItem, WindowId, WorkspaceState,
 };
 use crate::platform::x11::X11Event;
 
@@ -116,6 +116,7 @@ pub enum Event {
     BluetoothSetPowered(bool),
     BluetoothConnectDevice(String),
     BluetoothDisconnectDevice(String),
+    BluetoothActionFinished(BluetoothPendingAction),
     AudioPopupToggled,
     AudioTrackChanged {
         input: bool,

@@ -1554,11 +1554,20 @@ impl X11Platform {
                 }],
             )?
             .check()?;
+        let power_label = state
+            .bluetooth_pending
+            .iter()
+            .find_map(|pending| match pending {
+                crate::core::BluetoothPendingAction::SetPowered(powered) => Some(if *powered {
+                    "Ligando..."
+                } else {
+                    "Desligando..."
+                }),
+                _ => None,
+            })
+            .unwrap_or(if state.bluetooth.powered { "ON" } else { "OFF" });
         self.text.draw_popup_utf8(
-            &format!(
-                "Bluetooth                 {}",
-                if state.bluetooth.powered { "ON" } else { "OFF" }
-            ),
+            &format!("Bluetooth                 {power_label}"),
             12,
             25,
             BAR_STYLE.popup_foreground,
@@ -1574,7 +1583,21 @@ impl X11Platform {
                 &d.address
             };
             let marker = if d.connected { "✓" } else { " " };
-            let status = if d.connected { "Connected" } else { "Paired" };
+            let status = state
+                .bluetooth_pending
+                .iter()
+                .find_map(|pending| match pending {
+                    crate::core::BluetoothPendingAction::ConnectDevice(path) if path == &d.path => {
+                        Some("Conectando...")
+                    }
+                    crate::core::BluetoothPendingAction::DisconnectDevice(path)
+                        if path == &d.path =>
+                    {
+                        Some("Desconectando...")
+                    }
+                    _ => None,
+                })
+                .unwrap_or(if d.connected { "Connected" } else { "Paired" });
             self.text.draw_popup_utf8(
                 &format!("{marker} {name:<20} {status}"),
                 14,

@@ -11,6 +11,15 @@ fn item(model: &super::MenuModel, id: MenuItemId) -> Option<&super::MenuItem> {
     walk(&model.root, id)
 }
 
+fn begin_bluetooth_action(state: &mut State, action: super::BluetoothPendingAction) -> bool {
+    if state.bluetooth_pending.contains(&action) {
+        false
+    } else {
+        state.bluetooth_pending.push(action);
+        true
+    }
+}
+
 fn normalize_interaction(state: &mut State) {
     let Some(model) = state.active_menu_model().cloned() else {
         state.menu_interaction = Default::default();
@@ -670,6 +679,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         Event::BluetoothUnavailable => {
             let before = bluetooth_visual_state(&state.bluetooth);
             state.bluetooth = Default::default();
+            state.bluetooth_pending.clear();
             state.bluetooth_popup_open = false;
             before != bluetooth_visual_state(&state.bluetooth)
         }
@@ -684,9 +694,20 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             }
             true
         }
-        Event::BluetoothSetPowered(_)
-        | Event::BluetoothConnectDevice(_)
-        | Event::BluetoothDisconnectDevice(_) => false,
+        Event::BluetoothSetPowered(powered) => {
+            begin_bluetooth_action(state, super::BluetoothPendingAction::SetPowered(powered))
+        }
+        Event::BluetoothConnectDevice(path) => {
+            begin_bluetooth_action(state, super::BluetoothPendingAction::ConnectDevice(path))
+        }
+        Event::BluetoothDisconnectDevice(path) => {
+            begin_bluetooth_action(state, super::BluetoothPendingAction::DisconnectDevice(path))
+        }
+        Event::BluetoothActionFinished(action) => {
+            let before = state.bluetooth_pending.len();
+            state.bluetooth_pending.retain(|pending| pending != &action);
+            before != state.bluetooth_pending.len()
+        }
         Event::AudioUnavailable => {
             let audio = super::AudioState::default();
             let popup_changed = state.audio_popup_open || state.audio_dragging;
@@ -941,14 +962,45 @@ mod tests {
         ));
         assert!(state.bluetooth_popup_open);
         assert!(!state.audio_popup_open);
-        assert!(!reduce(
+        assert!(reduce(
             &mut state,
             Event::BluetoothDisconnectDevice("/org/bluez/hci0/dev_C01".into()),
             &mut registry
         ));
+        assert_eq!(state.bluetooth_pending.len(), 1);
         assert!(state.bluetooth_popup_open);
         assert!(reduce(&mut state, Event::MenuClickedOutside, &mut registry));
         assert!(!state.bluetooth_popup_open);
+    }
+
+    #[test]
+    fn bluetooth_pending_action_blocks_duplicates_without_changing_backend_state() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let path = "/org/bluez/hci0/dev_C01".to_owned();
+        assert!(reduce(
+            &mut state,
+            Event::BluetoothConnectDevice(path.clone()),
+            &mut registry
+        ));
+        assert!(!reduce(
+            &mut state,
+            Event::BluetoothConnectDevice(path.clone()),
+            &mut registry
+        ));
+        assert!(!state
+            .bluetooth
+            .devices
+            .iter()
+            .any(|device| device.connected));
+        assert!(reduce(
+            &mut state,
+            Event::BluetoothActionFinished(super::super::BluetoothPendingAction::ConnectDevice(
+                path
+            ),),
+            &mut registry
+        ));
+        assert!(state.bluetooth_pending.is_empty());
     }
 
     #[test]

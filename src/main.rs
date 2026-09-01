@@ -313,6 +313,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .map_or_else(
                         || event.clone(),
                         |d| {
+                            if std::env::var_os("XBAR_TRACE").is_some() {
+                                eprintln!(
+                                    "xbar trace: bluetooth row ButtonPress path={} connected={}",
+                                    path, d.connected
+                                );
+                            }
                             if d.connected {
                                 Event::BluetoothDisconnectDevice(path.clone())
                             } else {
@@ -577,11 +583,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Event::AudioSelectOutput(ref name) => audio.set_default_output(name),
                 Event::AudioSelectInput(ref name) => audio.set_default_input(name),
                 Event::AudioDragReleased => last_audio_command = None,
-                Event::BluetoothSetPowered(powered) => dbus.bluetooth_set_powered(powered),
+                Event::BluetoothSetPowered(powered) => {
+                    if std::env::var_os("XBAR_TRACE").is_some() {
+                        eprintln!("xbar trace: BluetoothCommand SetPowered powered={powered}");
+                    }
+                    dbus.bluetooth_set_powered(powered)
+                }
                 Event::BluetoothConnectDevice(ref path) => {
+                    if std::env::var_os("XBAR_TRACE").is_some() {
+                        eprintln!("xbar trace: BluetoothCommand ConnectDevice path={path}");
+                    }
                     dbus.bluetooth_connect_device(path.clone())
                 }
                 Event::BluetoothDisconnectDevice(ref path) => {
+                    if std::env::var_os("XBAR_TRACE").is_some() {
+                        eprintln!("xbar trace: BluetoothCommand DisconnectDevice path={path}");
+                    }
                     dbus.bluetooth_disconnect_device(path.clone())
                 }
                 _ => {}
@@ -907,7 +924,8 @@ fn render_target_for(
         Event::BluetoothPopupToggled
         | Event::BluetoothSetPowered(_)
         | Event::BluetoothConnectDevice(_)
-        | Event::BluetoothDisconnectDevice(_) => Some(RenderTarget::DockRightPopup),
+        | Event::BluetoothDisconnectDevice(_)
+        | Event::BluetoothActionFinished(_) => Some(RenderTarget::Popup),
         Event::StatusNotifierActionRequested { .. } => None,
         _ => Some(RenderTarget::All),
     }

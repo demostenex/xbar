@@ -1,8 +1,8 @@
 use crate::core::{
-    format_notifier_item_id, parse_notifier_item_id, BluetoothDevice, BluetoothState, Event,
-    GtkMenuEndpoint, MenuActionTarget, MenuRegistry, MenuSource, NetworkConnectivity,
-    NetworkLinkKind, NetworkState, StatusNotifierAction, StatusNotifierEndpoint,
-    StatusNotifierIcon, StatusNotifierItem, StatusNotifierStatus,
+    format_notifier_item_id, parse_notifier_item_id, BluetoothDevice, BluetoothPendingAction,
+    BluetoothState, Event, GtkMenuEndpoint, MenuActionTarget, MenuRegistry, MenuSource,
+    NetworkConnectivity, NetworkLinkKind, NetworkState, StatusNotifierAction,
+    StatusNotifierEndpoint, StatusNotifierIcon, StatusNotifierItem, StatusNotifierStatus,
 };
 mod gmenu;
 mod menu;
@@ -381,16 +381,25 @@ impl DbusBridge {
     }
 
     pub fn bluetooth_set_powered(&self, powered: bool) {
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!("xbar trace: DBusWorker enqueue SetPowered powered={powered}");
+        }
         let _ = self
             .requests
             .try_send(Request::BluetoothSetPowered(powered));
     }
     pub fn bluetooth_connect_device(&self, path: String) {
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!("xbar trace: DBusWorker enqueue ConnectDevice path={path}");
+        }
         let _ = self
             .requests
             .try_send(Request::BluetoothConnectDevice(path));
     }
     pub fn bluetooth_disconnect_device(&self, path: String) {
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!("xbar trace: DBusWorker enqueue DisconnectDevice path={path}");
+        }
         let _ = self
             .requests
             .try_send(Request::BluetoothDisconnectDevice(path));
@@ -1204,13 +1213,14 @@ async fn run(
     if std::env::var_os("XBAR_TRACE").is_some() {
         eprintln!("xbar trace: NetworkManager system connection starting");
     }
-    let system_executor = if let Ok(system) = zbus::Connection::system().await {
+    let system_connection = if let Ok(system) = zbus::Connection::system().await {
         if std::env::var_os("XBAR_TRACE").is_some() {
             eprintln!("xbar trace: NetworkManager system connection ready");
         }
         let network_events = Arc::clone(&events);
         let network_wake = Arc::clone(&wake);
         let executor = system.executor().clone();
+        let network_connection = system.clone();
         let bluetooth_connection = system.clone();
         match bluetooth_snapshot(&system).await {
             Ok(snapshot) => push_event(&events, &wake, Event::BluetoothSnapshotReceived(snapshot)),
@@ -1223,7 +1233,7 @@ async fn run(
         }
         executor
             .spawn(
-                async move { watch_network(system, network_events, network_wake).await },
+                async move { watch_network(network_connection, network_events, network_wake).await },
                 "xbar-network",
             )
             .detach();
@@ -1237,7 +1247,7 @@ async fn run(
                 "xbar-bluetooth",
             )
             .detach();
-        Some(executor)
+        Some((system, executor))
     } else if std::env::var_os("XBAR_TRACE").is_some() {
         eprintln!("xbar trace: NetworkManager system bus unavailable");
         None
@@ -1246,11 +1256,12 @@ async fn run(
     };
     let mut watched_endpoints = HashSet::new();
     let mut gmenu_subscriptions = HashMap::new();
+    let bluetooth_in_flight = Arc::new(Mutex::new(HashSet::<BluetoothPendingAction>::new()));
     loop {
         let owner = async { Either::Owner(owner_changes.next().await) };
         let request = async { Either::Request(requests.recv().await) };
         let dbus = futures_lite::future::race(owner, request);
-        let next = if let Some(executor) = &system_executor {
+        let next = if let Some((_, executor)) = &system_connection {
             futures_lite::future::race(dbus, async {
                 executor.tick().await;
                 Either::Network
@@ -1413,18 +1424,152 @@ async fn run(
                 }
             }
             Either::Request(Ok(Request::BluetoothSetPowered(powered))) => {
-                if let Err(error) = bluetooth_set_powered(&connection, powered).await {
-                    eprintln!("xbar: BlueZ Powered update failed: {error}");
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!("xbar trace: DBusWorker receive SetPowered powered={powered}");
+                }
+                if let Some((system, executor)) = &system_connection {
+                    let action = BluetoothPendingAction::SetPowered(powered);
+                    let should_start = bluetooth_in_flight
+                        .lock()
+                        .expect("Bluetooth in-flight lock poisoned")
+                        .insert(action.clone());
+                    if should_start {
+                        let system = system.clone();
+                        let events = Arc::clone(&events);
+                        let wake = Arc::clone(&wake);
+                        let in_flight = Arc::clone(&bluetooth_in_flight);
+                        executor
+                            .spawn(
+                                async move {
+                                    if std::env::var_os("XBAR_TRACE").is_some() {
+                                        eprintln!("xbar trace: DBus call begin SetPowered powered={powered}");
+                                    }
+                                    if let Err(error) =
+                                        bluetooth_set_powered(&system, powered).await
+                                    {
+                                        eprintln!("xbar: BlueZ Powered update failed: {error}");
+                                    }
+                                    if std::env::var_os("XBAR_TRACE").is_some() {
+                                        eprintln!("xbar trace: DBus call end SetPowered powered={powered}");
+                                    }
+                                    in_flight
+                                        .lock()
+                                        .expect("Bluetooth in-flight lock poisoned")
+                                        .remove(&action);
+                                    push_event(
+                                        &events,
+                                        &wake,
+                                        Event::BluetoothActionFinished(action),
+                                    );
+                                },
+                                "xbar-bluetooth-command",
+                            )
+                            .detach();
+                    } else if std::env::var_os("XBAR_TRACE").is_some() {
+                        eprintln!("xbar trace: Bluetooth action suppressed in-flight SetPowered powered={powered}");
+                    }
+                } else {
+                    eprintln!("xbar: BlueZ Powered update skipped: system bus unavailable");
                 }
             }
             Either::Request(Ok(Request::BluetoothConnectDevice(path))) => {
-                if let Err(error) = bluetooth_device_call(&connection, &path, "Connect").await {
-                    eprintln!("xbar: BlueZ Connect failed: {error}");
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!("xbar trace: DBusWorker receive ConnectDevice path={path}");
+                    eprintln!("xbar trace: DBus call org.bluez.Device1.Connect path={path}");
+                }
+                if let Some((system, executor)) = &system_connection {
+                    let action = BluetoothPendingAction::ConnectDevice(path.clone());
+                    let should_start = bluetooth_in_flight
+                        .lock()
+                        .expect("Bluetooth in-flight lock poisoned")
+                        .insert(action.clone());
+                    if should_start {
+                        let system = system.clone();
+                        let events = Arc::clone(&events);
+                        let wake = Arc::clone(&wake);
+                        let in_flight = Arc::clone(&bluetooth_in_flight);
+                        executor
+                            .spawn(
+                                async move {
+                                    if std::env::var_os("XBAR_TRACE").is_some() {
+                                        eprintln!("xbar trace: DBus call begin Device1.Connect path={path}");
+                                    }
+                                    if let Err(error) =
+                                        bluetooth_device_call(&system, &path, "Connect").await
+                                    {
+                                        eprintln!("xbar: BlueZ Connect failed: {error}");
+                                    }
+                                    if std::env::var_os("XBAR_TRACE").is_some() {
+                                        eprintln!("xbar trace: DBus call end Device1.Connect path={path}");
+                                    }
+                                    in_flight
+                                        .lock()
+                                        .expect("Bluetooth in-flight lock poisoned")
+                                        .remove(&action);
+                                    push_event(
+                                        &events,
+                                        &wake,
+                                        Event::BluetoothActionFinished(action),
+                                    );
+                                },
+                                "xbar-bluetooth-command",
+                            )
+                            .detach();
+                    } else if std::env::var_os("XBAR_TRACE").is_some() {
+                        eprintln!("xbar trace: Bluetooth action suppressed in-flight ConnectDevice path={path}");
+                    }
+                } else {
+                    eprintln!("xbar: BlueZ Connect skipped: system bus unavailable");
                 }
             }
             Either::Request(Ok(Request::BluetoothDisconnectDevice(path))) => {
-                if let Err(error) = bluetooth_device_call(&connection, &path, "Disconnect").await {
-                    eprintln!("xbar: BlueZ Disconnect failed: {error}");
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!("xbar trace: DBusWorker receive DisconnectDevice path={path}");
+                    eprintln!("xbar trace: DBus call org.bluez.Device1.Disconnect path={path}");
+                }
+                if let Some((system, executor)) = &system_connection {
+                    let action = BluetoothPendingAction::DisconnectDevice(path.clone());
+                    let should_start = bluetooth_in_flight
+                        .lock()
+                        .expect("Bluetooth in-flight lock poisoned")
+                        .insert(action.clone());
+                    if should_start {
+                        let system = system.clone();
+                        let events = Arc::clone(&events);
+                        let wake = Arc::clone(&wake);
+                        let in_flight = Arc::clone(&bluetooth_in_flight);
+                        executor
+                            .spawn(
+                                async move {
+                                    if std::env::var_os("XBAR_TRACE").is_some() {
+                                        eprintln!("xbar trace: DBus call begin Device1.Disconnect path={path}");
+                                    }
+                                    if let Err(error) =
+                                        bluetooth_device_call(&system, &path, "Disconnect").await
+                                    {
+                                        eprintln!("xbar: BlueZ Disconnect failed: {error}");
+                                    }
+                                    if std::env::var_os("XBAR_TRACE").is_some() {
+                                        eprintln!("xbar trace: DBus call end Device1.Disconnect path={path}");
+                                    }
+                                    in_flight
+                                        .lock()
+                                        .expect("Bluetooth in-flight lock poisoned")
+                                        .remove(&action);
+                                    push_event(
+                                        &events,
+                                        &wake,
+                                        Event::BluetoothActionFinished(action),
+                                    );
+                                },
+                                "xbar-bluetooth-command",
+                            )
+                            .detach();
+                    } else if std::env::var_os("XBAR_TRACE").is_some() {
+                        eprintln!("xbar trace: Bluetooth action suppressed in-flight DisconnectDevice path={path}");
+                    }
+                } else {
+                    eprintln!("xbar: BlueZ Disconnect skipped: system bus unavailable");
                 }
             }
         }

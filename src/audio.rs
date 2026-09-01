@@ -1,7 +1,7 @@
 use crate::core::{AudioDevice, AudioState, Event};
 use libpulse_binding as pulse;
 use pulse::callbacks::ListResult;
-use pulse::context::subscribe::{Facility, InterestMaskSet};
+use pulse::context::subscribe::{Facility, InterestMaskSet, Operation};
 use pulse::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
 use pulse::mainloop::{api::Mainloop as MainloopTrait, events::io::FlagSet as IoFlagSet};
@@ -54,6 +54,10 @@ enum AudioCommand {
     ToggleInputMute,
     SetDefaultOutput(String),
     SetDefaultInput(String),
+}
+
+fn refresh_detail_for(operation: Option<Operation>) -> bool {
+    operation != Some(Operation::Removed)
 }
 
 impl AudioBridge {
@@ -284,21 +288,32 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
     );
     let callback_flags = Arc::clone(&flags);
     context.set_subscribe_callback(Some(Box::new(
-        move |facility, _operation, _index| match facility {
-            Some(Facility::Server) => callback_flags.server.store(true, Ordering::Release),
-            Some(Facility::Sink) => {
-                callback_flags.sink.store(true, Ordering::Release);
-                callback_flags
-                    .inventory_sinks
-                    .store(true, Ordering::Release);
+        move |facility, operation, index| {
+            if std::env::var_os("XBAR_TRACE").is_some() {
+                eprintln!(
+                    "xbar trace: audio subscription facility={facility:?} operation={operation:?} index={index:?}"
+                );
             }
-            Some(Facility::Source) => {
-                callback_flags.source.store(true, Ordering::Release);
-                callback_flags
-                    .inventory_sources
-                    .store(true, Ordering::Release);
+            match facility {
+                Some(Facility::Server) => callback_flags.server.store(true, Ordering::Release),
+                Some(Facility::Sink) => {
+                    callback_flags
+                        .inventory_sinks
+                        .store(true, Ordering::Release);
+                    if refresh_detail_for(operation) {
+                        callback_flags.sink.store(true, Ordering::Release);
+                    }
+                }
+                Some(Facility::Source) => {
+                    callback_flags
+                        .inventory_sources
+                        .store(true, Ordering::Release);
+                    if refresh_detail_for(operation) {
+                        callback_flags.source.store(true, Ordering::Release);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         },
     )));
     let _subscription = context.subscribe(
@@ -703,5 +718,18 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{refresh_detail_for, Operation};
+
+    #[test]
+    fn removed_audio_object_never_requests_detail_refresh() {
+        assert!(!refresh_detail_for(Some(Operation::Removed)));
+        assert!(refresh_detail_for(Some(Operation::New)));
+        assert!(refresh_detail_for(Some(Operation::Changed)));
+        assert!(refresh_detail_for(None));
     }
 }

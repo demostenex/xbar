@@ -78,6 +78,13 @@ pub struct BluetoothState {
     pub devices: Vec<BluetoothDevice>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum BluetoothPendingAction {
+    SetPowered(bool),
+    ConnectDevice(String),
+    DisconnectDevice(String),
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum NetworkConnectivity {
     #[default]
@@ -128,6 +135,7 @@ pub struct State {
     pub audio: AudioState,
     pub network: NetworkState,
     pub bluetooth: BluetoothState,
+    pub bluetooth_pending: Vec<BluetoothPendingAction>,
     pub bluetooth_popup_open: bool,
     pub audio_popup_open: bool,
     pub audio_dragging: bool,

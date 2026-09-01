@@ -12,9 +12,9 @@ pub use menu::{
 };
 pub use reducer::reduce;
 pub use state::{
-    AboutToShowPending, AudioDevice, AudioState, BluetoothDevice, BluetoothState, ClockState,
-    MenuState, NetworkConnectivity, NetworkLinkKind, NetworkState, OutputId, OutputState, State,
-    WindowId, WorkspaceState,
+    AboutToShowPending, AudioDevice, AudioState, BluetoothDevice, BluetoothPendingAction,
+    BluetoothState, ClockState, MenuState, NetworkConnectivity, NetworkLinkKind, NetworkState,
+    OutputId, OutputState, State, WindowId, WorkspaceState,
 };
 pub use status_notifier::{
     format_notifier_item_id, parse_notifier_item_id, StatusNotifierAction, StatusNotifierEndpoint,
