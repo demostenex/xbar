@@ -1,0 +1,198 @@
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WindowId(pub u32);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct OutputId(pub u32);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputState {
+    pub id: OutputId,
+    pub name: String,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkspaceState {
+    pub name: String,
+    pub output: Option<String>,
+    pub focused: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClockState {
+    pub hour: u8,
+    pub minute: u8,
+    pub day: u8,
+    pub month: u8,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioDevice {
+    pub name: String,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioState {
+    pub available: bool,
+    pub default_output: Option<String>,
+    pub volume_percent: u32,
+    pub muted: bool,
+    pub default_input: Option<String>,
+    pub input_description: Option<String>,
+    pub input_volume_percent: u32,
+    pub input_muted: bool,
+    pub output_description: Option<String>,
+    pub outputs: Vec<AudioDevice>,
+    pub inputs: Vec<AudioDevice>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NetworkState {
+    pub available: bool,
+    pub connectivity: NetworkConnectivity,
+    pub link_kind: NetworkLinkKind,
+    pub interface: Option<String>,
+    pub display_name: Option<String>,
+    pub signal_percent: Option<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BluetoothDevice {
+    pub path: String,
+    pub address: String,
+    pub alias: String,
+    pub connected: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BluetoothState {
+    pub available: bool,
+    pub powered: bool,
+    pub devices: Vec<BluetoothDevice>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum NetworkConnectivity {
+    #[default]
+    Disconnected,
+    Connecting,
+    Connected,
+    Limited,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum NetworkLinkKind {
+    #[default]
+    Other,
+    Ethernet,
+    Wifi,
+}
+
+use super::{MenuModel, MenuSource};
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MenuInteractionState {
+    pub open_root: Option<super::MenuItemId>,
+    pub open_path: Vec<super::MenuItemId>,
+    pub hovered_path: Vec<super::MenuItemId>,
+    pub about_to_show_item: Option<super::MenuItemId>,
+    pub pending_about_to_show: Option<AboutToShowPending>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AboutToShowPending {
+    pub window_id: WindowId,
+    pub endpoint: MenuSource,
+    pub item_id: super::MenuItemId,
+    pub request_id: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct State {
+    pub outputs: Vec<OutputState>,
+    pub workspaces: Vec<WorkspaceState>,
+    pub focused_workspace: Option<String>,
+    pub focused_window: Option<WindowId>,
+    pub focused_app_name: Option<String>,
+    pub menu: MenuState,
+    pub global_menu_model: Option<(WindowId, MenuSource, MenuModel)>,
+    pub menu_interaction: MenuInteractionState,
+    pub clock: Option<ClockState>,
+    pub audio: AudioState,
+    pub network: NetworkState,
+    pub bluetooth: BluetoothState,
+    pub audio_popup_open: bool,
+    pub audio_dragging: bool,
+    pub audio_drag_input: bool,
+    pub status_notifiers: super::StatusNotifierRegistry,
+    pub status_notifier_items: super::StatusNotifierItemRegistry,
+    pub status_notifier_host_registered: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum MenuState {
+    #[default]
+    NoMenu,
+    Loading {
+        window_id: WindowId,
+        endpoint: MenuSource,
+        request_id: u64,
+    },
+    Loaded {
+        window_id: WindowId,
+        endpoint: MenuSource,
+        model: MenuModel,
+    },
+    Error {
+        window_id: WindowId,
+        endpoint: MenuSource,
+        request_id: u64,
+        error: String,
+    },
+    TrayLoading {
+        endpoint: super::MenuEndpoint,
+        request_id: u64,
+    },
+    TrayLoaded {
+        endpoint: super::MenuEndpoint,
+        model: MenuModel,
+    },
+    TrayError {
+        endpoint: super::MenuEndpoint,
+        request_id: u64,
+        error: String,
+    },
+}
+
+impl State {
+    pub fn active_menu_model(&self) -> Option<&MenuModel> {
+        match &self.menu {
+            MenuState::Loaded { model, .. } | MenuState::TrayLoaded { model, .. } => Some(model),
+            MenuState::NoMenu
+            | MenuState::Loading { .. }
+            | MenuState::Error { .. }
+            | MenuState::TrayLoading { .. }
+            | MenuState::TrayError { .. } => None,
+        }
+    }
+
+    pub fn active_menu_endpoint(&self, registry: &super::MenuRegistry) -> Option<MenuSource> {
+        registry.active(self.focused_window)
+    }
+
+    pub fn current_menu_source(&self, registry: &super::MenuRegistry) -> Option<MenuSource> {
+        match &self.menu {
+            MenuState::Loading { endpoint, .. }
+            | MenuState::Loaded { endpoint, .. }
+            | MenuState::Error { endpoint, .. } => Some(endpoint.clone()),
+            MenuState::TrayLoading { endpoint, .. }
+            | MenuState::TrayLoaded { endpoint, .. }
+            | MenuState::TrayError { endpoint, .. } => Some(MenuSource::Tray(endpoint.clone())),
+            MenuState::NoMenu => self.active_menu_endpoint(registry),
+        }
+    }
+}

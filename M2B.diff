@@ -1,0 +1,1259 @@
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/Cargo.lock ./Cargo.lock
+--- /tmp/xbar-m2a-baseline/Cargo.lock	2026-08-30 18:50:45.369358254 -0300
++++ ./Cargo.lock	2026-08-30 20:38:24.363707122 -0300
+@@ -793,8 +793,10 @@
+ name = "xbar"
+ version = "0.1.0"
+ dependencies = [
++ "async-channel",
+  "futures-lite",
+  "libc",
++ "serde",
+  "serde_json",
+  "x11rb",
+  "zbus",
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/Cargo.toml ./Cargo.toml
+--- /tmp/xbar-m2a-baseline/Cargo.toml	2026-08-30 18:50:42.725394664 -0300
++++ ./Cargo.toml	2026-08-30 20:35:42.271004365 -0300
+@@ -6,6 +6,8 @@
+ [dependencies]
+ libc = "0.2"
+ futures-lite = "2"
++async-channel = "2"
++serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ x11rb = { version = "0.14", features = ["allow-unsafe-code", "randr"] }
+ zbus = { version = "5", default-features = false, features = ["async-io"] }
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/README.md ./README.md
+--- /tmp/xbar-m2a-baseline/README.md	2026-08-30 19:06:36.537876103 -0300
++++ ./README.md	2026-08-30 20:42:28.086000609 -0300
+@@ -29,6 +29,21 @@
+ loop principal por um socket local usado como wakeup; o loop continua usando
+ `poll(2)` e não faz polling periódico do DBus.
+ 
++## Milestone 2B
++
++O M2B adiciona ao worker DBus a leitura assíncrona de `com.canonical.dbusmenu`
++via `GetLayout`, convertendo o payload para `MenuModel` antes de emitir
++`MenuLoaded`. O carregamento é disparado quando o foco ou o registro do menu
++muda, e `LayoutUpdated`/`ItemsPropertiesUpdated` invalidam o snapshot para um
++novo carregamento completo. O estado distingue `NoMenu`, `Loading`, `Loaded` e
++`Error`; respostas carregadas carregam janela, endpoint e request id, portanto
++respostas antigas são descartadas pelo reducer.
++
++O fixture publica a árvore controlada `Arquivo → Novo/Sair`, `Editar` e `Ajuda`
++em `com.canonical.dbusmenu` no caminho `/com/xbar/FixtureMenu`, incluindo
++atalho, ícone, item desabilitado e item oculto. Nenhum menu é renderizado na
++barra neste milestone.
++
+ ## Compilação e execução
+ 
+ ```bash
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/src/bin/appmenu-fixture.rs ./src/bin/appmenu-fixture.rs
+--- /tmp/xbar-m2a-baseline/src/bin/appmenu-fixture.rs	2026-08-30 19:05:03.943186992 -0300
++++ ./src/bin/appmenu-fixture.rs	2026-08-30 21:03:24.212814612 -0300
+@@ -1,6 +1,13 @@
++use serde::Serialize;
++use std::collections::HashMap;
+ use std::env;
+ use std::error::Error;
++use std::sync::{
++    atomic::{AtomicU32, Ordering},
++    Arc,
++};
+ use std::time::Duration;
++use zbus::zvariant::{OwnedValue, StructureBuilder, Type, Value};
+ 
+ const REGISTRAR_NAME: &str = "com.canonical.AppMenu.Registrar";
+ const REGISTRAR_PATH: &str = "/com/canonical/AppMenu/Registrar";
+@@ -8,11 +15,98 @@
+ const TEST_XID: u32 = 0x02e0_0003;
+ const TEST_OBJECT_PATH: &str = "/com/xbar/FixtureMenu";
+ 
+-struct Fixture;
++#[derive(Debug, Serialize, Type)]
++struct FixtureNode(i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
+ 
+-#[zbus::interface(name = "org.xbar.AppMenuFixture")]
++struct Fixture {
++    revision: Arc<AtomicU32>,
++}
++
++fn property(name: &str, value: OwnedValue) -> (String, OwnedValue) {
++    (name.into(), value)
++}
++fn value<T>(value: T) -> OwnedValue
++where
++    T: Into<Value<'static>>,
++{
++    OwnedValue::try_from(value.into()).expect("fixture value")
++}
++fn item(id: i32, props: Vec<(String, OwnedValue)>, children: Vec<OwnedValue>) -> OwnedValue {
++    OwnedValue::try_from(
++        StructureBuilder::new()
++            .add_field(id)
++            .add_field(props.into_iter().collect::<HashMap<_, _>>())
++            .add_field(children)
++            .build()
++            .expect("fixture layout"),
++    )
++    .expect("fixture item")
++}
++
++fn layout() -> FixtureNode {
++    let new = item(
++        2,
++        vec![
++            property("label", value("Novo")),
++            property("shortcut", value(vec![vec!["<Control>", "N"]])),
++        ],
++        vec![],
++    );
++    let quit = item(
++        3,
++        vec![
++            property("label", value("Sair")),
++            property("enabled", value(false)),
++            property("icon-name", value("application-exit")),
++        ],
++        vec![],
++    );
++    let file = item(
++        1,
++        vec![
++            property("label", value("_Arquivo")),
++            property("children-display", value("submenu")),
++        ],
++        vec![new, quit],
++    );
++    let edit = item(4, vec![property("label", value("Editar"))], vec![]);
++    let help = item(
++        5,
++        vec![
++            property("label", value("Ajuda")),
++            property("visible", value(false)),
++        ],
++        vec![],
++    );
++    FixtureNode(0, HashMap::new(), vec![file, edit, help])
++}
++
++#[zbus::interface(name = "com.canonical.dbusmenu")]
+ impl Fixture {
+     fn ping(&self) {}
++
++    fn get_layout(
++        &self,
++        _parent_id: i32,
++        _recursion_depth: i32,
++        _property_names: Vec<String>,
++    ) -> (u32, FixtureNode) {
++        (self.revision.load(Ordering::Relaxed), layout())
++    }
++
++    #[zbus(signal)]
++    async fn layout_updated(
++        emitter: &zbus::object_server::SignalEmitter<'_>,
++        revision: u32,
++        parent_id: i32,
++    ) -> zbus::Result<()>;
++
++    #[zbus(signal)]
++    async fn items_properties_updated(
++        emitter: &zbus::object_server::SignalEmitter<'_>,
++        updated: Vec<(i32, HashMap<String, OwnedValue>)>,
++        removed: Vec<(i32, Vec<String>)>,
++    ) -> zbus::Result<()>;
+ }
+ 
+ fn main() -> Result<(), Box<dyn Error>> {
+@@ -22,6 +116,7 @@
+ async fn async_main() -> Result<(), Box<dyn Error>> {
+     let unregister = env::args().any(|arg| arg == "--unregister");
+     let query = env::args().any(|arg| arg == "--query");
++    let update = env::args().any(|arg| arg == "--update");
+     let xid = env::args()
+         .skip_while(|arg| arg != "--xid")
+         .nth(1)
+@@ -34,8 +129,14 @@
+         })
+         .transpose()?
+         .unwrap_or(TEST_XID);
++    let revision = Arc::new(AtomicU32::new(1));
+     let connection = zbus::connection::Builder::session()?
+-        .serve_at(TEST_OBJECT_PATH, Fixture)?
++        .serve_at(
++            TEST_OBJECT_PATH,
++            Fixture {
++                revision: revision.clone(),
++            },
++        )?
+         .build()
+         .await?;
+     let proxy =
+@@ -51,6 +152,19 @@
+             proxy.call("GetMenuForWindow", &xid).await?;
+         println!("lookup xid={xid} service={service} path={menu_path}");
+     }
++    if update {
++        // Give xbar time to finish the first GetLayout and install its watcher.
++        std::thread::sleep(Duration::from_millis(4000));
++        revision.store(2, Ordering::Relaxed);
++        let interface = connection
++            .object_server()
++            .interface::<_, Fixture>(TEST_OBJECT_PATH)
++            .await?;
++        Fixture::layout_updated(interface.signal_emitter(), 2, 0).await?;
++        println!("emitted LayoutUpdated revision=2 parent=0");
++        Fixture::items_properties_updated(interface.signal_emitter(), vec![], vec![]).await?;
++        println!("emitted ItemsPropertiesUpdated updated=0 removed=0");
++    }
+     if unregister {
+         std::thread::sleep(Duration::from_millis(250));
+         proxy.call_method("UnregisterWindow", &xid).await?;
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/src/core/event.rs ./src/core/event.rs
+--- /tmp/xbar-m2a-baseline/src/core/event.rs	2026-08-30 18:50:21.573685945 -0300
++++ ./src/core/event.rs	2026-08-30 20:35:42.765997350 -0300
+@@ -1,4 +1,4 @@
+-use super::{MenuEndpoint, OutputState, WindowId, WorkspaceState};
++use super::{MenuEndpoint, MenuModel, OutputState, WindowId, WorkspaceState};
+ use crate::platform::x11::X11Event;
+ 
+ #[derive(Clone, Debug, PartialEq)]
+@@ -18,6 +18,26 @@
+     MenuOwnerVanished {
+         sender: String,
+     },
++    MenuLoadRequested {
++        window_id: WindowId,
++        endpoint: MenuEndpoint,
++        request_id: u64,
++    },
++    MenuLoaded {
++        window_id: WindowId,
++        endpoint: MenuEndpoint,
++        request_id: u64,
++        model: MenuModel,
++    },
++    MenuLoadFailed {
++        window_id: WindowId,
++        endpoint: MenuEndpoint,
++        request_id: u64,
++        error: String,
++    },
++    MenuLayoutInvalidated {
++        endpoint: MenuEndpoint,
++    },
+     OutputsChanged(Vec<OutputState>),
+     X11(X11Event),
+ }
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/src/core/menu.rs ./src/core/menu.rs
+--- /tmp/xbar-m2a-baseline/src/core/menu.rs	2026-08-30 18:50:21.575685917 -0300
++++ ./src/core/menu.rs	2026-08-30 20:35:42.514000922 -0300
+@@ -2,6 +2,46 @@
+ 
+ use super::WindowId;
+ 
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
++pub struct MenuItemId(pub i32);
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum MenuItemType {
++    Standard,
++    Separator,
++    Unknown(String),
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum ChildrenDisplay {
++    Submenu,
++    Unknown(String),
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct MenuShortcut {
++    pub keys: Vec<Vec<String>>,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct MenuItem {
++    pub id: MenuItemId,
++    pub label: Option<String>,
++    pub enabled: bool,
++    pub visible: bool,
++    pub item_type: MenuItemType,
++    pub children_display: Option<ChildrenDisplay>,
++    pub shortcut: Option<MenuShortcut>,
++    pub icon_name: Option<String>,
++    pub children: Vec<MenuItem>,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct MenuModel {
++    pub revision: u32,
++    pub root: MenuItem,
++}
++
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct MenuEndpoint {
+     pub service: String,
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/src/core/mod.rs ./src/core/mod.rs
+--- /tmp/xbar-m2a-baseline/src/core/mod.rs	2026-08-30 18:47:21.972159240 -0300
++++ ./src/core/mod.rs	2026-08-30 20:36:46.441094920 -0300
+@@ -4,6 +4,9 @@
+ pub mod state;
+ 
+ pub use event::Event;
+-pub use menu::{MenuEndpoint, MenuRegistry};
++pub use menu::{
++    ChildrenDisplay, MenuEndpoint, MenuItem, MenuItemId, MenuItemType, MenuModel, MenuRegistry,
++    MenuShortcut,
++};
+ pub use reducer::reduce;
+-pub use state::{OutputId, OutputState, State, WindowId, WorkspaceState};
++pub use state::{MenuState, OutputId, OutputState, State, WindowId, WorkspaceState};
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/src/core/reducer.rs ./src/core/reducer.rs
+--- /tmp/xbar-m2a-baseline/src/core/reducer.rs	2026-08-30 19:06:48.188714504 -0300
++++ ./src/core/reducer.rs	2026-08-30 21:02:01.845986658 -0300
+@@ -1,4 +1,4 @@
+-use super::{Event, MenuRegistry, State};
++use super::{Event, MenuRegistry, MenuState, State};
+ 
+ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> bool {
+     match event {
+@@ -25,6 +25,7 @@
+                 return false;
+             }
+             state.focused_window = window;
++            state.menu = MenuState::NoMenu;
+             true
+         }
+         Event::MenuRegistered {
+@@ -32,10 +33,85 @@
+             endpoint,
+         } => {
+             registry.register(window_id, endpoint.service, endpoint.object_path);
++            if state.focused_window == Some(window_id) {
++                state.menu = MenuState::NoMenu;
++            }
+             true
+         }
+-        Event::MenuUnregistered { window_id } => registry.unregister(window_id).is_some(),
+-        Event::MenuOwnerVanished { sender } => !registry.remove_sender(&sender).is_empty(),
++        Event::MenuUnregistered { window_id } => {
++            let removed = registry.unregister(window_id).is_some();
++            if removed && state.focused_window == Some(window_id) {
++                state.menu = MenuState::NoMenu;
++            }
++            removed
++        }
++        Event::MenuOwnerVanished { sender } => {
++            let removed = registry.remove_sender(&sender);
++            if state
++                .focused_window
++                .is_some_and(|window| removed.contains(&window))
++            {
++                state.menu = MenuState::NoMenu;
++            }
++            !removed.is_empty()
++        }
++        Event::MenuLoadRequested {
++            window_id,
++            endpoint,
++            request_id,
++        } => {
++            if state.focused_window == Some(window_id) && registry.get(window_id) == Some(&endpoint)
++            {
++                state.menu = MenuState::Loading {
++                    window_id,
++                    endpoint,
++                    request_id,
++                };
++                true
++            } else {
++                false
++            }
++        }
++        Event::MenuLoaded {
++            window_id,
++            endpoint,
++            request_id,
++            model,
++        } => {
++            let accepted = matches!(&state.menu,
++                MenuState::Loading { window_id: w, endpoint: e, request_id: r }
++                if *w == window_id && *e == endpoint && *r == request_id
++                    && state.focused_window == Some(window_id) && registry.get(window_id) == Some(&endpoint));
++            if accepted {
++                state.menu = MenuState::Loaded {
++                    window_id,
++                    endpoint,
++                    model,
++                };
++            }
++            accepted
++        }
++        Event::MenuLoadFailed {
++            window_id,
++            endpoint,
++            request_id,
++            error,
++        } => {
++            let accepted = matches!(&state.menu,
++                MenuState::Loading { window_id: w, endpoint: e, request_id: r }
++                if *w == window_id && *e == endpoint && *r == request_id
++                    && state.focused_window == Some(window_id) && registry.get(window_id) == Some(&endpoint));
++            if accepted {
++                state.menu = MenuState::Error {
++                    window_id,
++                    endpoint,
++                    request_id,
++                    error,
++                };
++            }
++            accepted
++        }
++        Event::MenuLayoutInvalidated { .. } => false,
+         Event::OutputsChanged(outputs) => {
+             if state.outputs == outputs {
+                 false
+@@ -54,6 +130,28 @@
+ mod tests {
+     use super::*;
+     use crate::core::{OutputId, OutputState, WindowId, WorkspaceState};
++    fn ep() -> super::super::MenuEndpoint {
++        super::super::MenuEndpoint {
++            service: ":1.9".into(),
++            object_path: "/menu".into(),
++        }
++    }
++    fn model() -> super::super::MenuModel {
++        super::super::MenuModel {
++            revision: 1,
++            root: super::super::MenuItem {
++                id: super::super::MenuItemId(0),
++                label: None,
++                enabled: true,
++                visible: true,
++                item_type: super::super::MenuItemType::Standard,
++                children_display: None,
++                shortcut: None,
++                icon_name: None,
++                children: vec![],
++            },
++        }
++    }
+     fn ws(name: &str, focused: bool) -> WorkspaceState {
+         WorkspaceState {
+             name: name.into(),
+@@ -191,4 +289,250 @@
+         ));
+         assert_eq!(registry.get(WindowId(42)), None);
+     }
++
++    #[test]
++    fn menu_load_lifecycle_and_stale_response() {
++        let mut state = State::default();
++        let mut registry = MenuRegistry::default();
++        reduce(
++            &mut state,
++            Event::MenuRegistered {
++                window_id: WindowId(7),
++                endpoint: ep(),
++            },
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::WindowFocused(Some(WindowId(7))),
++            &mut registry,
++        );
++        assert!(reduce(
++            &mut state,
++            Event::MenuLoadRequested {
++                window_id: WindowId(7),
++                endpoint: ep(),
++                request_id: 2
++            },
++            &mut registry
++        ));
++        assert!(!reduce(
++            &mut state,
++            Event::MenuLoaded {
++                window_id: WindowId(7),
++                endpoint: ep(),
++                request_id: 1,
++                model: model()
++            },
++            &mut registry
++        ));
++        assert!(matches!(
++            state.menu,
++            super::super::MenuState::Loading { request_id: 2, .. }
++        ));
++        assert!(reduce(
++            &mut state,
++            Event::MenuLoaded {
++                window_id: WindowId(7),
++                endpoint: ep(),
++                request_id: 2,
++                model: model()
++            },
++            &mut registry
++        ));
++        assert!(matches!(state.menu, super::super::MenuState::Loaded { .. }));
++        reduce(&mut state, Event::WindowFocused(None), &mut registry);
++        assert!(matches!(state.menu, super::super::MenuState::NoMenu));
++    }
++
++    #[test]
++    fn unregister_and_owner_vanished_clear_active_model() {
++        let mut state = State::default();
++        let mut registry = MenuRegistry::default();
++        reduce(
++            &mut state,
++            Event::MenuRegistered {
++                window_id: WindowId(7),
++                endpoint: ep(),
++            },
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::WindowFocused(Some(WindowId(7))),
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::MenuLoadRequested {
++                window_id: WindowId(7),
++                endpoint: ep(),
++                request_id: 1,
++            },
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::MenuLoaded {
++                window_id: WindowId(7),
++                endpoint: ep(),
++                request_id: 1,
++                model: model(),
++            },
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::MenuOwnerVanished {
++                sender: ":1.9".into(),
++            },
++            &mut registry,
++        );
++        assert!(matches!(state.menu, super::super::MenuState::NoMenu));
++    }
++
++    #[test]
++    fn stale_response_from_window_a_is_ignored_after_focus_moves_to_b() {
++        let mut state = State::default();
++        let mut registry = MenuRegistry::default();
++        let endpoint_a = ep();
++        let endpoint_b = super::super::MenuEndpoint {
++            service: ":1.10".into(),
++            object_path: "/menu-b".into(),
++        };
++        reduce(
++            &mut state,
++            Event::MenuRegistered {
++                window_id: WindowId(7),
++                endpoint: endpoint_a.clone(),
++            },
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::MenuRegistered {
++                window_id: WindowId(8),
++                endpoint: endpoint_b.clone(),
++            },
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::WindowFocused(Some(WindowId(7))),
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::MenuLoadRequested {
++                window_id: WindowId(7),
++                endpoint: endpoint_a.clone(),
++                request_id: 10,
++            },
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::WindowFocused(Some(WindowId(8))),
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::MenuLoadRequested {
++                window_id: WindowId(8),
++                endpoint: endpoint_b.clone(),
++                request_id: 11,
++            },
++            &mut registry,
++        );
++        assert!(!reduce(
++            &mut state,
++            Event::MenuLoaded {
++                window_id: WindowId(7),
++                endpoint: endpoint_a,
++                request_id: 10,
++                model: model(),
++            },
++            &mut registry,
++        ));
++        assert!(matches!(
++            state.menu,
++            super::super::MenuState::Loading {
++                window_id: WindowId(8),
++                request_id: 11,
++                ..
++            }
++        ));
++        assert!(reduce(
++            &mut state,
++            Event::MenuLoaded {
++                window_id: WindowId(8),
++                endpoint: endpoint_b,
++                request_id: 11,
++                model: model(),
++            },
++            &mut registry,
++        ));
++    }
++
++    #[test]
++    fn load_failure_and_stale_signals_do_not_corrupt_active_menu() {
++        let mut state = State::default();
++        let mut registry = MenuRegistry::default();
++        reduce(
++            &mut state,
++            Event::MenuRegistered {
++                window_id: WindowId(7),
++                endpoint: ep(),
++            },
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::WindowFocused(Some(WindowId(7))),
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::MenuLoadRequested {
++                window_id: WindowId(7),
++                endpoint: ep(),
++                request_id: 1,
++            },
++            &mut registry,
++        );
++        assert!(reduce(
++            &mut state,
++            Event::MenuLoadFailed {
++                window_id: WindowId(7),
++                endpoint: ep(),
++                request_id: 1,
++                error: "gone".into()
++            },
++            &mut registry
++        ));
++        assert!(matches!(state.menu, super::super::MenuState::Error { .. }));
++        let other = super::super::MenuEndpoint {
++            service: ":1.11".into(),
++            object_path: "/other".into(),
++        };
++        reduce(
++            &mut state,
++            Event::MenuRegistered {
++                window_id: WindowId(8),
++                endpoint: other.clone(),
++            },
++            &mut registry,
++        );
++        reduce(
++            &mut state,
++            Event::WindowFocused(Some(WindowId(8))),
++            &mut registry,
++        );
++        assert!(!reduce(
++            &mut state,
++            Event::MenuLayoutInvalidated { endpoint: ep() },
++            &mut registry,
++        ));
++        assert!(matches!(state.menu, super::super::MenuState::NoMenu));
++    }
+ }
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/src/core/state.rs ./src/core/state.rs
+--- /tmp/xbar-m2a-baseline/src/core/state.rs	2026-08-30 18:50:21.577685890 -0300
++++ ./src/core/state.rs	2026-08-30 20:41:29.394970606 -0300
+@@ -21,12 +21,37 @@
+     pub focused: bool,
+ }
+ 
++use super::{MenuEndpoint, MenuModel};
++
+ #[derive(Clone, Debug, Default, PartialEq)]
+ pub struct State {
+     pub outputs: Vec<OutputState>,
+     pub workspaces: Vec<WorkspaceState>,
+     pub focused_workspace: Option<String>,
+     pub focused_window: Option<WindowId>,
++    pub menu: MenuState,
++}
++
++#[derive(Clone, Debug, Default, PartialEq)]
++pub enum MenuState {
++    #[default]
++    NoMenu,
++    Loading {
++        window_id: WindowId,
++        endpoint: MenuEndpoint,
++        request_id: u64,
++    },
++    Loaded {
++        window_id: WindowId,
++        endpoint: MenuEndpoint,
++        model: MenuModel,
++    },
++    Error {
++        window_id: WindowId,
++        endpoint: MenuEndpoint,
++        request_id: u64,
++        error: String,
++    },
+ }
+ 
+ impl State {
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/src/dbus/menu.rs ./src/dbus/menu.rs
+--- /tmp/xbar-m2a-baseline/src/dbus/menu.rs	1969-12-31 21:00:00.000000000 -0300
++++ ./src/dbus/menu.rs	2026-08-30 21:00:53.823954590 -0300
+@@ -0,0 +1,225 @@
++//! DBusMenu wire types and the conversion boundary to core-owned menu types.
++
++use crate::core::{ChildrenDisplay, MenuItem, MenuItemId, MenuItemType, MenuModel, MenuShortcut};
++use serde::Deserialize;
++use std::collections::HashMap;
++use zbus::zvariant::{OwnedValue, Value};
++
++#[derive(Debug, Deserialize, zbus::zvariant::Type)]
++pub(crate) struct WireLayoutNode(
++    pub(crate) i32,
++    pub(crate) HashMap<String, OwnedValue>,
++    pub(crate) Vec<OwnedValue>,
++);
++
++#[derive(Debug)]
++pub(crate) struct LayoutNode(
++    pub(crate) i32,
++    pub(crate) HashMap<String, OwnedValue>,
++    pub(crate) Vec<LayoutNode>,
++);
++
++pub(crate) fn convert_layout(revision: u32, layout: LayoutNode) -> Result<MenuModel, String> {
++    Ok(MenuModel {
++        revision,
++        root: convert_item(layout)?,
++    })
++}
++
++pub(crate) fn parse_layout(value: OwnedValue) -> Result<LayoutNode, String> {
++    let value = match &*value {
++        Value::Value(inner) => {
++            OwnedValue::try_from(inner.as_ref().clone()).map_err(|error| error.to_string())?
++        }
++        _ => value,
++    };
++    let structure =
++        zbus::zvariant::Structure::try_from(value).map_err(|error| error.to_string())?;
++    let fields = structure.into_fields();
++    if fields.len() != 3 {
++        return Err("DBusMenu layout item must have three fields".into());
++    }
++    let id = i32::try_from(&fields[0]).map_err(|error| error.to_string())?;
++    let properties_value = OwnedValue::try_from(&fields[1]).map_err(|error| error.to_string())?;
++    let properties = HashMap::<String, OwnedValue>::try_from(properties_value)
++        .map_err(|error| format!("invalid item properties: {error}"))?;
++    let array = zbus::zvariant::Array::try_from(&fields[2]).map_err(|error| error.to_string())?;
++    let children = array
++        .inner()
++        .iter()
++        .cloned()
++        .map(OwnedValue::try_from)
++        .map(|value| value.map_err(|error| format!("invalid child value: {error}")))
++        .map(|value| {
++            value.and_then(|value| {
++                parse_layout(value).map_err(|error| format!("invalid child layout: {error}"))
++            })
++        })
++        .collect::<Result<Vec<_>, _>>()?;
++    Ok(LayoutNode(id, properties, children))
++}
++
++pub(crate) fn parse_wire_layout(wire: WireLayoutNode) -> Result<LayoutNode, String> {
++    let children = wire
++        .2
++        .into_iter()
++        .map(|child| parse_layout(child).map_err(|error| format!("invalid child layout: {error}")))
++        .collect::<Result<Vec<_>, _>>()?;
++    Ok(LayoutNode(wire.0, wire.1, children))
++}
++
++fn convert_item(raw: LayoutNode) -> Result<MenuItem, String> {
++    let (id, properties, children) = (raw.0, raw.1, raw.2);
++    let label = string_property(&properties, "label")?;
++    let enabled = bool_property(&properties, "enabled")?.unwrap_or(true);
++    let visible = bool_property(&properties, "visible")?.unwrap_or(true);
++    let item_type = match string_property(&properties, "type")? {
++        None => MenuItemType::Standard,
++        Some(value) if value == "separator" => MenuItemType::Separator,
++        Some(value) if value == "standard" || value.is_empty() => MenuItemType::Standard,
++        Some(value) => MenuItemType::Unknown(value),
++    };
++    let children_display = match string_property(&properties, "children-display")? {
++        None => None,
++        Some(value) if value == "submenu" => Some(ChildrenDisplay::Submenu),
++        Some(value) => Some(ChildrenDisplay::Unknown(value)),
++    };
++    let shortcut = properties
++        .get("shortcut")
++        .map(|value| {
++            Vec::<Vec<String>>::try_from(value.clone())
++                .map(|keys| MenuShortcut { keys })
++                .map_err(|error| format!("invalid shortcut for item {id}: {error}"))
++        })
++        .transpose()?;
++    let icon_name = string_property(&properties, "icon-name")?;
++
++    Ok(MenuItem {
++        id: MenuItemId(id),
++        label,
++        enabled,
++        visible,
++        item_type,
++        children_display,
++        shortcut,
++        icon_name,
++        children: children
++            .into_iter()
++            .map(convert_item)
++            .collect::<Result<_, _>>()?,
++    })
++}
++
++fn string_property(
++    properties: &HashMap<String, OwnedValue>,
++    name: &str,
++) -> Result<Option<String>, String> {
++    properties
++        .get(name)
++        .map(|value| {
++            String::try_from(value.clone())
++                .map_err(|error| format!("invalid {name} property: {error}"))
++        })
++        .transpose()
++}
++
++fn bool_property(
++    properties: &HashMap<String, OwnedValue>,
++    name: &str,
++) -> Result<Option<bool>, String> {
++    properties
++        .get(name)
++        .map(|value| {
++            bool::try_from(value.clone())
++                .map_err(|error| format!("invalid {name} property: {error}"))
++        })
++        .transpose()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use zbus::zvariant::OwnedValue;
++
++    fn node(id: i32, props: &[(&str, OwnedValue)], children: Vec<LayoutNode>) -> LayoutNode {
++        LayoutNode(
++            id,
++            props
++                .iter()
++                .map(|(k, v)| ((*k).into(), v.clone()))
++                .collect(),
++            children,
++        )
++    }
++    fn s(value: &str) -> OwnedValue {
++        OwnedValue::try_from(zbus::zvariant::Value::from(value.to_string())).unwrap()
++    }
++    fn b(value: bool) -> OwnedValue {
++        value.into()
++    }
++
++    #[test]
++    fn converts_nested_tree_and_defaults() {
++        let root = node(
++            0,
++            &[],
++            vec![node(
++                1,
++                &[("label", s("_File")), ("children-display", s("submenu"))],
++                vec![node(
++                    2,
++                    &[
++                        ("label", s("New")),
++                        (
++                            "shortcut",
++                            zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::from(
++                                vec![vec!["<Control>".to_string(), "N".to_string()]],
++                            ))
++                            .unwrap(),
++                        ),
++                    ],
++                    vec![],
++                )],
++            )],
++        );
++        let model = convert_layout(1, root).unwrap();
++        assert_eq!(model.revision, 1);
++        assert_eq!(model.root.children[0].label.as_deref(), Some("_File"));
++        assert!(model.root.enabled && model.root.visible);
++        assert_eq!(
++            model.root.children[0].children_display,
++            Some(ChildrenDisplay::Submenu)
++        );
++        assert_eq!(
++            model.root.children[0].children[0]
++                .shortcut
++                .as_ref()
++                .unwrap()
++                .keys[0],
++            vec!["<Control>", "N"]
++        );
++    }
++
++    #[test]
++    fn preserves_flags_unknown_type_and_optional_properties() {
++        let root = node(
++            0,
++            &[],
++            vec![node(
++                1,
++                &[
++                    ("label", s("Hidden")),
++                    ("enabled", b(false)),
++                    ("visible", b(false)),
++                    ("type", s("future")),
++                    ("icon-name", s("document-new")),
++                ],
++                vec![],
++            )],
++        );
++        let item = &convert_layout(1, root).unwrap().root.children[0];
++        assert!(!item.enabled && !item.visible);
++        assert_eq!(item.item_type, MenuItemType::Unknown("future".into()));
++        assert_eq!(item.icon_name.as_deref(), Some("document-new"));
++    }
++}
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/src/dbus/mod.rs ./src/dbus/mod.rs
+--- /tmp/xbar-m2a-baseline/src/dbus/mod.rs	2026-08-30 19:02:18.196593334 -0300
++++ ./src/dbus/mod.rs	2026-08-30 21:00:53.828954519 -0300
+@@ -1,5 +1,8 @@
+ use crate::core::{Event, MenuRegistry};
++mod menu;
++use async_channel::{Receiver, Sender};
+ use futures_lite::StreamExt;
++use std::collections::HashSet;
+ use std::collections::VecDeque;
+ use std::io::{self, Read, Write};
+ use std::os::fd::{AsRawFd, RawFd};
+@@ -11,6 +14,14 @@
+ 
+ pub const REGISTRAR_NAME: &str = "com.canonical.AppMenu.Registrar";
+ pub const REGISTRAR_PATH: &str = "/com/canonical/AppMenu/Registrar";
++const DBUSMENU_INTERFACE: &str = "com.canonical.dbusmenu";
++
++#[derive(Clone, Debug)]
++struct LayoutRequest {
++    window_id: crate::core::WindowId,
++    endpoint: crate::core::MenuEndpoint,
++    request_id: u64,
++}
+ 
+ type EventQueue = Arc<Mutex<VecDeque<Event>>>;
+ 
+@@ -18,6 +29,7 @@
+     reader: UnixStream,
+     events: EventQueue,
+     _thread: JoinHandle<()>,
++    requests: Sender<LayoutRequest>,
+ }
+ 
+ impl DbusBridge {
+@@ -26,11 +38,14 @@
+         reader.set_nonblocking(true)?;
+         writer.set_nonblocking(true)?;
+         let events = Arc::new(Mutex::new(VecDeque::new()));
++        let (requests, request_receiver) = async_channel::unbounded();
+         let thread_events = Arc::clone(&events);
+         let thread = thread::Builder::new()
+             .name("xbar-dbus".into())
+             .spawn(move || {
+-                if let Err(error) = zbus::block_on(run(thread_events, writer, registry)) {
++                if let Err(error) =
++                    zbus::block_on(run(thread_events, writer, registry, request_receiver))
++                {
+                     eprintln!("xbar: DBus adapter stopped: {error}");
+                 }
+             })?;
+@@ -38,6 +53,7 @@
+             reader,
+             events,
+             _thread: thread,
++            requests,
+         })
+     }
+ 
+@@ -58,6 +74,19 @@
+         let mut events = self.events.lock().expect("DBus event queue poisoned");
+         Ok(events.drain(..).collect())
+     }
++
++    pub fn request_layout(
++        &self,
++        window_id: crate::core::WindowId,
++        endpoint: crate::core::MenuEndpoint,
++        request_id: u64,
++    ) {
++        let _ = self.requests.try_send(LayoutRequest {
++            window_id,
++            endpoint,
++            request_id,
++        });
++    }
+ }
+ 
+ struct Registrar {
+@@ -137,6 +166,7 @@
+     events: EventQueue,
+     writer: UnixStream,
+     registry: Arc<Mutex<MenuRegistry>>,
++    requests: Receiver<LayoutRequest>,
+ ) -> zbus::Result<()> {
+     let wake = Arc::new(Mutex::new(writer));
+     let connection = zbus::connection::Builder::session()?
+@@ -155,16 +185,140 @@
+         .await?;
+     let dbus = zbus::fdo::DBusProxy::new(&connection).await?;
+     let mut owner_changes = dbus.receive_name_owner_changed().await?;
+-    while let Some(signal) = owner_changes.next().await {
+-        let args = signal.args()?;
+-        if args.name().as_str().starts_with(':') && args.new_owner().is_none() {
+-            let sender = args.name().to_string();
+-            events
+-                .lock()
+-                .expect("DBus event queue poisoned")
+-                .push_back(Event::MenuOwnerVanished { sender });
+-            let _ = wake.lock().expect("DBus wake poisoned").write_all(&[1]);
++    let mut watched_endpoints = HashSet::new();
++    loop {
++        let owner = async { Either::Owner(owner_changes.next().await) };
++        let request = async { Either::Request(requests.recv().await) };
++        match futures_lite::future::race(owner, request).await {
++            Either::Owner(Some(signal)) => {
++                let args = signal.args()?;
++                if args.name().as_str().starts_with(':') && args.new_owner().is_none() {
++                    push_event(
++                        &events,
++                        &wake,
++                        Event::MenuOwnerVanished {
++                            sender: args.name().to_string(),
++                        },
++                    );
++                }
++            }
++            Either::Owner(None) | Either::Request(Err(_)) => break,
++            Either::Request(Ok(request)) => {
++                let event = match load_layout(&connection, &request).await {
++                    Ok(model) => Event::MenuLoaded {
++                        window_id: request.window_id,
++                        endpoint: request.endpoint.clone(),
++                        request_id: request.request_id,
++                        model,
++                    },
++                    Err(error) => Event::MenuLoadFailed {
++                        window_id: request.window_id,
++                        endpoint: request.endpoint.clone(),
++                        request_id: request.request_id,
++                        error,
++                    },
++                };
++                push_event(&events, &wake, event);
++                let key = format!(
++                    "{}{}",
++                    request.endpoint.service, request.endpoint.object_path
++                );
++                if watched_endpoints.insert(key) {
++                    install_signal_watcher(&connection, &events, &wake, request.endpoint);
++                }
++            }
+         }
+     }
+     Ok(())
+ }
++
++enum Either<O, R> {
++    Owner(O),
++    Request(R),
++}
++
++async fn load_layout(
++    connection: &zbus::Connection,
++    request: &LayoutRequest,
++) -> Result<crate::core::MenuModel, String> {
++    let proxy = zbus::Proxy::new_owned(
++        connection.clone(),
++        request.endpoint.service.clone(),
++        request.endpoint.object_path.clone(),
++        DBUSMENU_INTERFACE,
++    )
++    .await
++    .map_err(|error| error.to_string())?;
++    let properties = vec![
++        "label",
++        "enabled",
++        "visible",
++        "type",
++        "children-display",
++        "shortcut",
++        "icon-name",
++    ];
++    let (revision, wire_layout): (u32, menu::WireLayoutNode) = proxy
++        .call("GetLayout", &(0_i32, -1_i32, properties))
++        .await
++        .map_err(|error| error.to_string())?;
++    menu::convert_layout(revision, menu::parse_wire_layout(wire_layout)?)
++}
++
++fn install_signal_watcher(
++    connection: &zbus::Connection,
++    events: &EventQueue,
++    wake: &Arc<Mutex<UnixStream>>,
++    endpoint: crate::core::MenuEndpoint,
++) {
++    let connection = connection.clone();
++    let events = Arc::clone(events);
++    let wake = Arc::clone(wake);
++    connection
++        .clone()
++        .executor()
++        .spawn(
++            async move {
++                let proxy = match zbus::Proxy::new_owned(
++                    connection,
++                    endpoint.service.clone(),
++                    endpoint.object_path.clone(),
++                    DBUSMENU_INTERFACE,
++                )
++                .await
++                {
++                    Ok(proxy) => proxy,
++                    Err(_) => return,
++                };
++                let mut signals = match proxy.receive_all_signals().await {
++                    Ok(signals) => signals,
++                    Err(_) => return,
++                };
++                while let Some(signal) = signals.next().await {
++                    let is_update = signal.header().member().is_some_and(|member| {
++                        member.as_str() == "LayoutUpdated"
++                            || member.as_str() == "ItemsPropertiesUpdated"
++                    });
++                    if is_update {
++                        push_event(
++                            &events,
++                            &wake,
++                            Event::MenuLayoutInvalidated {
++                                endpoint: endpoint.clone(),
++                            },
++                        );
++                    }
++                }
++            },
++            "xbar-dbusmenu-signals",
++        )
++        .detach();
++}
++
++fn push_event(events: &EventQueue, wake: &Arc<Mutex<UnixStream>>, event: Event) {
++    events
++        .lock()
++        .expect("DBus event queue poisoned")
++        .push_back(event);
++    let _ = wake.lock().expect("DBus wake poisoned").write_all(&[1]);
++}
+diff -ruN --exclude target --exclude M2B.diff /tmp/xbar-m2a-baseline/src/main.rs ./src/main.rs
+--- /tmp/xbar-m2a-baseline/src/main.rs	2026-08-30 18:51:14.568956152 -0300
++++ ./src/main.rs	2026-08-30 20:41:10.619280915 -0300
+@@ -18,6 +18,7 @@
+     let registry = Arc::new(Mutex::new(core::MenuRegistry::default()));
+     let mut dbus = dbus::DbusBridge::start(Arc::clone(&registry))?;
+     let trace = std::env::var_os("XBAR_TRACE").is_some();
++    let mut next_menu_request_id = 1_u64;
+ 
+     i3.request_workspaces()?;
+     i3.subscribe()?;
+@@ -90,17 +91,39 @@
+                 return Ok(());
+             }
+             outputs_changed |= matches!(&event, Event::OutputsChanged(_));
++            let request_menu = matches!(
++                &event,
++                Event::WindowFocused(_) | Event::MenuRegistered { .. }
++            ) || matches!(&event, Event::MenuLayoutInvalidated { endpoint }
++                    if state.active_menu_endpoint(&registry.lock().expect("registry poisoned")) == Some(endpoint));
+             dirty |= core::reduce(
+                 &mut state,
+                 event,
+                 &mut registry.lock().expect("registry poisoned"),
+             );
++            if request_menu {
++                let mut registry_guard = registry.lock().expect("registry poisoned");
++                if let (Some(window_id), Some(endpoint)) = (
++                    state.focused_window,
++                    state.active_menu_endpoint(&registry_guard).cloned(),
++                ) {
++                    let request_id = next_menu_request_id;
++                    next_menu_request_id += 1;
++                    let request_event = Event::MenuLoadRequested {
++                        window_id,
++                        endpoint: endpoint.clone(),
++                        request_id,
++                    };
++                    dirty |= core::reduce(&mut state, request_event, &mut registry_guard);
++                    dbus.request_layout(window_id, endpoint, request_id);
++                }
++            }
+             if trace {
+                 let registry_guard = registry.lock().expect("registry poisoned");
+                 let active_menu = state.active_menu_endpoint(&registry_guard).cloned();
+                 eprintln!(
+-                    "xbar trace: focused_workspace={:?} focused_window={:?} active_menu_endpoint={active_menu:?} dirty={dirty}",
+-                    state.focused_workspace, state.focused_window
++                    "xbar trace: focused_workspace={:?} focused_window={:?} active_menu_endpoint={active_menu:?} menu_state={:?} dirty={dirty}",
++                    state.focused_workspace, state.focused_window, state.menu
+                 );
+             }
+         }

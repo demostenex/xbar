@@ -1,0 +1,364 @@
+diff -ruN --exclude target --exclude M2B.diff --exclude M2C.diff /tmp/xbar-m2b-baseline/src/bin/appmenu-fixture.rs ./src/bin/appmenu-fixture.rs
+--- /tmp/xbar-m2b-baseline/src/bin/appmenu-fixture.rs	2026-08-30 21:11:01.353584662 -0300
++++ ./src/bin/appmenu-fixture.rs	2026-08-30 21:08:05.560811159 -0300
+@@ -70,15 +70,16 @@
+         vec![new, quit],
+     );
+     let edit = item(4, vec![property("label", value("Editar"))], vec![]);
++    let view = item(5, vec![property("label", value("Exibir"))], vec![]);
+     let help = item(
+-        5,
++        6,
+         vec![
+             property("label", value("Ajuda")),
+             property("visible", value(false)),
+         ],
+         vec![],
+     );
+-    FixtureNode(0, HashMap::new(), vec![file, edit, help])
++    FixtureNode(0, HashMap::new(), vec![file, edit, view, help])
+ }
+ 
+ #[zbus::interface(name = "com.canonical.dbusmenu")]
+diff -ruN --exclude target --exclude M2B.diff --exclude M2C.diff /tmp/xbar-m2b-baseline/src/core/state.rs ./src/core/state.rs
+--- /tmp/xbar-m2b-baseline/src/core/state.rs	2026-08-30 21:11:01.356050568 -0300
++++ ./src/core/state.rs	2026-08-30 21:07:41.209157671 -0300
+@@ -55,6 +55,13 @@
+ }
+ 
+ impl State {
++    pub fn active_menu_model(&self) -> Option<&MenuModel> {
++        match &self.menu {
++            MenuState::Loaded { model, .. } => Some(model),
++            MenuState::NoMenu | MenuState::Loading { .. } | MenuState::Error { .. } => None,
++        }
++    }
++
+     pub fn active_menu_endpoint<'a>(
+         &self,
+         registry: &'a super::MenuRegistry,
+diff -ruN --exclude target --exclude M2B.diff --exclude M2C.diff /tmp/xbar-m2b-baseline/src/platform/x11.rs ./src/platform/x11.rs
+--- /tmp/xbar-m2b-baseline/src/platform/x11.rs	2026-08-30 18:21:59.689039982 -0300
++++ ./src/platform/x11.rs	2026-08-30 21:08:37.000363779 -0300
+@@ -1,5 +1,5 @@
+ use crate::core::{OutputId, OutputState, State};
+-use crate::ui::layout;
++use crate::ui::view;
+ use std::error::Error;
+ use std::os::fd::{AsRawFd, RawFd};
+ use x11rb::connection::Connection;
+@@ -268,7 +268,38 @@
+                 })
+                 .collect();
+             let workspace_values: Vec<_> = workspaces.into_iter().cloned().collect();
+-            let rects = layout::allocate(output, &workspace_values);
++            let active_output = state
++                .focused_workspace
++                .as_ref()
++                .and_then(|name| {
++                    state
++                        .workspaces
++                        .iter()
++                        .find(|workspace| &workspace.name == name)
++                })
++                .and_then(|workspace| workspace.output.as_ref())
++                .is_some_and(|name| {
++                    state
++                        .outputs
++                        .iter()
++                        .any(|candidate| candidate.id == output.id && candidate.name == *name)
++                });
++            let context = view::context_view(
++                output,
++                &workspace_values,
++                if active_output {
++                    state.active_menu_model()
++                } else {
++                    None
++                },
++            );
++            if std::env::var_os("XBAR_TRACE").is_some() {
++                eprintln!(
++                    "xbar trace: context output={} workspaces={:?} menu={:?}",
++                    output.name, context.workspaces, context.menu
++                );
++            }
++            let rects = context.workspaces;
+             for (workspace, rect) in workspace_values.iter().zip(rects) {
+                 let x = rect.x.saturating_sub(output.x).saturating_add(4);
+                 let width = rect.width.saturating_sub(8).max(1);
+@@ -303,6 +334,18 @@
+                 let label = workspace.name.as_bytes();
+                 self.conn.image_text8(bar.window, gc, x + 12, 17, label)?;
+             }
++            for item in context.menu {
++                let x = item.rect.x.saturating_sub(output.x).saturating_add(8);
++                self.conn
++                    .change_gc(
++                        gc,
++                        &xproto::ChangeGCAux::new()
++                            .foreground(self.conn.setup().roots[self.screen].white_pixel),
++                    )?
++                    .check()?;
++                self.conn
++                    .image_text8(bar.window, gc, x, 17, item.label.as_bytes())?;
++            }
+             self.conn.free_gc(gc)?.check()?;
+         }
+         self.conn.flush()?;
+diff -ruN --exclude target --exclude M2B.diff --exclude M2C.diff /tmp/xbar-m2b-baseline/src/ui/layout.rs ./src/ui/layout.rs
+--- /tmp/xbar-m2b-baseline/src/ui/layout.rs	2026-08-30 17:57:43.562114079 -0300
++++ ./src/ui/layout.rs	2026-08-30 21:07:50.545024826 -0300
+@@ -1,3 +1,4 @@
++use crate::core::MenuItemId;
+ use crate::core::{OutputState, WorkspaceState};
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub struct WorkspaceRect {
+@@ -6,6 +7,47 @@
+     pub width: u16,
+     pub height: u16,
+ }
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct MenuRect {
++    pub x: i16,
++    pub y: i16,
++    pub width: u16,
++    pub height: u16,
++}
++
++pub fn allocate_context(
++    output: &OutputState,
++    workspaces: &[WorkspaceState],
++    menu: &[(MenuItemId, String, bool)],
++) -> (Vec<WorkspaceRect>, Vec<MenuRect>) {
++    let workspace_width = (workspaces.len() as u32 * 72).min(output.width as u32) as u16;
++    let workspace_output = OutputState {
++        width: workspace_width,
++        ..output.clone()
++    };
++    let workspaces = allocate(&workspace_output, workspaces);
++    let mut x = output.x.saturating_add(workspace_width as i16);
++    let end = output.x.saturating_add(output.width as i16);
++    let mut rects = Vec::new();
++    for (_, label, _) in menu {
++        let width = (label.chars().count() as u16)
++            .saturating_mul(8)
++            .saturating_add(20)
++            .max(20);
++        if x.saturating_add(width as i16) > end {
++            break;
++        }
++        rects.push(MenuRect {
++            x,
++            y: output.y,
++            width,
++            height: 26,
++        });
++        x = x.saturating_add(width as i16);
++    }
++    (workspaces, rects)
++}
+ pub fn allocate(output: &OutputState, workspaces: &[WorkspaceState]) -> Vec<WorkspaceRect> {
+     if workspaces.is_empty() {
+         return Vec::new();
+diff -ruN --exclude target --exclude M2B.diff --exclude M2C.diff /tmp/xbar-m2b-baseline/src/ui/mod.rs ./src/ui/mod.rs
+--- /tmp/xbar-m2b-baseline/src/ui/mod.rs	2026-08-30 17:57:43.562114079 -0300
++++ ./src/ui/mod.rs	2026-08-30 21:07:02.469708915 -0300
+@@ -1 +1,2 @@
+ pub mod layout;
++pub mod view;
+diff -ruN --exclude target --exclude M2B.diff --exclude M2C.diff /tmp/xbar-m2b-baseline/src/ui/view.rs ./src/ui/view.rs
+--- /tmp/xbar-m2b-baseline/src/ui/view.rs	1969-12-31 21:00:00.000000000 -0300
++++ ./src/ui/view.rs	2026-08-30 21:12:49.431771776 -0300
+@@ -0,0 +1,190 @@
++use crate::core::{MenuItemId, MenuModel};
++use crate::ui::layout::{allocate_context, MenuRect, WorkspaceRect};
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct MenuVisualItem {
++    pub id: MenuItemId,
++    pub rect: MenuRect,
++    pub label: String,
++    pub enabled: bool,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct ContextView {
++    pub workspaces: Vec<WorkspaceRect>,
++    pub menu: Vec<MenuVisualItem>,
++}
++
++pub fn context_view(
++    output: &crate::core::OutputState,
++    workspaces: &[crate::core::WorkspaceState],
++    model: Option<&MenuModel>,
++) -> ContextView {
++    let visible = match model {
++        Some(model) => model
++            .root
++            .children
++            .iter()
++            .filter(|item| item.visible)
++            .filter_map(|item| {
++                item.label
++                    .as_ref()
++                    .map(|label| (item, present_label(label)))
++            })
++            .map(|(item, label)| (item.id, label, item.enabled))
++            .collect::<Vec<_>>(),
++        None => Vec::new(),
++    };
++    let (workspace_rects, menu_rects) = allocate_context(output, workspaces, &visible);
++    ContextView {
++        workspaces: workspace_rects,
++        menu: visible
++            .into_iter()
++            .zip(menu_rects)
++            .map(|((id, label, enabled), rect)| MenuVisualItem {
++                id,
++                rect,
++                label,
++                enabled,
++            })
++            .collect(),
++    }
++}
++
++/// DBusMenu uses `_x` for a mnemonic and `__` for a literal underscore.
++/// Mnemonic presentation belongs here, never in the domain model.
++pub fn present_label(label: &str) -> String {
++    let mut result = String::with_capacity(label.len());
++    let mut chars = label.chars().peekable();
++    while let Some(ch) = chars.next() {
++        if ch == '_' {
++            match chars.peek() {
++                Some('_') => {
++                    result.push('_');
++                    chars.next();
++                }
++                Some(next) if !next.is_whitespace() => {}
++                _ => result.push('_'),
++            }
++        } else {
++            result.push(ch);
++        }
++    }
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::core::{
++        ChildrenDisplay, MenuItem, MenuItemType, MenuModel, OutputId, OutputState, WorkspaceState,
++    };
++
++    fn output(width: u16) -> OutputState {
++        OutputState {
++            id: OutputId(1),
++            name: "HDMI-1".into(),
++            x: 0,
++            y: 0,
++            width,
++            height: 600,
++        }
++    }
++    fn workspace() -> Vec<WorkspaceState> {
++        vec![WorkspaceState {
++            name: "1".into(),
++            output: Some("HDMI-1".into()),
++            focused: true,
++        }]
++    }
++    fn item(id: i32, label: Option<&str>, visible: bool) -> MenuItem {
++        MenuItem {
++            id: MenuItemId(id),
++            label: label.map(str::to_string),
++            enabled: true,
++            visible,
++            item_type: MenuItemType::Standard,
++            children_display: None,
++            shortcut: None,
++            icon_name: None,
++            children: vec![],
++        }
++    }
++    fn loaded(items: Vec<MenuItem>) -> MenuModel {
++        MenuModel {
++            revision: 1,
++            root: MenuItem {
++                id: MenuItemId(0),
++                label: None,
++                enabled: true,
++                visible: true,
++                item_type: MenuItemType::Standard,
++                children_display: Some(ChildrenDisplay::Submenu),
++                shortcut: None,
++                icon_name: None,
++                children: items,
++            },
++        }
++    }
++
++    #[test]
++    fn renders_only_visible_top_level_and_keeps_ids() {
++        let model = loaded(vec![
++            item(1, Some("Arquivo"), true),
++            item(2, Some("Novo"), false),
++            item(3, Some("Editar"), true),
++        ]);
++        let view = context_view(&output(600), &workspace(), Some(&model));
++        assert_eq!(
++            view.menu.iter().map(|item| item.id).collect::<Vec<_>>(),
++            vec![MenuItemId(1), MenuItemId(3)]
++        );
++        assert!(view
++            .menu
++            .iter()
++            .all(|item| item.rect.x >= 0 && item.rect.x + item.rect.width as i16 <= 600));
++    }
++
++    #[test]
++    fn loading_error_and_no_menu_have_no_visual_menu() {
++        assert!(context_view(&output(600), &workspace(), None)
++            .menu
++            .is_empty());
++    }
++
++    #[test]
++    fn mnemonic_presentation_does_not_mutate_domain() {
++        let model = loaded(vec![
++            item(1, Some("_Arquivo"), true),
++            item(2, Some("A__B"), true),
++        ]);
++        let view = context_view(&output(600), &workspace(), Some(&model));
++        assert_eq!(view.menu[0].label, "Arquivo");
++        assert_eq!(view.menu[1].label, "A_B");
++        assert_eq!(model.root.children[0].label.as_deref(), Some("_Arquivo"));
++    }
++
++    #[test]
++    fn overflow_is_clipped_without_invalid_rectangles() {
++        let items = (0..30)
++            .map(|id| item(id, Some("Long menu item"), true))
++            .collect();
++        let model = loaded(items);
++        let view = context_view(&output(120), &workspace(), Some(&model));
++        assert!(view.menu.iter().all(|item| item.rect.x >= 0
++            && item.rect.width > 0
++            && item.rect.x + item.rect.width as i16 <= 120));
++    }
++
++    #[test]
++    fn changing_loaded_model_replaces_visual_menu() {
++        let model_a = loaded(vec![item(1, Some("Arquivo"), true)]);
++        let model_b = loaded(vec![item(9, Some("Preferências"), true)]);
++        let view_a = context_view(&output(600), &workspace(), Some(&model_a));
++        let view_b = context_view(&output(600), &workspace(), Some(&model_b));
++
++        assert_eq!(view_a.menu[0].id, MenuItemId(1));
++        assert_eq!(view_b.menu[0].id, MenuItemId(9));
++        assert_eq!(view_b.menu[0].label, "Preferências");
++    }
++}
