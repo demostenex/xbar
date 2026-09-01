@@ -172,6 +172,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.audio_dragging = false;
             state.audio_drag_input = false;
             state.audio_drag_input = false;
+            state.bluetooth_popup_open = false;
             true
         }
         Event::WindowFocusedWithApp { window, app_name } => {
@@ -186,6 +187,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.audio_popup_open = false;
             state.audio_dragging = false;
             state.audio_drag_input = false;
+            state.bluetooth_popup_open = false;
             true
         }
         Event::MenuRegistered {
@@ -501,19 +503,25 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             true
         }
         Event::MenuClickedOutside => {
-            if state.menu_interaction.open_root.is_some() || state.audio_popup_open {
+            if state.menu_interaction.open_root.is_some()
+                || state.audio_popup_open
+                || state.bluetooth_popup_open
+            {
                 state.menu_interaction = Default::default();
                 state.audio_popup_open = false;
                 state.audio_dragging = false;
                 state.audio_drag_input = false;
+                state.bluetooth_popup_open = false;
                 true
             } else {
                 false
             }
         }
         Event::TrayMenuOpenRequested { .. } => {
-            let changed = state.audio_popup_open || state.audio_dragging;
+            let changed =
+                state.audio_popup_open || state.audio_dragging || state.bluetooth_popup_open;
             state.audio_popup_open = false;
+            state.bluetooth_popup_open = false;
             state.audio_dragging = false;
             state.audio_drag_input = false;
             changed
@@ -656,14 +664,29 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 false
             } else {
                 state.bluetooth = bluetooth;
-                before != after
+                before != after || state.bluetooth_popup_open
             }
         }
         Event::BluetoothUnavailable => {
             let before = bluetooth_visual_state(&state.bluetooth);
             state.bluetooth = Default::default();
+            state.bluetooth_popup_open = false;
             before != bluetooth_visual_state(&state.bluetooth)
         }
+        Event::BluetoothPopupToggled => {
+            state.bluetooth_popup_open = !state.bluetooth_popup_open;
+            if state.bluetooth_popup_open {
+                state.audio_popup_open = false;
+                state.audio_dragging = false;
+                state.audio_drag_input = false;
+                state.menu = MenuState::NoMenu;
+                state.menu_interaction = Default::default();
+            }
+            true
+        }
+        Event::BluetoothSetPowered(_)
+        | Event::BluetoothConnectDevice(_)
+        | Event::BluetoothDisconnectDevice(_) => false,
         Event::AudioUnavailable => {
             let audio = super::AudioState::default();
             let popup_changed = state.audio_popup_open || state.audio_dragging;
@@ -885,6 +908,9 @@ mod tests {
                 path: "/org/bluez/hci0/dev_C01".into(),
                 address: "55:FB:BA:A6:E7:D2".into(),
                 alias: "C01".into(),
+                name: "C01".into(),
+                paired: true,
+                trusted: true,
                 connected: true,
             }],
         };
@@ -899,6 +925,51 @@ mod tests {
             Event::BluetoothUnavailable,
             &mut registry
         ));
+    }
+
+    #[test]
+    fn bluetooth_popup_is_exclusive_and_commands_are_not_optimistic() {
+        let mut state = State {
+            audio_popup_open: true,
+            ..Default::default()
+        };
+        let mut registry = MenuRegistry::default();
+        assert!(reduce(
+            &mut state,
+            Event::BluetoothPopupToggled,
+            &mut registry
+        ));
+        assert!(state.bluetooth_popup_open);
+        assert!(!state.audio_popup_open);
+        assert!(!reduce(
+            &mut state,
+            Event::BluetoothDisconnectDevice("/org/bluez/hci0/dev_C01".into()),
+            &mut registry
+        ));
+        assert!(state.bluetooth_popup_open);
+        assert!(reduce(&mut state, Event::MenuClickedOutside, &mut registry));
+        assert!(!state.bluetooth_popup_open);
+    }
+
+    #[test]
+    fn bluetooth_unavailable_closes_popup_but_power_off_keeps_slot_state() {
+        let mut state = State {
+            bluetooth_popup_open: true,
+            bluetooth: super::super::BluetoothState {
+                available: true,
+                powered: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut registry = MenuRegistry::default();
+        assert!(reduce(
+            &mut state,
+            Event::BluetoothUnavailable,
+            &mut registry
+        ));
+        assert!(!state.bluetooth_popup_open);
+        assert!(!state.bluetooth.available);
     }
 
     #[test]

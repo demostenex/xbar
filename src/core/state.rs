@@ -65,6 +65,9 @@ pub struct BluetoothDevice {
     pub path: String,
     pub address: String,
     pub alias: String,
+    pub name: String,
+    pub paired: bool,
+    pub trusted: bool,
     pub connected: bool,
 }
 
@@ -125,6 +128,7 @@ pub struct State {
     pub audio: AudioState,
     pub network: NetworkState,
     pub bluetooth: BluetoothState,
+    pub bluetooth_popup_open: bool,
     pub audio_popup_open: bool,
     pub audio_dragging: bool,
     pub audio_drag_input: bool,

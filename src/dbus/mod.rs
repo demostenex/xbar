@@ -228,6 +228,9 @@ enum Request {
         root_x: i32,
         root_y: i32,
     },
+    BluetoothSetPowered(bool),
+    BluetoothConnectDevice(String),
+    BluetoothDisconnectDevice(String),
 }
 
 type EventQueue = Arc<Mutex<VecDeque<Event>>>;
@@ -375,6 +378,22 @@ impl DbusBridge {
             root_x,
             root_y,
         });
+    }
+
+    pub fn bluetooth_set_powered(&self, powered: bool) {
+        let _ = self
+            .requests
+            .try_send(Request::BluetoothSetPowered(powered));
+    }
+    pub fn bluetooth_connect_device(&self, path: String) {
+        let _ = self
+            .requests
+            .try_send(Request::BluetoothConnectDevice(path));
+    }
+    pub fn bluetooth_disconnect_device(&self, path: String) {
+        let _ = self
+            .requests
+            .try_send(Request::BluetoothDisconnectDevice(path));
     }
 }
 
@@ -971,6 +990,49 @@ fn bluetooth_bool(properties: &HashMap<String, OwnedValue>, name: &str) -> bool 
         .unwrap_or(false)
 }
 
+async fn bluetooth_set_powered(connection: &zbus::Connection, powered: bool) -> Result<(), String> {
+    let proxy = zbus::Proxy::new_owned(
+        connection.clone(),
+        "org.bluez",
+        "/org/bluez/hci0",
+        "org.freedesktop.DBus.Properties",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    proxy
+        .call(
+            "Set",
+            &(
+                "org.bluez.Adapter1",
+                "Powered",
+                zbus::zvariant::Value::from(powered),
+            ),
+        )
+        .await
+        .map(|_: ()| ())
+        .map_err(|e| e.to_string())
+}
+
+async fn bluetooth_device_call(
+    connection: &zbus::Connection,
+    path: &str,
+    method: &str,
+) -> Result<(), String> {
+    let proxy = zbus::Proxy::new_owned(
+        connection.clone(),
+        "org.bluez",
+        OwnedObjectPath::try_from(path.to_owned()).map_err(|e| e.to_string())?,
+        "org.bluez.Device1",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    proxy
+        .call(method, &())
+        .await
+        .map(|_: ()| ())
+        .map_err(|e| e.to_string())
+}
+
 async fn bluetooth_snapshot(connection: &zbus::Connection) -> zbus::Result<BluetoothState> {
     let proxy = zbus::fdo::ObjectManagerProxy::builder(connection)
         .destination("org.bluez")?
@@ -996,10 +1058,16 @@ async fn bluetooth_snapshot(connection: &zbus::Connection) -> zbus::Result<Bluet
                         alias
                     }
                 },
+                name: bluetooth_string(properties, "Name"),
+                paired: bluetooth_bool(properties, "Paired"),
+                trusted: bluetooth_bool(properties, "Trusted"),
                 connected: bluetooth_bool(properties, "Connected"),
             });
         }
     }
+    state
+        .devices
+        .retain(|device| device.connected || device.paired);
     state.devices.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(state)
 }
@@ -1342,6 +1410,21 @@ async fn run(
                         "xbar: SNI action {:?} failed for {}{}: {error}",
                         action, endpoint.service, endpoint.object_path
                     );
+                }
+            }
+            Either::Request(Ok(Request::BluetoothSetPowered(powered))) => {
+                if let Err(error) = bluetooth_set_powered(&connection, powered).await {
+                    eprintln!("xbar: BlueZ Powered update failed: {error}");
+                }
+            }
+            Either::Request(Ok(Request::BluetoothConnectDevice(path))) => {
+                if let Err(error) = bluetooth_device_call(&connection, &path, "Connect").await {
+                    eprintln!("xbar: BlueZ Connect failed: {error}");
+                }
+            }
+            Either::Request(Ok(Request::BluetoothDisconnectDevice(path))) => {
+                if let Err(error) = bluetooth_device_call(&connection, &path, "Disconnect").await {
+                    eprintln!("xbar: BlueZ Disconnect failed: {error}");
                 }
             }
         }

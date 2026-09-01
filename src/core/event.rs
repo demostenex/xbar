@@ -112,6 +112,10 @@ pub enum Event {
     NetworkSnapshotReceived(NetworkState),
     BluetoothSnapshotReceived(super::BluetoothState),
     BluetoothUnavailable,
+    BluetoothPopupToggled,
+    BluetoothSetPowered(bool),
+    BluetoothConnectDevice(String),
+    BluetoothDisconnectDevice(String),
     AudioPopupToggled,
     AudioTrackChanged {
         input: bool,

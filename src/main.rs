@@ -296,6 +296,32 @@ fn main() -> Result<(), Box<dyn Error>> {
                 ) => Event::AudioPopupToggled,
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::Bluetooth),
+                ) => Event::BluetoothPopupToggled,
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::BluetoothPower),
+                ) => Event::BluetoothSetPowered(!state.bluetooth.powered),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::BluetoothDevice(path)),
+                ) => state
+                    .bluetooth
+                    .devices
+                    .iter()
+                    .find(|d| d.path == *path)
+                    .map_or_else(
+                        || event.clone(),
+                        |d| {
+                            if d.connected {
+                                Event::BluetoothDisconnectDevice(path.clone())
+                            } else {
+                                Event::BluetoothConnectDevice(path.clone())
+                            }
+                        },
+                    ),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::AudioTrack),
                 ) => x11
                     .audio_track_percent(match &event {
@@ -387,6 +413,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { .. }),
                     Some(platform::x11::HitTarget::AudioInside),
+                ) => event.clone(),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { .. }),
+                    Some(platform::x11::HitTarget::BluetoothInside),
                 ) => event.clone(),
                 (
                     Event::X11(platform::x11::X11Event::MotionNotify { .. }),
@@ -547,6 +577,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Event::AudioSelectOutput(ref name) => audio.set_default_output(name),
                 Event::AudioSelectInput(ref name) => audio.set_default_input(name),
                 Event::AudioDragReleased => last_audio_command = None,
+                Event::BluetoothSetPowered(powered) => dbus.bluetooth_set_powered(powered),
+                Event::BluetoothConnectDevice(ref path) => {
+                    dbus.bluetooth_connect_device(path.clone())
+                }
+                Event::BluetoothDisconnectDevice(ref path) => {
+                    dbus.bluetooth_disconnect_device(path.clone())
+                }
                 _ => {}
             }
             if matches!(
@@ -555,6 +592,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                     | Event::AudioInventoryReceived { .. }
                     | Event::AudioUnavailable
             ) && state.audio_popup_open
+            {
+                render_target = Some(match render_target {
+                    Some(current) => current.merge(RenderTarget::Popup),
+                    None => RenderTarget::Popup,
+                });
+            }
+            if matches!(
+                translated,
+                Event::BluetoothSnapshotReceived(_) | Event::BluetoothUnavailable
+            ) && state.bluetooth_popup_open
             {
                 render_target = Some(match render_target {
                     Some(current) => current.merge(RenderTarget::Popup),
@@ -833,6 +880,10 @@ fn render_target_for(
             Some(HitTarget::AudioOutputDevice(_)) | Some(HitTarget::AudioInputDevice(_)) => {
                 Some(RenderTarget::Popup)
             }
+            Some(HitTarget::BluetoothDevice(_)) => Some(RenderTarget::Popup),
+            Some(HitTarget::BluetoothPower)
+            | Some(HitTarget::BluetoothInside)
+            | Some(HitTarget::Bluetooth) => None,
         },
         Event::MenuClickedOutside => Some(RenderTarget::Popup),
         Event::MenuAboutToShowRequested { .. } => Some(RenderTarget::Popup),
@@ -853,6 +904,10 @@ fn render_target_for(
         Event::AudioTrackChanged { .. }
         | Event::AudioDragReleased
         | Event::AudioMuteToggled { .. } => Some(RenderTarget::Popup),
+        Event::BluetoothPopupToggled
+        | Event::BluetoothSetPowered(_)
+        | Event::BluetoothConnectDevice(_)
+        | Event::BluetoothDisconnectDevice(_) => Some(RenderTarget::DockRightPopup),
         Event::StatusNotifierActionRequested { .. } => None,
         _ => Some(RenderTarget::All),
     }

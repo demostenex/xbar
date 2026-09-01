@@ -1,0 +1,762 @@
+diff --git a/src/core/event.rs b/src/core/event.rs
+index b1d6c61..ea2c5c4 100644
+--- a/src/core/event.rs
++++ b/src/core/event.rs
+@@ -112,6 +112,10 @@ pub enum Event {
+     NetworkSnapshotReceived(NetworkState),
+     BluetoothSnapshotReceived(super::BluetoothState),
+     BluetoothUnavailable,
++    BluetoothPopupToggled,
++    BluetoothSetPowered(bool),
++    BluetoothConnectDevice(String),
++    BluetoothDisconnectDevice(String),
+     AudioPopupToggled,
+     AudioTrackChanged {
+         input: bool,
+diff --git a/src/core/reducer.rs b/src/core/reducer.rs
+index 5dabd4d..030bb6b 100644
+--- a/src/core/reducer.rs
++++ b/src/core/reducer.rs
+@@ -172,6 +172,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
+             state.audio_dragging = false;
+             state.audio_drag_input = false;
+             state.audio_drag_input = false;
++            state.bluetooth_popup_open = false;
+             true
+         }
+         Event::WindowFocusedWithApp { window, app_name } => {
+@@ -186,6 +187,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
+             state.audio_popup_open = false;
+             state.audio_dragging = false;
+             state.audio_drag_input = false;
++            state.bluetooth_popup_open = false;
+             true
+         }
+         Event::MenuRegistered {
+@@ -501,19 +503,25 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
+             true
+         }
+         Event::MenuClickedOutside => {
+-            if state.menu_interaction.open_root.is_some() || state.audio_popup_open {
++            if state.menu_interaction.open_root.is_some()
++                || state.audio_popup_open
++                || state.bluetooth_popup_open
++            {
+                 state.menu_interaction = Default::default();
+                 state.audio_popup_open = false;
+                 state.audio_dragging = false;
+                 state.audio_drag_input = false;
++                state.bluetooth_popup_open = false;
+                 true
+             } else {
+                 false
+             }
+         }
+         Event::TrayMenuOpenRequested { .. } => {
+-            let changed = state.audio_popup_open || state.audio_dragging;
++            let changed =
++                state.audio_popup_open || state.audio_dragging || state.bluetooth_popup_open;
+             state.audio_popup_open = false;
++            state.bluetooth_popup_open = false;
+             state.audio_dragging = false;
+             state.audio_drag_input = false;
+             changed
+@@ -656,14 +664,29 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
+                 false
+             } else {
+                 state.bluetooth = bluetooth;
+-                before != after
++                before != after || state.bluetooth_popup_open
+             }
+         }
+         Event::BluetoothUnavailable => {
+             let before = bluetooth_visual_state(&state.bluetooth);
+             state.bluetooth = Default::default();
++            state.bluetooth_popup_open = false;
+             before != bluetooth_visual_state(&state.bluetooth)
+         }
++        Event::BluetoothPopupToggled => {
++            state.bluetooth_popup_open = !state.bluetooth_popup_open;
++            if state.bluetooth_popup_open {
++                state.audio_popup_open = false;
++                state.audio_dragging = false;
++                state.audio_drag_input = false;
++                state.menu = MenuState::NoMenu;
++                state.menu_interaction = Default::default();
++            }
++            true
++        }
++        Event::BluetoothSetPowered(_)
++        | Event::BluetoothConnectDevice(_)
++        | Event::BluetoothDisconnectDevice(_) => false,
+         Event::AudioUnavailable => {
+             let audio = super::AudioState::default();
+             let popup_changed = state.audio_popup_open || state.audio_dragging;
+@@ -885,6 +908,9 @@ mod tests {
+                 path: "/org/bluez/hci0/dev_C01".into(),
+                 address: "55:FB:BA:A6:E7:D2".into(),
+                 alias: "C01".into(),
++                name: "C01".into(),
++                paired: true,
++                trusted: true,
+                 connected: true,
+             }],
+         };
+@@ -901,6 +927,51 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn bluetooth_popup_is_exclusive_and_commands_are_not_optimistic() {
++        let mut state = State {
++            audio_popup_open: true,
++            ..Default::default()
++        };
++        let mut registry = MenuRegistry::default();
++        assert!(reduce(
++            &mut state,
++            Event::BluetoothPopupToggled,
++            &mut registry
++        ));
++        assert!(state.bluetooth_popup_open);
++        assert!(!state.audio_popup_open);
++        assert!(!reduce(
++            &mut state,
++            Event::BluetoothDisconnectDevice("/org/bluez/hci0/dev_C01".into()),
++            &mut registry
++        ));
++        assert!(state.bluetooth_popup_open);
++        assert!(reduce(&mut state, Event::MenuClickedOutside, &mut registry));
++        assert!(!state.bluetooth_popup_open);
++    }
++
++    #[test]
++    fn bluetooth_unavailable_closes_popup_but_power_off_keeps_slot_state() {
++        let mut state = State {
++            bluetooth_popup_open: true,
++            bluetooth: super::super::BluetoothState {
++                available: true,
++                powered: false,
++                ..Default::default()
++            },
++            ..Default::default()
++        };
++        let mut registry = MenuRegistry::default();
++        assert!(reduce(
++            &mut state,
++            Event::BluetoothUnavailable,
++            &mut registry
++        ));
++        assert!(!state.bluetooth_popup_open);
++        assert!(!state.bluetooth.available);
++    }
++
+     #[test]
+     fn audio_drag_release_clears_drag_without_closing_popup() {
+         let mut state = State::default();
+diff --git a/src/core/state.rs b/src/core/state.rs
+index 4c8af11..492a7bd 100644
+--- a/src/core/state.rs
++++ b/src/core/state.rs
+@@ -65,6 +65,9 @@ pub struct BluetoothDevice {
+     pub path: String,
+     pub address: String,
+     pub alias: String,
++    pub name: String,
++    pub paired: bool,
++    pub trusted: bool,
+     pub connected: bool,
+ }
+ 
+@@ -125,6 +128,7 @@ pub struct State {
+     pub audio: AudioState,
+     pub network: NetworkState,
+     pub bluetooth: BluetoothState,
++    pub bluetooth_popup_open: bool,
+     pub audio_popup_open: bool,
+     pub audio_dragging: bool,
+     pub audio_drag_input: bool,
+diff --git a/src/dbus/mod.rs b/src/dbus/mod.rs
+index 7e4082f..dd89301 100644
+--- a/src/dbus/mod.rs
++++ b/src/dbus/mod.rs
+@@ -228,6 +228,9 @@ enum Request {
+         root_x: i32,
+         root_y: i32,
+     },
++    BluetoothSetPowered(bool),
++    BluetoothConnectDevice(String),
++    BluetoothDisconnectDevice(String),
+ }
+ 
+ type EventQueue = Arc<Mutex<VecDeque<Event>>>;
+@@ -376,6 +379,22 @@ impl DbusBridge {
+             root_y,
+         });
+     }
++
++    pub fn bluetooth_set_powered(&self, powered: bool) {
++        let _ = self
++            .requests
++            .try_send(Request::BluetoothSetPowered(powered));
++    }
++    pub fn bluetooth_connect_device(&self, path: String) {
++        let _ = self
++            .requests
++            .try_send(Request::BluetoothConnectDevice(path));
++    }
++    pub fn bluetooth_disconnect_device(&self, path: String) {
++        let _ = self
++            .requests
++            .try_send(Request::BluetoothDisconnectDevice(path));
++    }
+ }
+ 
+ struct Registrar {
+@@ -971,6 +990,49 @@ fn bluetooth_bool(properties: &HashMap<String, OwnedValue>, name: &str) -> bool
+         .unwrap_or(false)
+ }
+ 
++async fn bluetooth_set_powered(connection: &zbus::Connection, powered: bool) -> Result<(), String> {
++    let proxy = zbus::Proxy::new_owned(
++        connection.clone(),
++        "org.bluez",
++        "/org/bluez/hci0",
++        "org.freedesktop.DBus.Properties",
++    )
++    .await
++    .map_err(|e| e.to_string())?;
++    proxy
++        .call(
++            "Set",
++            &(
++                "org.bluez.Adapter1",
++                "Powered",
++                zbus::zvariant::Value::from(powered),
++            ),
++        )
++        .await
++        .map(|_: ()| ())
++        .map_err(|e| e.to_string())
++}
++
++async fn bluetooth_device_call(
++    connection: &zbus::Connection,
++    path: &str,
++    method: &str,
++) -> Result<(), String> {
++    let proxy = zbus::Proxy::new_owned(
++        connection.clone(),
++        "org.bluez",
++        OwnedObjectPath::try_from(path.to_owned()).map_err(|e| e.to_string())?,
++        "org.bluez.Device1",
++    )
++    .await
++    .map_err(|e| e.to_string())?;
++    proxy
++        .call(method, &())
++        .await
++        .map(|_: ()| ())
++        .map_err(|e| e.to_string())
++}
++
+ async fn bluetooth_snapshot(connection: &zbus::Connection) -> zbus::Result<BluetoothState> {
+     let proxy = zbus::fdo::ObjectManagerProxy::builder(connection)
+         .destination("org.bluez")?
+@@ -996,10 +1058,16 @@ async fn bluetooth_snapshot(connection: &zbus::Connection) -> zbus::Result<Bluet
+                         alias
+                     }
+                 },
++                name: bluetooth_string(properties, "Name"),
++                paired: bluetooth_bool(properties, "Paired"),
++                trusted: bluetooth_bool(properties, "Trusted"),
+                 connected: bluetooth_bool(properties, "Connected"),
+             });
+         }
+     }
++    state
++        .devices
++        .retain(|device| device.connected || device.paired);
+     state.devices.sort_by(|a, b| a.path.cmp(&b.path));
+     Ok(state)
+ }
+@@ -1344,6 +1412,21 @@ async fn run(
+                     );
+                 }
+             }
++            Either::Request(Ok(Request::BluetoothSetPowered(powered))) => {
++                if let Err(error) = bluetooth_set_powered(&connection, powered).await {
++                    eprintln!("xbar: BlueZ Powered update failed: {error}");
++                }
++            }
++            Either::Request(Ok(Request::BluetoothConnectDevice(path))) => {
++                if let Err(error) = bluetooth_device_call(&connection, &path, "Connect").await {
++                    eprintln!("xbar: BlueZ Connect failed: {error}");
++                }
++            }
++            Either::Request(Ok(Request::BluetoothDisconnectDevice(path))) => {
++                if let Err(error) = bluetooth_device_call(&connection, &path, "Disconnect").await {
++                    eprintln!("xbar: BlueZ Disconnect failed: {error}");
++                }
++            }
+         }
+     }
+     Ok(())
+diff --git a/src/main.rs b/src/main.rs
+index f001698..c7d133b 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -294,6 +294,32 @@ fn main() -> Result<(), Box<dyn Error>> {
+                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                     Some(platform::x11::HitTarget::Audio),
+                 ) => Event::AudioPopupToggled,
++                (
++                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
++                    Some(platform::x11::HitTarget::Bluetooth),
++                ) => Event::BluetoothPopupToggled,
++                (
++                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
++                    Some(platform::x11::HitTarget::BluetoothPower),
++                ) => Event::BluetoothSetPowered(!state.bluetooth.powered),
++                (
++                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
++                    Some(platform::x11::HitTarget::BluetoothDevice(path)),
++                ) => state
++                    .bluetooth
++                    .devices
++                    .iter()
++                    .find(|d| d.path == *path)
++                    .map_or_else(
++                        || event.clone(),
++                        |d| {
++                            if d.connected {
++                                Event::BluetoothDisconnectDevice(path.clone())
++                            } else {
++                                Event::BluetoothConnectDevice(path.clone())
++                            }
++                        },
++                    ),
+                 (
+                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                     Some(platform::x11::HitTarget::AudioTrack),
+@@ -388,6 +414,10 @@ fn main() -> Result<(), Box<dyn Error>> {
+                     Event::X11(platform::x11::X11Event::ButtonPress { .. }),
+                     Some(platform::x11::HitTarget::AudioInside),
+                 ) => event.clone(),
++                (
++                    Event::X11(platform::x11::X11Event::ButtonPress { .. }),
++                    Some(platform::x11::HitTarget::BluetoothInside),
++                ) => event.clone(),
+                 (
+                     Event::X11(platform::x11::X11Event::MotionNotify { .. }),
+                     Some(platform::x11::HitTarget::Item(path)),
+@@ -547,6 +577,13 @@ fn main() -> Result<(), Box<dyn Error>> {
+                 Event::AudioSelectOutput(ref name) => audio.set_default_output(name),
+                 Event::AudioSelectInput(ref name) => audio.set_default_input(name),
+                 Event::AudioDragReleased => last_audio_command = None,
++                Event::BluetoothSetPowered(powered) => dbus.bluetooth_set_powered(powered),
++                Event::BluetoothConnectDevice(ref path) => {
++                    dbus.bluetooth_connect_device(path.clone())
++                }
++                Event::BluetoothDisconnectDevice(ref path) => {
++                    dbus.bluetooth_disconnect_device(path.clone())
++                }
+                 _ => {}
+             }
+             if matches!(
+@@ -561,6 +598,16 @@ fn main() -> Result<(), Box<dyn Error>> {
+                     None => RenderTarget::Popup,
+                 });
+             }
++            if matches!(
++                translated,
++                Event::BluetoothSnapshotReceived(_) | Event::BluetoothUnavailable
++            ) && state.bluetooth_popup_open
++            {
++                render_target = Some(match render_target {
++                    Some(current) => current.merge(RenderTarget::Popup),
++                    None => RenderTarget::Popup,
++                });
++            }
+             if let Some((endpoint, action, root_x, root_y)) = sni_action {
+                 if trace {
+                     eprintln!("xbar trace: SNI action={action:?} endpoint={endpoint:?} root=({root_x},{root_y})");
+@@ -833,6 +880,10 @@ fn render_target_for(
+             Some(HitTarget::AudioOutputDevice(_)) | Some(HitTarget::AudioInputDevice(_)) => {
+                 Some(RenderTarget::Popup)
+             }
++            Some(HitTarget::BluetoothDevice(_)) => Some(RenderTarget::Popup),
++            Some(HitTarget::BluetoothPower)
++            | Some(HitTarget::BluetoothInside)
++            | Some(HitTarget::Bluetooth) => None,
+         },
+         Event::MenuClickedOutside => Some(RenderTarget::Popup),
+         Event::MenuAboutToShowRequested { .. } => Some(RenderTarget::Popup),
+@@ -853,6 +904,10 @@ fn render_target_for(
+         Event::AudioTrackChanged { .. }
+         | Event::AudioDragReleased
+         | Event::AudioMuteToggled { .. } => Some(RenderTarget::Popup),
++        Event::BluetoothPopupToggled
++        | Event::BluetoothSetPowered(_)
++        | Event::BluetoothConnectDevice(_)
++        | Event::BluetoothDisconnectDevice(_) => Some(RenderTarget::DockRightPopup),
+         Event::StatusNotifierActionRequested { .. } => None,
+         _ => Some(RenderTarget::All),
+     }
+diff --git a/src/platform/x11.rs b/src/platform/x11.rs
+index 9541f19..3d1aa68 100644
+--- a/src/platform/x11.rs
++++ b/src/platform/x11.rs
+@@ -66,6 +66,7 @@ pub struct X11Platform {
+     windows: Vec<BarWindow>,
+     popups: Vec<PopupWindow>,
+     audio_popup: Option<AudioPopupWindow>,
++    bluetooth_popup: Option<BluetoothPopupWindow>,
+     pointer_grabbed: bool,
+     bar_hits: Vec<BarHitMap>,
+ }
+@@ -106,6 +107,12 @@ struct AudioPopupWindow {
+     output_devices: Vec<(String, layout::MenuRect)>,
+     input_devices: Vec<(String, layout::MenuRect)>,
+ }
++struct BluetoothPopupWindow {
++    window: u32,
++    rect: layout::MenuRect,
++    power: layout::MenuRect,
++    devices: Vec<(String, layout::MenuRect)>,
++}
+ type BarHitMap = (
+     u32,
+     OutputId,
+@@ -114,6 +121,7 @@ type BarHitMap = (
+     Vec<view::MenuVisualItem>,
+     Vec<view::TrayVisualItem>,
+     Option<view::AudioVisual>,
++    Option<view::BluetoothVisual>,
+ );
+ 
+ #[derive(Clone, Debug, PartialEq)]
+@@ -129,6 +137,10 @@ pub enum HitTarget {
+     AudioOutputDevice(String),
+     AudioInputDevice(String),
+     AudioInside,
++    Bluetooth,
++    BluetoothPower,
++    BluetoothDevice(String),
++    BluetoothInside,
+     Outside,
+ }
+ 
+@@ -220,6 +232,7 @@ impl X11Platform {
+             windows: Vec::new(),
+             popups: Vec::new(),
+             audio_popup: None,
++            bluetooth_popup: None,
+             pointer_grabbed: false,
+             bar_hits: Vec::new(),
+         })
+@@ -310,6 +323,10 @@ impl X11Platform {
+                 .audio_popup
+                 .as_ref()
+                 .is_some_and(|popup| popup.window == window)
++            || self
++                .bluetooth_popup
++                .as_ref()
++                .is_some_and(|popup| popup.window == window)
+     }
+     pub fn acquire_instance(&mut self) -> Result<bool, Box<dyn Error>> {
+         let window = self.conn.generate_id()?;
+@@ -750,12 +767,19 @@ impl X11Platform {
+             target,
+             RenderTarget::Popup | RenderTarget::DockRightPopup | RenderTarget::All
+         ) {
+-            if !state.audio_popup_open {
++            if !state.audio_popup_open && !state.bluetooth_popup_open {
+                 self.render_popups(state)?;
+             } else {
+                 self.destroy_popup_suffix(0)?;
+             }
+-            self.render_audio_popup(state)?;
++            if state.bluetooth_popup_open {
++                if self.audio_popup.is_some() {
++                    self.close_popups(Some(state))?;
++                }
++                self.render_bluetooth_popup(state)?;
++            } else {
++                self.render_audio_popup(state)?;
++            }
+         }
+         self.conn.flush()?;
+         self.text.flush();
+@@ -861,6 +885,7 @@ impl X11Platform {
+                 context.menu.clone(),
+                 context.tray.clone(),
+                 context.audio.clone(),
++                context.bluetooth.clone(),
+             ));
+             if std::env::var_os("XBAR_TRACE").is_some() {
+                 eprintln!(
+@@ -1106,6 +1131,10 @@ impl X11Platform {
+                 eprintln!("xbar trace: audio popup destroyed xid={}", popup.window);
+             }
+         }
++        if let Some(popup) = self.bluetooth_popup.take() {
++            self.text.release_drawable(popup.window);
++            self.conn.destroy_window(popup.window)?.check()?;
++        }
+         if self.pointer_grabbed {
+             if std::env::var_os("XBAR_TRACE").is_some() {
+                 if let Some(state) = state {
+@@ -1406,6 +1435,173 @@ impl X11Platform {
+         Ok(())
+     }
+ 
++    fn render_bluetooth_popup(&mut self, state: &State) -> Result<(), Box<dyn Error>> {
++        if !state.bluetooth_popup_open || !state.bluetooth.available {
++            if self.bluetooth_popup.is_some() {
++                self.close_popups(Some(state))?;
++            }
++            return Ok(());
++        }
++        let output = state
++            .outputs
++            .first()
++            .ok_or("no output for bluetooth popup")?;
++        let devices: Vec<_> = state
++            .bluetooth
++            .devices
++            .iter()
++            .filter(|d| d.connected || d.paired)
++            .collect();
++        let rect = layout::MenuRect {
++            x: (output.x + output.width as i16 - 330).max(output.x),
++            y: output.y + 26,
++            width: 330,
++            height: (72 + devices.len() as u16 * 30).min(output.height.saturating_sub(26).max(120)),
++        };
++        let power = layout::MenuRect {
++            x: rect.x + rect.width as i16 - 82,
++            y: rect.y + 8,
++            width: 68,
++            height: 28,
++        };
++        let rows: Vec<_> = devices
++            .iter()
++            .enumerate()
++            .map(|(i, d)| {
++                (
++                    d.path.clone(),
++                    layout::MenuRect {
++                        x: rect.x + 10,
++                        y: rect.y + 58 + i as i16 * 30,
++                        width: rect.width - 20,
++                        height: 28,
++                    },
++                )
++            })
++            .collect();
++        let window = if let Some(p) = &self.bluetooth_popup {
++            p.window
++        } else {
++            let w = self.conn.generate_id()?;
++            self.conn
++                .create_window(
++                    x11rb::COPY_FROM_PARENT as u8,
++                    w,
++                    self.root,
++                    rect.x,
++                    rect.y,
++                    rect.width,
++                    rect.height,
++                    1,
++                    WindowClass::INPUT_OUTPUT,
++                    x11rb::COPY_FROM_PARENT,
++                    &xproto::CreateWindowAux::new()
++                        .background_pixel(BAR_STYLE.popup_background)
++                        .override_redirect(1)
++                        .event_mask(
++                            EventMask::EXPOSURE
++                                | EventMask::BUTTON_PRESS
++                                | EventMask::POINTER_MOTION,
++                        ),
++                )?
++                .check()?;
++            self.conn.map_window(w)?.check()?;
++            w
++        };
++        let resize = self
++            .bluetooth_popup
++            .as_ref()
++            .is_some_and(|p| p.rect != rect);
++        self.bluetooth_popup = Some(BluetoothPopupWindow {
++            window,
++            rect,
++            power,
++            devices: rows.clone(),
++        });
++        if resize {
++            self.conn
++                .configure_window(
++                    window,
++                    &xproto::ConfigureWindowAux::new()
++                        .x(rect.x as i32)
++                        .y(rect.y as i32)
++                        .width(rect.width as u32)
++                        .height(rect.height as u32),
++                )?
++                .check()?;
++        }
++        let geometry = self.conn.get_geometry(window)?.reply()?;
++        let attrs = self.conn.get_window_attributes(window)?.reply()?;
++        self.text
++            .prepare_drawable(window, attrs.visual, geometry.depth)?;
++        let gc = self.conn.generate_id()?;
++        self.conn
++            .create_gc(
++                gc,
++                window,
++                &xproto::CreateGCAux::new().foreground(BAR_STYLE.popup_foreground),
++            )?
++            .check()?;
++        self.conn
++            .poly_rectangle(
++                window,
++                gc,
++                &[xproto::Rectangle {
++                    x: 0,
++                    y: 0,
++                    width: rect.width,
++                    height: rect.height,
++                }],
++            )?
++            .check()?;
++        self.text.draw_popup_utf8(
++            &format!(
++                "Bluetooth                 {}",
++                if state.bluetooth.powered { "ON" } else { "OFF" }
++            ),
++            12,
++            25,
++            BAR_STYLE.popup_foreground,
++        )?;
++        self.text
++            .draw_popup_utf8("Dispositivos", 12, 50, BAR_STYLE.popup_foreground)?;
++        for (i, d) in devices.iter().enumerate() {
++            let name = if !d.alias.is_empty() {
++                &d.alias
++            } else if !d.name.is_empty() {
++                &d.name
++            } else {
++                &d.address
++            };
++            let marker = if d.connected { "✓" } else { " " };
++            let status = if d.connected { "Connected" } else { "Paired" };
++            self.text.draw_popup_utf8(
++                &format!("{marker} {name:<20} {status}"),
++                14,
++                78 + i as i32 * 30,
++                BAR_STYLE.popup_foreground,
++            )?;
++        }
++        self.conn.free_gc(gc)?.check()?;
++        if !self.pointer_grabbed {
++            let grab = self
++                .conn
++                .grab_pointer(
++                    false,
++                    self.root,
++                    EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
++                    xproto::GrabMode::ASYNC,
++                    xproto::GrabMode::ASYNC,
++                    x11rb::NONE,
++                    x11rb::NONE,
++                    0_u32,
++                )?
++                .reply()?;
++            self.pointer_grabbed = grab.status == xproto::GrabStatus::SUCCESS;
++        }
++        Ok(())
++    }
++
+     fn draw_audio_slider(
+         &self,
+         window: u32,
+@@ -1491,7 +1687,7 @@ impl X11Platform {
+         let anchor = self
+             .bar_hits
+             .iter()
+-            .find_map(|(_, output_id, _, _, items, tray, _)| {
++            .find_map(|(_, output_id, _, _, items, tray, _, _)| {
+                 if let Some(endpoint) = tray_endpoint {
+                     tray.iter()
+                         .find(|item| item.endpoint.service == endpoint.service)
+@@ -1772,8 +1968,8 @@ impl X11Platform {
+             | X11Event::MotionNotify { window, x, y } => (*window, *x, *y, *x, *y),
+             _ => return HitTarget::Outside,
+         };
+-        if let Some((_bar, _, ox, oy, items, tray, audio)) =
+-            self.bar_hits.iter().find(|(bar, _, _, _, _, _, _)| {
++        if let Some((_bar, _, ox, oy, items, tray, audio, bluetooth)) =
++            self.bar_hits.iter().find(|(bar, _, _, _, _, _, _, _)| {
+                 *bar == window || (self.root == window && root_y < BAR_HEIGHT as i16)
+             })
+         {
+@@ -1803,6 +1999,15 @@ impl X11Platform {
+                     return HitTarget::Audio;
+                 }
+             }
++            if let Some(bluetooth) = bluetooth {
++                if root_x >= bluetooth.rect.x
++                    && root_x < bluetooth.rect.x + bluetooth.rect.width as i16
++                    && root_y >= bluetooth.rect.y
++                    && root_y < bluetooth.rect.y + bluetooth.rect.height as i16
++                {
++                    return HitTarget::Bluetooth;
++                }
++            }
+             return tray_hit(tray, root_x, root_y)
+                 .map(HitTarget::Tray)
+                 .unwrap_or(HitTarget::Outside);
+@@ -1872,6 +2077,42 @@ impl X11Platform {
+                 return HitTarget::AudioInside;
+             }
+         }
++        if let Some(popup) = &self.bluetooth_popup {
++            let inside = popup.window == window
++                || (self.root == window
++                    && root_x >= popup.rect.x
++                    && root_x < popup.rect.x + popup.rect.width as i16
++                    && root_y >= popup.rect.y
++                    && root_y < popup.rect.y + popup.rect.height as i16);
++            if inside {
++                let rx = if popup.window == window {
++                    x + popup.rect.x
++                } else {
++                    root_x
++                };
++                let ry = if popup.window == window {
++                    y + popup.rect.y
++                } else {
++                    root_y
++                };
++                if rx >= popup.power.x
++                    && rx < popup.power.x + popup.power.width as i16
++                    && ry >= popup.power.y
++                    && ry < popup.power.y + popup.power.height as i16
++                {
++                    return HitTarget::BluetoothPower;
++                }
++                if let Some((path, _)) = popup.devices.iter().find(|(_, r)| {
++                    rx >= r.x
++                        && rx < r.x + r.width as i16
++                        && ry >= r.y
++                        && ry < r.y + r.height as i16
++                }) {
++                    return HitTarget::BluetoothDevice(path.clone());
++                }
++                return HitTarget::BluetoothInside;
++            }
++        }
+         for (level, popup) in self.popups.iter().enumerate() {
+             if popup.window != window && self.root != window {
+                 continue;
