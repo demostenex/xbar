@@ -215,6 +215,7 @@ pub struct State {
     pub bluetooth_pending: Vec<BluetoothPendingAction>,
     pub bluetooth_popup_open: bool,
     pub network_popup_open: bool,
+    pub network_popup_open_pending: bool,
     pub audio_popup_open: bool,
     pub notifications: Vec<Notification>,
     pub audio_dragging: bool,

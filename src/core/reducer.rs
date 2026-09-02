@@ -183,6 +183,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.audio_drag_input = false;
             state.bluetooth_popup_open = false;
             state.network_popup_open = false;
+            state.network_popup_open_pending = false;
             true
         }
         Event::WindowFocusedWithApp { window, app_name } => {
@@ -199,6 +200,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.audio_drag_input = false;
             state.bluetooth_popup_open = false;
             state.network_popup_open = false;
+            state.network_popup_open_pending = false;
             true
         }
         Event::MenuRegistered {
@@ -675,8 +677,38 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 visual_before != visual_after || state.network_popup_open
             }
         }
+        Event::NetworkPopupOpenRequested => {
+            if state.network_popup_open || state.network_popup_open_pending {
+                false
+            } else {
+                state.network_popup_open_pending = true;
+                state.audio_popup_open = false;
+                state.audio_dragging = false;
+                state.audio_drag_input = false;
+                state.bluetooth_popup_open = false;
+                state.menu = MenuState::NoMenu;
+                state.menu_interaction = Default::default();
+                true
+            }
+        }
+        Event::NetworkPopupSnapshotReceived(network) => {
+            if !state.network_popup_open_pending {
+                false
+            } else {
+                state.network_popup_open_pending = false;
+                state.network = network;
+                state.network_popup_open = true;
+                true
+            }
+        }
+        Event::NetworkPopupSnapshotFailed => {
+            let pending = state.network_popup_open_pending;
+            state.network_popup_open_pending = false;
+            pending
+        }
         Event::NetworkPopupToggled => {
             state.network_popup_open = !state.network_popup_open;
+            state.network_popup_open_pending = false;
             if state.network_popup_open {
                 state.audio_popup_open = false;
                 state.audio_dragging = false;
@@ -1241,6 +1273,87 @@ mod tests {
     }
 
     #[test]
+    fn reopening_network_popup_uses_each_fresh_same_device_snapshot() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let snapshot = |active_connection: &str, active_ap: &str, five_ghz: bool| {
+            let five = wifi_ap(
+                "/device/0",
+                "wlan0",
+                "DEMOSTENES-5G",
+                5765,
+                80,
+                five_ghz,
+                Some("profile-5g"),
+            );
+            let two_four = wifi_ap(
+                "/device/0",
+                "wlan0",
+                "DEMOSTENES-2.4G",
+                2417,
+                75,
+                !five_ghz,
+                Some("profile-2.4g"),
+            );
+            wifi_snapshot(
+                vec![super::super::WifiDevice {
+                    path: "/device/0".into(),
+                    interface: "wlan0".into(),
+                    active_connection: Some(active_connection.into()),
+                    active_ap: Some(active_ap.into()),
+                    access_points: vec![five, two_four],
+                    ..Default::default()
+                }],
+                true,
+            )
+        };
+        let assert_active = |state: &State, ssid: &str| {
+            let device = &state.network.wifi_devices[0];
+            assert_eq!(
+                device
+                    .access_points
+                    .iter()
+                    .filter(|access_point| access_point.is_active)
+                    .map(|access_point| access_point.ssid.as_str())
+                    .collect::<Vec<_>>(),
+                vec![ssid]
+            );
+        };
+
+        for (connection, ap, five_ghz, expected) in [
+            ("/active/5g", "/ap/5g", true, "DEMOSTENES-5G"),
+            ("/active/2.4g", "/ap/2.4g", false, "DEMOSTENES-2.4G"),
+            ("/active/5g-again", "/ap/5g-again", true, "DEMOSTENES-5G"),
+            (
+                "/active/2.4g-again",
+                "/ap/2.4g-again",
+                false,
+                "DEMOSTENES-2.4G",
+            ),
+            ("/active/5g-final", "/ap/5g-final", true, "DEMOSTENES-5G"),
+        ] {
+            assert!(reduce(
+                &mut state,
+                Event::NetworkPopupToggled,
+                &mut registry,
+            ));
+            assert!(state.network_popup_open);
+            assert!(reduce(
+                &mut state,
+                Event::NetworkSnapshotReceived(snapshot(connection, ap, five_ghz)),
+                &mut registry,
+            ));
+            assert_active(&state, expected);
+            assert!(reduce(
+                &mut state,
+                Event::NetworkPopupToggled,
+                &mut registry,
+            ));
+            assert!(!state.network_popup_open);
+        }
+    }
+
+    #[test]
     fn bluetooth_visual_states_and_deduplication() {
         let mut state = State::default();
         let mut registry = MenuRegistry::default();
@@ -1386,6 +1499,101 @@ mod tests {
             &mut registry
         ));
         assert!(state.network_pending.is_empty());
+    }
+
+    #[test]
+    fn network_popup_fetch_first_never_maps_stale_state() {
+        let mut state = State {
+            network: wifi_snapshot(
+                vec![super::super::WifiDevice {
+                    interface: "wlan0".into(),
+                    active_connection: Some("/active/5g".into()),
+                    access_points: vec![wifi_ap(
+                        "/device/0",
+                        "wlan0",
+                        "DEMOSTENES-5G",
+                        5765,
+                        80,
+                        true,
+                        None,
+                    )],
+                    ..Default::default()
+                }],
+                true,
+            ),
+            ..Default::default()
+        };
+        let mut registry = MenuRegistry::default();
+
+        assert!(reduce(
+            &mut state,
+            Event::NetworkPopupOpenRequested,
+            &mut registry,
+        ));
+        assert!(state.network_popup_open_pending);
+        assert!(!state.network_popup_open);
+
+        let fresh = wifi_snapshot(
+            vec![super::super::WifiDevice {
+                interface: "wlan0".into(),
+                active_connection: Some("/active/2.4g".into()),
+                access_points: vec![
+                    wifi_ap("/device/0", "wlan0", "DEMOSTENES-5G", 5765, 80, false, None),
+                    wifi_ap(
+                        "/device/0",
+                        "wlan0",
+                        "DEMOSTENES-2.4G",
+                        2417,
+                        75,
+                        true,
+                        None,
+                    ),
+                ],
+                ..Default::default()
+            }],
+            true,
+        );
+        assert!(reduce(
+            &mut state,
+            Event::NetworkPopupSnapshotReceived(fresh),
+            &mut registry,
+        ));
+        assert!(!state.network_popup_open_pending);
+        assert!(state.network_popup_open);
+        let active = &state.network.wifi_devices[0].access_points;
+        assert!(!active
+            .iter()
+            .any(|ap| ap.ssid == "DEMOSTENES-5G" && ap.is_active));
+        assert!(active
+            .iter()
+            .any(|ap| ap.ssid == "DEMOSTENES-2.4G" && ap.is_active));
+    }
+
+    #[test]
+    fn network_popup_snapshot_failure_releases_pending_for_next_click() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+
+        assert!(reduce(
+            &mut state,
+            Event::NetworkPopupOpenRequested,
+            &mut registry,
+        ));
+        assert!(state.network_popup_open_pending);
+        assert!(reduce(
+            &mut state,
+            Event::NetworkPopupSnapshotFailed,
+            &mut registry,
+        ));
+        assert!(!state.network_popup_open_pending);
+        assert!(!state.network_popup_open);
+
+        assert!(reduce(
+            &mut state,
+            Event::NetworkPopupOpenRequested,
+            &mut registry,
+        ));
+        assert!(state.network_popup_open_pending);
     }
 
     #[test]

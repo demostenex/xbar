@@ -236,6 +236,7 @@ enum Request {
     BluetoothConnectDevice(String),
     BluetoothDisconnectDevice(String),
     NetworkSetWireless(bool),
+    NetworkPopupSnapshot,
     NetworkScan,
     NotificationTimerFired,
     WindowAttention {
@@ -453,6 +454,10 @@ impl DbusBridge {
     }
     pub fn network_scan(&self) {
         let _ = self.requests.try_send(Request::NetworkScan);
+    }
+
+    pub fn network_popup_snapshot(&self) {
+        let _ = self.requests.try_send(Request::NetworkPopupSnapshot);
     }
 }
 
@@ -1160,6 +1165,37 @@ async fn network_snapshot(connection: &zbus::Connection) -> zbus::Result<Network
         };
     }
     Ok(result)
+}
+
+async fn network_popup_fresh_snapshot() -> Result<NetworkState, String> {
+    let read = async {
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!("xbar trace: NETWORK_POPUP_FRESH_CONNECTION_BEGIN");
+        }
+        let connection = zbus::Connection::system()
+            .await
+            .map_err(|error| format!("system bus connection failed: {error}"))?;
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!("xbar trace: NETWORK_POPUP_FRESH_CONNECTION_READY");
+            eprintln!("xbar trace: NETWORK_POPUP_SNAPSHOT_BEGIN");
+        }
+        let snapshot = network_snapshot(&connection)
+            .await
+            .map_err(|error| format!("fresh NetworkManager snapshot failed: {error}"))?;
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!("xbar trace: NETWORK_POPUP_SNAPSHOT_COMPLETE");
+        }
+        drop(connection);
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!("xbar trace: NETWORK_POPUP_FRESH_CONNECTION_DROP");
+        }
+        Ok(snapshot)
+    };
+    let timeout = async {
+        async_io::Timer::after(std::time::Duration::from_secs(5)).await;
+        Err("fresh NetworkManager snapshot timed out after 5 seconds".to_owned())
+    };
+    futures_lite::future::race(read, timeout).await
 }
 
 fn deduplicate_wifi_access_points(
@@ -1993,11 +2029,39 @@ async fn run(
                     }, "xbar-network-command").detach();
                 }
             }
+            Either::Request(Ok(Request::NetworkPopupSnapshot)) => {
+                if let Some((_, executor)) = &system_connection {
+                    let events = Arc::clone(&events);
+                    let wake = Arc::clone(&wake);
+                    executor
+                        .spawn(
+                            async move {
+                                match network_popup_fresh_snapshot().await {
+                                    Ok(snapshot) => {
+                                        push_event(
+                                            &events,
+                                            &wake,
+                                            Event::NetworkPopupSnapshotReceived(snapshot),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        eprintln!("xbar: Network popup snapshot failed: {error}");
+                                        push_event(
+                                            &events,
+                                            &wake,
+                                            Event::NetworkPopupSnapshotFailed,
+                                        );
+                                    }
+                                }
+                            },
+                            "xbar-network-popup-snapshot",
+                        )
+                        .detach();
+                }
+            }
             Either::Request(Ok(Request::NetworkScan)) => {
                 if let Some((system, executor)) = &system_connection {
                     let system = system.clone();
-                    let events = Arc::clone(&events);
-                    let wake = Arc::clone(&wake);
                     executor
                         .spawn(
                             async move {
@@ -2007,13 +2071,6 @@ async fn run(
                                             "xbar trace: NetworkManager scan failed: {error}"
                                         );
                                     }
-                                }
-                                if let Ok(snapshot) = network_snapshot(&system).await {
-                                    push_event(
-                                        &events,
-                                        &wake,
-                                        Event::NetworkSnapshotReceived(snapshot),
-                                    );
                                 }
                             },
                             "xbar-network-scan",

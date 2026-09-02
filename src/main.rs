@@ -335,7 +335,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::Network),
-                ) => Event::NetworkPopupToggled,
+                ) => {
+                    if state.network_popup_open {
+                        Event::NetworkPopupToggled
+                    } else {
+                        Event::NetworkPopupOpenRequested
+                    }
+                }
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::NetworkWireless),
@@ -603,6 +609,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 translated.clone(),
                 &mut registry.lock().expect("registry poisoned"),
             );
+            if trace && matches!(translated, Event::NetworkPopupSnapshotReceived(_)) && reduced {
+                let active = state
+                    .network
+                    .wifi_devices
+                    .iter()
+                    .filter(|device| device.active_connection.is_some())
+                    .map(|device| {
+                        let active = device
+                            .access_points
+                            .iter()
+                            .find(|access_point| access_point.is_active)
+                            .map(|access_point| {
+                                format!(
+                                    "{} ({})",
+                                    access_point.ssid,
+                                    crate::core::wifi_band(access_point.frequency)
+                                )
+                            })
+                            .unwrap_or_else(|| "-".to_owned());
+                        format!("{}={active}", device.interface)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!("xbar trace: NETWORK_POPUP_OPEN active_device={active}");
+            }
             if matches!(translated, Event::AudioSnapshotReceived(_)) && reduced {
                 let current_audio_glyph =
                     (state.audio.available, ui::view::audio_glyph(&state.audio));
@@ -659,7 +690,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 _ => {}
             }
-            if matches!(translated, Event::NetworkPopupToggled) && state.network_popup_open {
+            if matches!(translated, Event::NetworkPopupOpenRequested) && reduced {
+                if trace {
+                    eprintln!("xbar trace: NETWORK_POPUP_OPEN_REQUEST");
+                }
+                dbus.network_popup_snapshot();
+            }
+            if matches!(translated, Event::NetworkPopupSnapshotReceived(_))
+                && state.network_popup_open
+            {
                 dbus.network_scan();
             }
             if matches!(
@@ -686,7 +725,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             if matches!(
                 translated,
-                Event::NetworkSnapshotReceived(_) | Event::NetworkActionFinished(_)
+                Event::NetworkSnapshotReceived(_)
+                    | Event::NetworkPopupSnapshotReceived(_)
+                    | Event::NetworkActionFinished(_)
             ) && state.network_popup_open
             {
                 render_target = Some(match render_target {
@@ -999,6 +1040,9 @@ fn render_target_for(
         | Event::BluetoothDisconnectDevice(_)
         | Event::BluetoothActionFinished(_) => Some(RenderTarget::Popup),
         Event::NetworkPopupToggled
+        | Event::NetworkPopupOpenRequested
+        | Event::NetworkPopupSnapshotReceived(_)
+        | Event::NetworkPopupSnapshotFailed
         | Event::NetworkSetWireless(_)
         | Event::NetworkActionFinished(_) => Some(RenderTarget::Popup),
         Event::NotificationsSnapshot(_) => Some(RenderTarget::Notification),
