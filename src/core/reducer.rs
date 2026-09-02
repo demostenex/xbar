@@ -942,6 +942,305 @@ mod tests {
     }
 
     #[test]
+    fn wifi_inventory_is_device_scoped_and_duplicate_snapshots_are_quiet() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let access_point = |device: &str, interface: &str| super::super::NetworkAccessPoint {
+            path: format!("{device}/ap"),
+            device_path: device.into(),
+            interface: interface.into(),
+            ssid: "SAME-SSID".into(),
+            strength: 80,
+            frequency: 2412,
+            is_active: false,
+            saved_profile: None,
+        };
+        let inventory = super::super::NetworkState {
+            available: true,
+            wireless_enabled: true,
+            wifi_devices: vec![
+                super::super::WifiDevice {
+                    path: "/device/0".into(),
+                    interface: "wlan0".into(),
+                    access_points: vec![access_point("/device/0", "wlan0")],
+                    ..Default::default()
+                },
+                super::super::WifiDevice {
+                    path: "/device/1".into(),
+                    interface: "wlan1".into(),
+                    access_points: vec![access_point("/device/1", "wlan1")],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!reduce(
+            &mut state,
+            Event::NetworkSnapshotReceived(inventory.clone()),
+            &mut registry,
+        ));
+        assert_eq!(state.network.wifi_devices.len(), 2);
+        assert_eq!(
+            state.network.wifi_devices[0].access_points[0].saved_profile,
+            None
+        );
+        assert_eq!(super::super::wifi_band(5765), "5 GHz");
+        assert!(!reduce(
+            &mut state,
+            Event::NetworkSnapshotReceived(inventory),
+            &mut registry,
+        ));
+    }
+
+    fn wifi_ap(
+        device: &str,
+        interface: &str,
+        ssid: &str,
+        frequency: u32,
+        strength: u8,
+        is_active: bool,
+        saved_profile: Option<&str>,
+    ) -> super::super::NetworkAccessPoint {
+        super::super::NetworkAccessPoint {
+            path: format!("{device}/{ssid}/{frequency}/{strength}"),
+            device_path: device.into(),
+            interface: interface.into(),
+            ssid: ssid.into(),
+            strength,
+            frequency,
+            is_active,
+            saved_profile: saved_profile.map(str::to_owned),
+        }
+    }
+
+    fn wifi_snapshot(
+        devices: Vec<super::super::WifiDevice>,
+        enabled: bool,
+    ) -> super::super::NetworkState {
+        super::super::NetworkState {
+            available: true,
+            wireless_enabled: enabled,
+            wifi_devices: devices,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wifi_inventory_keeps_unsaved_and_saved_candidates_and_filters_empty_ssid() {
+        let device = super::super::WifiDevice {
+            path: "/device/0".into(),
+            interface: "wlan0".into(),
+            raw_access_points: 4,
+            named_access_points: 3,
+            access_points: vec![
+                wifi_ap(
+                    "/device/0",
+                    "wlan0",
+                    "A",
+                    2412,
+                    50,
+                    false,
+                    Some("profile-a"),
+                ),
+                wifi_ap("/device/0", "wlan0", "B", 2412, 60, false, None),
+                wifi_ap("/device/0", "wlan0", "C", 5180, 70, false, None),
+            ],
+            ..Default::default()
+        };
+        let snapshot = wifi_snapshot(vec![device], true);
+        assert_eq!(snapshot.wifi_devices[0].raw_access_points, 4);
+        assert_eq!(snapshot.wifi_devices[0].named_access_points, 3);
+        assert_eq!(snapshot.wifi_devices[0].access_points.len(), 3);
+        assert!(snapshot.wifi_devices[0]
+            .access_points
+            .iter()
+            .any(|ap| ap.ssid == "B" && ap.saved_profile.is_none()));
+        assert!(snapshot.wifi_devices[0]
+            .access_points
+            .iter()
+            .all(|ap| !ap.ssid.is_empty() && !ap.ssid.eq_ignore_ascii_case("hidden")));
+    }
+
+    #[test]
+    fn wifi_inventory_preserves_band_split_and_selects_strongest_same_band_ap() {
+        let device = super::super::WifiDevice {
+            path: "/device/0".into(),
+            interface: "wlan0".into(),
+            access_points: vec![
+                wifi_ap("/device/0", "wlan0", "Foo", 5180, 40, false, None),
+                wifi_ap("/device/0", "wlan0", "Foo", 5200, 75, false, None),
+                wifi_ap("/device/0", "wlan0", "Foo", 2412, 55, false, None),
+            ],
+            ..Default::default()
+        };
+        let candidates = &wifi_snapshot(vec![device], true).wifi_devices[0].access_points;
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(super::super::wifi_band(2412), "2.4 GHz");
+        assert_eq!(super::super::wifi_band(2462), "2.4 GHz");
+        assert_eq!(super::super::wifi_band(5180), "5 GHz");
+        assert_eq!(super::super::wifi_band(5765), "5 GHz");
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|ap| ap.ssid == "Foo" && super::super::wifi_band(ap.frequency) == "5 GHz")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn wifi_inventory_is_independent_across_devices_and_active_is_device_scoped() {
+        let wlan0 = super::super::WifiDevice {
+            path: "/device/0".into(),
+            interface: "wlan0".into(),
+            active_connection: Some("/active/foo".into()),
+            access_points: vec![wifi_ap("/device/0", "wlan0", "Foo", 2412, 80, true, None)],
+            ..Default::default()
+        };
+        let wlan1 = super::super::WifiDevice {
+            path: "/device/1".into(),
+            interface: "wlan1".into(),
+            access_points: vec![wifi_ap("/device/1", "wlan1", "Foo", 2412, 70, false, None)],
+            ..Default::default()
+        };
+        let snapshot = wifi_snapshot(vec![wlan0, wlan1], true);
+        assert_eq!(snapshot.wifi_devices.len(), 2);
+        assert!(snapshot.wifi_devices[0].access_points[0].is_active);
+        assert!(!snapshot.wifi_devices[1].access_points[0].is_active);
+        assert_eq!(
+            snapshot
+                .wifi_devices
+                .iter()
+                .filter(|device| device.active_connection.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn wifi_inventory_supports_two_active_devices_and_global_wireless_state() {
+        let devices = vec![
+            super::super::WifiDevice {
+                path: "/device/0".into(),
+                interface: "wlan0".into(),
+                state: 100,
+                active_connection: Some("/active/foo".into()),
+                access_points: vec![wifi_ap("/device/0", "wlan0", "Foo", 5180, 80, true, None)],
+                ..Default::default()
+            },
+            super::super::WifiDevice {
+                path: "/device/1".into(),
+                interface: "wlan1".into(),
+                state: 100,
+                active_connection: Some("/active/bar".into()),
+                access_points: vec![wifi_ap("/device/1", "wlan1", "Bar", 2412, 70, true, None)],
+                ..Default::default()
+            },
+        ];
+        let on = wifi_snapshot(devices.clone(), true);
+        let off = wifi_snapshot(devices, false);
+        assert!(on.wireless_enabled);
+        assert!(!off.wireless_enabled);
+        assert_eq!(
+            on.wifi_devices
+                .iter()
+                .filter(|d| d.active_connection.is_some())
+                .count(),
+            2
+        );
+        assert!(on
+            .wifi_devices
+            .iter()
+            .all(|d| d.access_points.iter().any(|ap| ap.is_active)));
+        assert_eq!(on.wifi_devices.len(), off.wifi_devices.len());
+    }
+
+    #[test]
+    fn wifi_device_states_have_semantic_labels_and_grouping_is_structural() {
+        assert_eq!(super::super::wifi_device_state_label(10), "Não gerenciada");
+        assert_eq!(super::super::wifi_device_state_label(20), "Indisponível");
+        assert_eq!(super::super::wifi_device_state_label(30), "Desconectada");
+        assert_eq!(super::super::wifi_device_state_label(40), "Conectando");
+        assert_eq!(super::super::wifi_device_state_label(100), "Conectada");
+        assert_eq!(super::super::wifi_device_state_label(110), "Desconectando");
+        assert_eq!(super::super::wifi_device_state_label(120), "Falha");
+
+        let snapshot = wifi_snapshot(
+            vec![
+                super::super::WifiDevice {
+                    interface: "wlan0".into(),
+                    ..Default::default()
+                },
+                super::super::WifiDevice {
+                    interface: "wlan1".into(),
+                    ..Default::default()
+                },
+            ],
+            true,
+        );
+        assert_eq!(snapshot.wifi_devices.len(), 2);
+        assert_eq!(snapshot.wifi_devices[0].interface, "wlan0");
+        assert_eq!(snapshot.wifi_devices[1].interface, "wlan1");
+    }
+
+    #[test]
+    fn external_wifi_membership_changes_update_open_popup_and_active_count() {
+        let mut state = State {
+            network_popup_open: true,
+            ..Default::default()
+        };
+        let mut registry = MenuRegistry::default();
+        let wlan0 = super::super::WifiDevice {
+            interface: "wlan0".into(),
+            active_connection: Some("/active/foo".into()),
+            access_points: vec![wifi_ap("/device/0", "wlan0", "Foo", 5180, 80, true, None)],
+            ..Default::default()
+        };
+        let wlan1 = super::super::WifiDevice {
+            interface: "wlan1".into(),
+            active_connection: Some("/active/bar".into()),
+            access_points: vec![wifi_ap("/device/1", "wlan1", "Bar", 2412, 70, true, None)],
+            ..Default::default()
+        };
+        assert!(reduce(
+            &mut state,
+            Event::NetworkSnapshotReceived(wifi_snapshot(vec![wlan0.clone()], true)),
+            &mut registry,
+        ));
+        assert_eq!(state.network.wifi_devices.len(), 1);
+        assert!(reduce(
+            &mut state,
+            Event::NetworkSnapshotReceived(wifi_snapshot(vec![wlan0, wlan1], true)),
+            &mut registry,
+        ));
+        assert_eq!(
+            state
+                .network
+                .wifi_devices
+                .iter()
+                .filter(|device| device.active_connection.is_some())
+                .count(),
+            2
+        );
+        assert!(reduce(
+            &mut state,
+            Event::NetworkSnapshotReceived(wifi_snapshot(
+                vec![super::super::WifiDevice {
+                    interface: "wlan0".into(),
+                    active_connection: Some("/active/foo".into()),
+                    access_points: vec![
+                        wifi_ap("/device/0", "wlan0", "Foo", 5180, 80, true, None,)
+                    ],
+                    ..Default::default()
+                }],
+                true,
+            )),
+            &mut registry,
+        ));
+        assert_eq!(state.network.wifi_devices.len(), 1);
+    }
+
+    #[test]
     fn bluetooth_visual_states_and_deduplication() {
         let mut state = State::default();
         let mut registry = MenuRegistry::default();

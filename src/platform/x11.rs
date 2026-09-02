@@ -1950,29 +1950,46 @@ impl X11Platform {
             return Ok(());
         }
         let output = state.outputs.first().ok_or("no output for network popup")?;
-        let rows: Vec<_> = state
-            .network
-            .access_points
-            .iter()
-            .take(8)
-            .enumerate()
-            .map(|(index, access_point)| {
-                (
-                    access_point.ssid.clone(),
+        let mut rows = Vec::new();
+        let mut headers = Vec::new();
+        let mut row_index = 0;
+        for device in &state.network.wifi_devices {
+            headers.push((
+                device.interface.clone(),
+                device.driver.clone(),
+                crate::core::wifi_device_state_label(device.state).to_owned(),
+                device
+                    .access_points
+                    .iter()
+                    .find(|access_point| access_point.is_active)
+                    .map(|access_point| {
+                        format!(
+                            "{} · {}",
+                            access_point.ssid,
+                            crate::core::wifi_band(access_point.frequency)
+                        )
+                    }),
+                row_index,
+            ));
+            row_index += 2;
+            for access_point in &device.access_points {
+                rows.push((
+                    access_point.path.clone(),
                     layout::MenuRect {
                         x: output.x + output.width as i16 - 350 + 10,
-                        y: output.y + 26 + 82 + index as i16 * 24,
+                        y: output.y + 26 + 82 + row_index * 24,
                         width: 330,
                         height: 22,
                     },
-                )
-            })
-            .collect();
+                ));
+                row_index += 1;
+            }
+        }
         let rect = layout::MenuRect {
             x: (output.x + output.width as i16 - 350).max(output.x),
             y: output.y + 26,
             width: 350,
-            height: (78 + rows.len() as u16 * 24 + 10)
+            height: (78 + row_index as u16 * 24 + 10)
                 .min(output.height.saturating_sub(26).max(120)),
         };
         let wireless = layout::MenuRect {
@@ -2097,17 +2114,53 @@ impl X11Platform {
         )?;
         self.text
             .draw_popup_utf8("Redes disponíveis", 12, 74, BAR_STYLE.popup_foreground)?;
-        for (index, (ssid, _)) in rows.iter().enumerate() {
-            let strength = state
+        for (interface, driver, device_state, active, index) in headers {
+            self.text.draw_popup_utf8(
+                &format!(
+                    "{}{}",
+                    interface,
+                    driver
+                        .map(|driver| format!(" · {driver}"))
+                        .unwrap_or_default()
+                ),
+                14,
+                98 + index as i32 * 24,
+                BAR_STYLE.popup_foreground,
+            )?;
+            self.text.draw_popup_utf8(
+                &format!(
+                    "{}{}",
+                    device_state,
+                    active
+                        .map(|active| format!(" · {active}"))
+                        .unwrap_or_default()
+                ),
+                14,
+                98 + (index as i32 + 1) * 24,
+                BAR_STYLE.popup_foreground,
+            )?;
+        }
+        for (path, row) in &rows {
+            let access_point = state
                 .network
                 .access_points
                 .iter()
-                .find(|access_point| access_point.ssid == *ssid)
-                .map_or(0, |access_point| access_point.strength);
+                .find(|access_point| access_point.path == *path)
+                .expect("network popup row has matching access point");
+            let band = crate::core::wifi_band(access_point.frequency);
+            let marker = if access_point.is_active { "●" } else { " " };
+            let saved = if access_point.saved_profile.is_some() {
+                "saved"
+            } else {
+                "unsaved"
+            };
             self.text.draw_popup_utf8(
-                &format!("{ssid:<28} {strength:>3}%"),
+                &format!(
+                    "{marker} {:<7} {:<24} {band:<9} {:>3}% {saved}",
+                    access_point.interface, access_point.ssid, access_point.strength
+                ),
                 14,
-                98 + index as i32 * 24,
+                (row.y - rect.y + 16) as i32,
                 BAR_STYLE.popup_foreground,
             )?;
         }

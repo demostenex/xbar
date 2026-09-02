@@ -953,98 +953,66 @@ impl Registrar {
 
 async fn network_snapshot(connection: &zbus::Connection) -> zbus::Result<NetworkState> {
     let path = "/org/freedesktop/NetworkManager";
-    let iface = "org.freedesktop.NetworkManager";
-    let proxy = zbus::Proxy::new(connection, "org.freedesktop.NetworkManager", path, iface).await?;
-    let state: u32 = proxy.get_property("State").await?;
+    let proxy = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.NetworkManager",
+        path,
+        "org.freedesktop.NetworkManager",
+    )
+    .await?;
+    let nm_state: u32 = proxy.get_property("State").await?;
     let wireless_enabled: bool = proxy.get_property("WirelessEnabled").await.unwrap_or(true);
     let connectivity: u32 = proxy.get_property("Connectivity").await.unwrap_or(0);
     let primary: OwnedObjectPath = proxy.get_property("PrimaryConnection").await?;
-    let connected = state == 70;
-    let connection_path = primary.as_str();
-    let active = zbus::Proxy::new(
+    let primary_path = (primary.as_str() != "/").then(|| primary.to_string());
+    let devices: Vec<OwnedObjectPath> = proxy.get_property("Devices").await?;
+    let settings = zbus::Proxy::new(
         connection,
         "org.freedesktop.NetworkManager",
-        connection_path,
-        "org.freedesktop.NetworkManager.Connection.Active",
+        "/org/freedesktop/NetworkManager/Settings",
+        "org.freedesktop.NetworkManager.Settings",
     )
     .await?;
-    let is_default: bool = active.get_property("Default").await.unwrap_or(false);
-    let devices: Vec<OwnedObjectPath> = proxy.get_property("Devices").await?;
+    let profile_paths: Vec<OwnedObjectPath> = settings
+        .get_property("Connections")
+        .await
+        .unwrap_or_default();
+    let mut saved_by_ssid = HashMap::<String, String>::new();
+    for profile_path in profile_paths {
+        let profile = zbus::Proxy::new(
+            connection,
+            "org.freedesktop.NetworkManager",
+            profile_path.as_str(),
+            "org.freedesktop.NetworkManager.Settings.Connection",
+        )
+        .await?;
+        let settings: HashMap<String, HashMap<String, OwnedValue>> =
+            profile.call("GetSettings", &()).await.unwrap_or_default();
+        if let Some(ssid) = settings
+            .get("802-11-wireless")
+            .and_then(|wireless| wireless.get("ssid"))
+            .and_then(|ssid| Vec::<u8>::try_from(ssid.clone()).ok())
+        {
+            saved_by_ssid
+                .entry(String::from_utf8_lossy(&ssid).into_owned())
+                .or_insert_with(|| profile_path.to_string());
+        }
+    }
     let mut result = NetworkState {
         available: true,
         wireless_enabled,
-        connectivity: if !connected {
-            if state > 20 {
-                NetworkConnectivity::Connecting
-            } else {
-                NetworkConnectivity::Disconnected
-            }
+        connectivity: if nm_state < 20 {
+            NetworkConnectivity::Disconnected
         } else if connectivity == 4 {
             NetworkConnectivity::Connected
-        } else {
+        } else if nm_state >= 70 {
             NetworkConnectivity::Limited
+        } else {
+            NetworkConnectivity::Connecting
         },
         ..Default::default()
     };
-    let mut access_points = HashMap::<String, u8>::new();
-    for device_path in &devices {
-        let device = zbus::Proxy::new(
-            connection,
-            "org.freedesktop.NetworkManager",
-            device_path.as_str(),
-            "org.freedesktop.NetworkManager.Device",
-        )
-        .await?;
-        let device_type: u32 = device.get_property("DeviceType").await.unwrap_or(0);
-        if device_type != 2 {
-            continue;
-        }
-        let wireless = zbus::Proxy::new(
-            connection,
-            "org.freedesktop.NetworkManager",
-            device_path.as_str(),
-            "org.freedesktop.NetworkManager.Device.Wireless",
-        )
-        .await?;
-        let paths: Vec<OwnedObjectPath> = wireless
-            .get_property("AccessPoints")
-            .await
-            .unwrap_or_default();
-        for ap_path in paths {
-            let ap = zbus::Proxy::new(
-                connection,
-                "org.freedesktop.NetworkManager",
-                ap_path.as_str(),
-                "org.freedesktop.NetworkManager.AccessPoint",
-            )
-            .await?;
-            let ssid = ap.get_property::<Vec<u8>>("Ssid").await.unwrap_or_default();
-            let ssid = String::from_utf8_lossy(&ssid).into_owned();
-            if ssid.is_empty() {
-                continue;
-            }
-            let strength = ap.get_property::<u8>("Strength").await.unwrap_or(0);
-            access_points
-                .entry(ssid)
-                .and_modify(|old| *old = (*old).max(strength))
-                .or_insert(strength);
-        }
-    }
-    result.access_points = access_points
-        .into_iter()
-        .map(|(ssid, strength)| NetworkAccessPoint { ssid, strength })
-        .collect();
-    result.access_points.sort_by(|a, b| {
-        b.strength
-            .cmp(&a.strength)
-            .then_with(|| a.ssid.cmp(&b.ssid))
-    });
-    if !wireless_enabled {
-        result.access_points.clear();
-    }
-    if !is_default {
-        return Ok(result);
-    }
+    let mut all_access_points = Vec::new();
     for device_path in devices {
         let device = zbus::Proxy::new(
             connection,
@@ -1053,69 +1021,183 @@ async fn network_snapshot(connection: &zbus::Connection) -> zbus::Result<Network
             "org.freedesktop.NetworkManager.Device",
         )
         .await?;
-        let active_path: OwnedObjectPath = device
-            .get_property("ActiveConnection")
-            .await
-            .unwrap_or_else(|_| OwnedObjectPath::try_from("/").expect("root path"));
-        if active_path.as_str() != connection_path {
+        if device.get_property::<u32>("DeviceType").await.unwrap_or(0) != 2 {
             continue;
         }
-        let device_type: u32 = device.get_property("DeviceType").await.unwrap_or(0);
-        let interface: String = device.get_property("Interface").await.unwrap_or_default();
-        result.interface = Some(interface.clone());
-        result.link_kind = match device_type {
-            1 => NetworkLinkKind::Ethernet,
-            2 => NetworkLinkKind::Wifi,
-            _ => NetworkLinkKind::Other,
-        };
-        if matches!(result.link_kind, NetworkLinkKind::Wifi) {
-            let wireless = zbus::Proxy::new(
-                connection,
-                "org.freedesktop.NetworkManager",
-                device_path.as_str(),
-                "org.freedesktop.NetworkManager.Device.Wireless",
-            )
-            .await?;
-            let ap_path: OwnedObjectPath = match wireless.get_property("ActiveAccessPoint").await {
-                Ok(path) => path,
-                Err(error) => {
-                    if std::env::var_os("XBAR_TRACE").is_some() {
-                        eprintln!("xbar trace: NetworkManager AP lookup failed: {error}");
-                    }
-                    OwnedObjectPath::try_from("/").expect("root path")
-                }
-            };
-            if ap_path.as_str() != "/" {
-                let ap = zbus::Proxy::new(
-                    connection,
-                    "org.freedesktop.NetworkManager",
-                    ap_path.as_str(),
-                    "org.freedesktop.NetworkManager.AccessPoint",
-                )
-                .await?;
-                let ssid: Vec<u8> = match ap.get_property("Ssid").await {
-                    Ok(ssid) => ssid,
-                    Err(error) => {
-                        if std::env::var_os("XBAR_TRACE").is_some() {
-                            eprintln!("xbar trace: NetworkManager SSID lookup failed: {error}");
-                        }
-                        Vec::new()
-                    }
-                };
-                result.display_name = Some(String::from_utf8_lossy(&ssid).into_owned());
-                result.signal_percent = Some(ap.get_property::<u8>("Strength").await.unwrap_or(0));
-            }
-        } else {
-            result.display_name = Some(
-                active
-                    .get_property::<String>("Id")
-                    .await
-                    .unwrap_or_else(|_| interface.clone()),
+        let interface = device
+            .get_property::<String>("Interface")
+            .await
+            .unwrap_or_default();
+        let driver = device
+            .get_property::<String>("Driver")
+            .await
+            .ok()
+            .filter(|driver| !driver.is_empty());
+        let state = device.get_property("State").await.unwrap_or(0);
+        let active_connection = device
+            .get_property::<OwnedObjectPath>("ActiveConnection")
+            .await
+            .ok()
+            .filter(|path| path.as_str() != "/")
+            .map(|path| path.to_string());
+        let wireless = zbus::Proxy::new(
+            connection,
+            "org.freedesktop.NetworkManager",
+            device_path.as_str(),
+            "org.freedesktop.NetworkManager.Device.Wireless",
+        )
+        .await?;
+        let active_ap = wireless
+            .get_property::<OwnedObjectPath>("ActiveAccessPoint")
+            .await
+            .ok()
+            .filter(|path| path.as_str() != "/")
+            .map(|path| path.to_string());
+        let mut candidates = Vec::new();
+        let raw_paths: Vec<OwnedObjectPath> = wireless
+            .call("GetAllAccessPoints", &())
+            .await
+            .unwrap_or_default();
+        let raw_access_points = raw_paths.len();
+        let mut named_access_points = 0;
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!(
+                "xbar trace: WIFI_INVENTORY device={} interface={} raw_aps={}",
+                device_path,
+                interface,
+                raw_paths.len()
             );
         }
-        break;
+        for ap_path in raw_paths {
+            let ap = zbus::Proxy::new(
+                connection,
+                "org.freedesktop.NetworkManager",
+                ap_path.as_str(),
+                "org.freedesktop.NetworkManager.AccessPoint",
+            )
+            .await?;
+            let ssid_bytes = ap.get_property::<Vec<u8>>("Ssid").await.unwrap_or_default();
+            if ssid_bytes.is_empty() {
+                continue;
+            }
+            let ssid = String::from_utf8_lossy(&ssid_bytes).into_owned();
+            named_access_points += 1;
+            candidates.push(NetworkAccessPoint {
+                path: ap_path.to_string(),
+                device_path: device_path.to_string(),
+                interface: interface.clone(),
+                ssid: ssid.clone(),
+                strength: ap.get_property("Strength").await.unwrap_or(0),
+                frequency: ap.get_property("Frequency").await.unwrap_or(0),
+                is_active: active_ap.as_deref() == Some(ap_path.as_str()),
+                saved_profile: saved_by_ssid.get(&ssid).cloned(),
+            });
+        }
+        let mut access_points = deduplicate_wifi_access_points(candidates);
+        all_access_points.extend(access_points.iter().cloned());
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!(
+                "xbar trace: WIFI_INVENTORY_COUNTS device={} interface={} raw_access_points={} named_access_points={} deduplicated_candidates={}",
+                device_path,
+                interface,
+                raw_access_points,
+                named_access_points,
+                access_points.len()
+            );
+            for access_point in &access_points {
+                eprintln!(
+                    "xbar trace: WIFI_CANDIDATE device={} interface={} ssid={} ap={} frequency={} band={} strength={} saved={}",
+                    device_path,
+                    interface,
+                    access_point.ssid,
+                    access_point.path,
+                    access_point.frequency,
+                    crate::core::wifi_band(access_point.frequency),
+                    access_point.strength,
+                    access_point.saved_profile.is_some()
+                );
+            }
+        }
+        if !wireless_enabled {
+            access_points.clear();
+        }
+        result.wifi_devices.push(crate::core::WifiDevice {
+            path: device_path.to_string(),
+            interface,
+            driver,
+            state,
+            raw_access_points,
+            named_access_points,
+            active_connection,
+            active_ap,
+            access_points,
+        });
+    }
+    result.access_points = all_access_points;
+    if let Some(primary) = primary_path {
+        if let Some(device) = result
+            .wifi_devices
+            .iter()
+            .find(|device| device.active_connection.as_deref() == Some(primary.as_str()))
+        {
+            result.interface = Some(device.interface.clone());
+            result.link_kind = NetworkLinkKind::Wifi;
+            result.display_name = device
+                .access_points
+                .iter()
+                .find(|ap| ap.is_active)
+                .map(|ap| ap.ssid.clone());
+            result.signal_percent = device
+                .access_points
+                .iter()
+                .find(|ap| ap.is_active)
+                .map(|ap| ap.strength);
+        }
+        result.link_kind = if result.interface.is_some() {
+            NetworkLinkKind::Wifi
+        } else {
+            NetworkLinkKind::Other
+        };
     }
     Ok(result)
+}
+
+fn deduplicate_wifi_access_points(
+    raw_access_points: Vec<NetworkAccessPoint>,
+) -> Vec<NetworkAccessPoint> {
+    let mut candidates = HashMap::<(String, String), NetworkAccessPoint>::new();
+    for candidate in raw_access_points {
+        if candidate.ssid.trim().is_empty() {
+            continue;
+        }
+        let key = (
+            candidate.ssid.clone(),
+            crate::core::wifi_band(candidate.frequency).to_owned(),
+        );
+        if candidates
+            .get(&key)
+            .is_none_or(|current| candidate.strength > current.strength)
+        {
+            let is_active = candidate.is_active
+                || candidates
+                    .get(&key)
+                    .is_some_and(|current| current.is_active);
+            candidates.insert(
+                key,
+                NetworkAccessPoint {
+                    is_active,
+                    ..candidate
+                },
+            );
+        }
+    }
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        b.strength
+            .cmp(&a.strength)
+            .then_with(|| a.ssid.cmp(&b.ssid))
+    });
+    candidates
 }
 
 async fn watch_network(
@@ -1169,14 +1251,47 @@ async fn watch_network(
     else {
         return;
     };
+    let ap_added_rule = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.NetworkManager")
+        .expect("valid NetworkManager sender")
+        .interface("org.freedesktop.NetworkManager.Device.Wireless")
+        .expect("valid wireless interface")
+        .member("AccessPointAdded")
+        .expect("valid AccessPointAdded member")
+        .build();
+    let Ok(mut ap_added) =
+        MessageStream::for_match_rule(ap_added_rule, &connection, Some(32)).await
+    else {
+        return;
+    };
+    let ap_removed_rule = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.NetworkManager")
+        .expect("valid NetworkManager sender")
+        .interface("org.freedesktop.NetworkManager.Device.Wireless")
+        .expect("valid wireless interface")
+        .member("AccessPointRemoved")
+        .expect("valid AccessPointRemoved member")
+        .build();
+    let Ok(mut ap_removed) =
+        MessageStream::for_match_rule(ap_removed_rule, &connection, Some(32)).await
+    else {
+        return;
+    };
     loop {
         let state_signal = async { state_changes.next().await.map(|_| ()) };
         let add_signal = async { added.next().await.map(|_| ()) };
         let remove_signal = async { removed.next().await.map(|_| ()) };
+        let ap_added_signal = async { ap_added.next().await.map(|_| ()) };
+        let ap_removed_signal = async { ap_removed.next().await.map(|_| ()) };
         let _ = futures_lite::future::race(
             futures_lite::future::race(
-                futures_lite::future::race(state_signal, add_signal),
-                remove_signal,
+                futures_lite::future::race(
+                    futures_lite::future::race(state_signal, add_signal),
+                    remove_signal,
+                ),
+                futures_lite::future::race(ap_added_signal, ap_removed_signal),
             ),
             async { properties.next().await.map(|_| ()) },
         )
@@ -1215,7 +1330,11 @@ async fn network_request_scan(connection: &zbus::Connection) -> Result<(), Strin
         .get_property("Devices")
         .await
         .map_err(|e| e.to_string())?;
-    let mut device_path = None;
+    let wireless_enabled: bool = manager
+        .get_property("WirelessEnabled")
+        .await
+        .unwrap_or(true);
+    let options: HashMap<String, OwnedValue> = HashMap::new();
     for candidate in devices {
         let device = zbus::Proxy::new(
             connection,
@@ -1229,27 +1348,32 @@ async fn network_request_scan(connection: &zbus::Connection) -> Result<(), Strin
             .get_property("DeviceType")
             .await
             .map_err(|e| e.to_string())?;
-        if device_type == 2 {
-            device_path = Some(candidate);
-            break;
+        let state: u32 = device.get_property("State").await.unwrap_or(0);
+        if wireless_enabled && device_type == 2 && state != 10 && state != 20 {
+            if std::env::var_os("XBAR_TRACE").is_some() {
+                let interface = device
+                    .get_property::<String>("Interface")
+                    .await
+                    .unwrap_or_default();
+                eprintln!(
+                    "xbar trace: WIFI_REQUEST_SCAN device={} interface={}",
+                    candidate, interface
+                );
+            }
+            let wireless = zbus::Proxy::new(
+                connection,
+                "org.freedesktop.NetworkManager",
+                candidate.as_str(),
+                "org.freedesktop.NetworkManager.Device.Wireless",
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let _: () = wireless
+                .call("RequestScan", &(options.clone(),))
+                .await
+                .map_err(|e| e.to_string())?;
         }
     }
-    let Some(device_path) = device_path else {
-        return Ok(());
-    };
-    let proxy = zbus::Proxy::new(
-        connection,
-        "org.freedesktop.NetworkManager",
-        device_path.as_str(),
-        "org.freedesktop.NetworkManager.Device.Wireless",
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    let options: HashMap<String, OwnedValue> = HashMap::new();
-    let _: () = proxy
-        .call("RequestScan", &(options,))
-        .await
-        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2384,5 +2508,98 @@ mod status_notifier_tests {
             ),
             Some(normal)
         );
+    }
+}
+
+#[cfg(test)]
+mod network_inventory_tests {
+    use super::deduplicate_wifi_access_points;
+    use crate::core::NetworkAccessPoint;
+
+    fn ap(ssid: &str, frequency: u32, strength: u8, active: bool) -> NetworkAccessPoint {
+        NetworkAccessPoint {
+            path: format!("/ap/{ssid}/{frequency}/{strength}"),
+            device_path: "/device/0".into(),
+            interface: "wlan0".into(),
+            ssid: ssid.into(),
+            strength,
+            frequency,
+            is_active: active,
+            saved_profile: None,
+        }
+    }
+
+    #[test]
+    fn empty_ssids_are_filtered_without_synthesizing_hidden_rows() {
+        let candidates = deduplicate_wifi_access_points(vec![
+            ap("", 2412, 90, false),
+            ap("   ", 5180, 80, false),
+            ap("Visible", 2412, 70, false),
+        ]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].ssid, "Visible");
+        assert!(candidates.iter().all(|candidate| {
+            !candidate.ssid.is_empty() && !candidate.ssid.eq_ignore_ascii_case("hidden")
+        }));
+    }
+
+    #[test]
+    fn saved_and_unsaved_networks_are_both_candidates() {
+        let mut saved = ap("Saved", 2412, 50, false);
+        saved.saved_profile = Some("/profile/saved".into());
+        let unsaved = ap("Unsaved", 2412, 60, false);
+        let other_unsaved = ap("Other", 5180, 55, false);
+        let candidates = deduplicate_wifi_access_points(vec![saved, unsaved, other_unsaved]);
+        assert_eq!(candidates.len(), 3);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.saved_profile.is_none()));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.saved_profile.is_some()));
+    }
+
+    #[test]
+    fn strongest_ap_wins_per_ssid_and_band_while_bands_are_preserved() {
+        let candidates = deduplicate_wifi_access_points(vec![
+            ap("Foo", 5180, 40, false),
+            ap("Foo", 5200, 75, true),
+            ap("Foo", 2412, 55, false),
+        ]);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|candidate| candidate.frequency == 5200)
+                .map(|candidate| candidate.strength),
+            Some(75)
+        );
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.frequency == 2412));
+        assert!(candidates
+            .iter()
+            .find(|candidate| candidate.frequency == 5200)
+            .is_some_and(|candidate| candidate.is_active));
+    }
+
+    #[test]
+    fn inventory_does_not_truncate_large_candidate_sets() {
+        let raw = (0..64)
+            .map(|index| ap(&format!("Network-{index}"), 2412, index as u8, false))
+            .collect();
+        assert_eq!(deduplicate_wifi_access_points(raw).len(), 64);
+    }
+
+    #[test]
+    fn same_ssid_on_different_devices_is_not_globally_deduplicated() {
+        let wlan0 = deduplicate_wifi_access_points(vec![ap("Foo", 2412, 80, true)]);
+        let mut wlan1_ap = ap("Foo", 2412, 70, true);
+        wlan1_ap.device_path = "/device/1".into();
+        wlan1_ap.interface = "wlan1".into();
+        let wlan1 = deduplicate_wifi_access_points(vec![wlan1_ap]);
+        assert_eq!(wlan0.len(), 1);
+        assert_eq!(wlan1.len(), 1);
+        assert_ne!(wlan0[0].device_path, wlan1[0].device_path);
     }
 }

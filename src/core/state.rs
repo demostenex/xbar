@@ -52,8 +52,48 @@ pub struct AudioState {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NetworkAccessPoint {
+    pub path: String,
+    pub device_path: String,
+    pub interface: String,
     pub ssid: String,
     pub strength: u8,
+    pub frequency: u32,
+    pub is_active: bool,
+    pub saved_profile: Option<String>,
+}
+
+pub fn wifi_band(frequency: u32) -> &'static str {
+    match frequency {
+        2400..=2500 => "2.4 GHz",
+        4900..=6000 => "5 GHz",
+        _ => "unknown band",
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WifiDevice {
+    pub path: String,
+    pub interface: String,
+    pub driver: Option<String>,
+    pub state: u32,
+    pub raw_access_points: usize,
+    pub named_access_points: usize,
+    pub active_connection: Option<String>,
+    pub active_ap: Option<String>,
+    pub access_points: Vec<NetworkAccessPoint>,
+}
+
+pub fn wifi_device_state_label(state: u32) -> &'static str {
+    match state {
+        10 => "Não gerenciada",
+        20 => "Indisponível",
+        30 => "Desconectada",
+        40..=90 => "Conectando",
+        100 => "Conectada",
+        110 => "Desconectando",
+        120 => "Falha",
+        _ => "Estado desconhecido",
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +111,7 @@ pub struct NetworkState {
     pub display_name: Option<String>,
     pub signal_percent: Option<u8>,
     pub access_points: Vec<NetworkAccessPoint>,
+    pub wifi_devices: Vec<WifiDevice>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

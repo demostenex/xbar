@@ -12,10 +12,11 @@ pub use menu::{
 };
 pub use reducer::reduce;
 pub use state::{
-    AboutToShowPending, AudioDevice, AudioState, BluetoothDevice, BluetoothPendingAction,
-    BluetoothState, ClockState, MenuState, NetworkAccessPoint, NetworkConnectivity,
-    NetworkLinkKind, NetworkPendingAction, NetworkState, Notification, NotificationId,
-    NotificationSource, OutputId, OutputState, State, WindowId, WorkspaceState,
+    wifi_band, wifi_device_state_label, AboutToShowPending, AudioDevice, AudioState,
+    BluetoothDevice, BluetoothPendingAction, BluetoothState, ClockState, MenuState,
+    NetworkAccessPoint, NetworkConnectivity, NetworkLinkKind, NetworkPendingAction, NetworkState,
+    Notification, NotificationId, NotificationSource, OutputId, OutputState, State, WifiDevice,
+    WindowId, WorkspaceState,
 };
 pub use status_notifier::{
     format_notifier_item_id, parse_notifier_item_id, StatusNotifierAction, StatusNotifierEndpoint,
