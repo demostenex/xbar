@@ -128,6 +128,19 @@ impl Client {
     pub fn wireless_enabled(&self) -> bool {
         self.graph.wireless_enabled
     }
+
+    /// Requests the global NetworkManager Wi-Fi switch without mutating the
+    /// cache. The cache changes only when NetworkManager emits PropertiesChanged.
+    pub async fn set_wireless_enabled(&mut self, enabled: bool) -> Result<bool, Error> {
+        if !wireless_write_needed(self.graph.wireless_enabled, enabled) {
+            return Ok(false);
+        }
+        let n = ManagerProxy::new(&self.connection, SERVICE, ROOT)
+            .await
+            .map_err(e)?;
+        n.set_wireless_enabled(enabled).await.map_err(e)?;
+        Ok(true)
+    }
     pub fn wifi_device(&self, id: &DeviceId) -> Option<WifiDevice> {
         self.graph.devices.get(id).cloned()
     }
@@ -850,6 +863,10 @@ fn set_wireless_enabled(graph: &mut NetworkGraph, enabled: bool) -> NetworkEvent
     }
 }
 
+fn wireless_write_needed(current: bool, requested: bool) -> bool {
+    current != requested
+}
+
 fn band_matches(frequency: u32, band: Band) -> bool {
     matches!(
         (frequency, band),
@@ -898,5 +915,13 @@ mod tests {
                 wireless_enabled: false
             }
         );
+    }
+
+    #[test]
+    fn wireless_write_is_needed_only_when_target_differs() {
+        assert!(wireless_write_needed(true, false));
+        assert!(wireless_write_needed(false, true));
+        assert!(!wireless_write_needed(true, true));
+        assert!(!wireless_write_needed(false, false));
     }
 }

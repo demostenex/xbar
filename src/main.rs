@@ -171,7 +171,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     let previous_status = xnm_shadow.presentation_status();
                     let previous_popup = xnm_shadow.popup_projection();
+                    let wireless_action_finished = match &event {
+                        xnm::XnmBridgeEvent::WirelessRequestNoop { enabled }
+                        | xnm::XnmBridgeEvent::WirelessRequestFailed { enabled, .. } => {
+                            Some(*enabled)
+                        }
+                        _ => None,
+                    };
                     xnm::apply_shadow_event(&mut xnm_shadow, event);
+                    if let Some(enabled) = wireless_action_finished {
+                        events.push(Event::NetworkActionFinished(
+                            core::NetworkPendingAction::SetWireless(enabled),
+                        ));
+                    }
                     let status = xnm_shadow.presentation_status();
                     if status != previous_status {
                         events.push(Event::NetworkStatusChanged(core::NetworkStatus {
@@ -184,7 +196,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }));
                     }
                     let popup = xnm_shadow.popup_projection();
-                    if previous_popup.wifi_devices != popup.wifi_devices
+                    if previous_popup.wireless_enabled != popup.wireless_enabled
+                        || previous_popup.wifi_devices != popup.wifi_devices
                         || previous_popup.access_points != popup.access_points
                     {
                         events.push(Event::NetworkPopupProjectionChanged(popup));
@@ -214,7 +227,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut dirty = false;
         let mut outputs_changed = false;
         let mut render_target: Option<RenderTarget> = None;
-        for event in events {
+        let mut event_index = 0;
+        while event_index < events.len() {
+            let event = events[event_index].clone();
+            event_index += 1;
             let event = match event {
                 Event::X11(platform::x11::X11Event::WindowAttentionChanged {
                     window,
@@ -744,7 +760,27 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if trace {
                         eprintln!("xbar trace: NetworkCommand SetWireless enabled={enabled}");
                     }
-                    dbus.network_set_wireless(enabled)
+                    if let Some(bridge) = xnm.as_ref() {
+                        if !bridge.set_wireless_enabled(enabled) {
+                            events.push(Event::NetworkActionFinished(
+                                core::NetworkPendingAction::SetWireless(enabled),
+                            ));
+                            if trace {
+                                eprintln!(
+                                    "xbar trace: NETWORK_WIRELESS_ENABLE_REQUEST_REJECTED reason=xnm-unavailable"
+                                );
+                            }
+                        }
+                    } else {
+                        events.push(Event::NetworkActionFinished(
+                            core::NetworkPendingAction::SetWireless(enabled),
+                        ));
+                        if trace {
+                            eprintln!(
+                                "xbar trace: NETWORK_WIRELESS_ENABLE_REQUEST_REJECTED reason=xnm-unavailable"
+                            );
+                        }
+                    }
                 }
                 Event::NetworkConnectSavedWifi(ref target) if reduced => {
                     if trace {

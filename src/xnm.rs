@@ -42,6 +42,13 @@ pub enum XnmBridgeEvent {
         interface: String,
         ssid: String,
     },
+    WirelessRequestNoop {
+        enabled: bool,
+    },
+    WirelessRequestFailed {
+        enabled: bool,
+        error: String,
+    },
     ScanFailed {
         interface: String,
         error: String,
@@ -57,6 +64,9 @@ pub enum XnmBackendCommand {
         interface: String,
         ssid: String,
         band: String,
+    },
+    SetWirelessEnabled {
+        enabled: bool,
     },
 }
 
@@ -370,6 +380,8 @@ pub fn apply_shadow_event(shadow: &mut XnmShadowState, event: XnmBridgeEvent) {
             shadow.stable_status = None;
             shadow.stable_popup_devices = None;
         }
+        XnmBridgeEvent::WirelessRequestNoop { .. }
+        | XnmBridgeEvent::WirelessRequestFailed { .. } => {}
         XnmBridgeEvent::ScanFailed { .. } => {}
     }
 }
@@ -454,6 +466,12 @@ impl XnmBridge {
             ssid: target.ssid,
             band: target.band,
         });
+    }
+
+    pub fn set_wireless_enabled(&self, enabled: bool) -> bool {
+        self.commands
+            .try_send(XnmBackendCommand::SetWirelessEnabled { enabled })
+            .is_ok()
     }
 
     pub fn drain_events(&mut self) -> io::Result<Vec<XnmBridgeEvent>> {
@@ -576,6 +594,37 @@ async fn run(
                             error: error.to_string(),
                         },
                     );
+                }
+            }
+            WaitResult::Command(Ok(XnmBackendCommand::SetWirelessEnabled { enabled })) => {
+                match client.set_wireless_enabled(enabled).await {
+                    Ok(true) => {
+                        if std::env::var_os("XBAR_TRACE").is_some() {
+                            eprintln!(
+                                "xbar trace: NETWORK_WIRELESS_ENABLE_REQUEST_ACCEPTED target={enabled}"
+                            );
+                        }
+                    }
+                    Ok(false) => {
+                        push(
+                            &queue,
+                            writer,
+                            XnmBridgeEvent::WirelessRequestNoop { enabled },
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "xbar: NETWORK_WIRELESS_ENABLE_REQUEST_REJECTED target={enabled} reason={error}"
+                        );
+                        push(
+                            &queue,
+                            writer,
+                            XnmBridgeEvent::WirelessRequestFailed {
+                                enabled,
+                                error: error.to_string(),
+                            },
+                        );
+                    }
                 }
             }
             WaitResult::Command(Ok(XnmBackendCommand::ConnectSavedWifi {

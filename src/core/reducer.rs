@@ -710,11 +710,13 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             changed && visual_before != network_visual_state(&state.network)
         }
         Event::NetworkPopupProjectionChanged(network) => {
-            if state.network.wifi_devices == network.wifi_devices
+            if state.network.wireless_enabled == network.wireless_enabled
+                && state.network.wifi_devices == network.wifi_devices
                 && state.network.access_points == network.access_points
             {
                 false
             } else {
+                state.network.wireless_enabled = network.wireless_enabled;
                 state.network.wifi_devices = network.wifi_devices;
                 state.network.access_points = network.access_points;
                 state.network_popup_open
@@ -1602,6 +1604,30 @@ mod tests {
             &mut registry
         ));
         assert!(state.network_pending.is_empty());
+    }
+
+    #[test]
+    fn xnm_wireless_projection_updates_only_after_authoritative_event() {
+        let mut state = State {
+            network: wifi_snapshot(Vec::new(), true),
+            ..Default::default()
+        };
+        state.network.wireless_enabled = true;
+        let mut registry = MenuRegistry::default();
+        assert!(reduce(
+            &mut state,
+            Event::NetworkSetWireless(false),
+            &mut registry
+        ));
+        assert!(state.network.wireless_enabled);
+        let mut projection = state.network.clone();
+        projection.wireless_enabled = false;
+        reduce(
+            &mut state,
+            Event::NetworkPopupProjectionChanged(projection),
+            &mut registry,
+        );
+        assert!(!state.network.wireless_enabled);
     }
 
     #[test]

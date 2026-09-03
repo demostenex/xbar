@@ -19,6 +19,8 @@ pub(crate) trait Manager {
     fn active_connections(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
     #[zbus(property)]
     fn wireless_enabled(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn set_wireless_enabled(&self, value: bool) -> zbus::Result<()>;
 }
 #[zbus::proxy(interface = "org.freedesktop.NetworkManager.Device")]
 pub(crate) trait Device {

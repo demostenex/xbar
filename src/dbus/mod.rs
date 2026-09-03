@@ -3,8 +3,8 @@ use crate::core::NetworkAccessPoint;
 use crate::core::{
     format_notifier_item_id, parse_notifier_item_id, BluetoothDevice, BluetoothPendingAction,
     BluetoothState, Event, GtkMenuEndpoint, MenuActionTarget, MenuRegistry, MenuSource,
-    NetworkPendingAction, NotificationId, StatusNotifierAction, StatusNotifierEndpoint,
-    StatusNotifierIcon, StatusNotifierItem, StatusNotifierStatus,
+    NotificationId, StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierIcon,
+    StatusNotifierItem, StatusNotifierStatus,
 };
 mod gmenu;
 mod menu;
@@ -236,7 +236,6 @@ enum Request {
     BluetoothSetPowered(bool),
     BluetoothConnectDevice(String),
     BluetoothDisconnectDevice(String),
-    NetworkSetWireless(bool),
     NotificationTimerFired,
     WindowAttention {
         window: crate::core::WindowId,
@@ -447,9 +446,6 @@ impl DbusBridge {
         let _ = self
             .requests
             .try_send(Request::BluetoothDisconnectDevice(path));
-    }
-    pub fn network_set_wireless(&self, enabled: bool) {
-        let _ = self.requests.try_send(Request::NetworkSetWireless(enabled));
     }
 }
 
@@ -985,21 +981,6 @@ fn deduplicate_wifi_access_points(
             .then_with(|| a.ssid.cmp(&b.ssid))
     });
     candidates
-}
-
-async fn network_set_wireless(connection: &zbus::Connection, enabled: bool) -> Result<(), String> {
-    let proxy = zbus::Proxy::new(
-        connection,
-        "org.freedesktop.NetworkManager",
-        "/org/freedesktop/NetworkManager",
-        "org.freedesktop.NetworkManager",
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    proxy
-        .set_property("WirelessEnabled", &enabled)
-        .await
-        .map_err(|e| e.to_string())
 }
 
 fn bluetooth_string(properties: &HashMap<String, OwnedValue>, name: &str) -> String {
@@ -1590,20 +1571,6 @@ async fn run(
                     }
                 } else {
                     eprintln!("xbar: BlueZ Disconnect skipped: system bus unavailable");
-                }
-            }
-            Either::Request(Ok(Request::NetworkSetWireless(enabled))) => {
-                if let Some((system, executor)) = &system_connection {
-                    let action = NetworkPendingAction::SetWireless(enabled);
-                    let system = system.clone();
-                    let events = Arc::clone(&events);
-                    let wake = Arc::clone(&wake);
-                    executor.spawn(async move {
-                        if let Err(error) = network_set_wireless(&system, enabled).await {
-                            eprintln!("xbar: NetworkManager WirelessEnabled update failed: {error}");
-                        }
-                        push_event(&events, &wake, Event::NetworkActionFinished(action));
-                    }, "xbar-network-command").detach();
                 }
             }
             Either::Request(Ok(Request::NotificationTimerFired)) => {
