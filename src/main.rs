@@ -6,6 +6,7 @@ mod i3;
 mod notifications;
 mod platform;
 mod ui;
+mod xnm;
 
 use clock::ClockSource;
 use core::{Event, MenuSource, State, StatusNotifierAction};
@@ -28,6 +29,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut state = State::default();
     let registry = Arc::new(Mutex::new(core::MenuRegistry::default()));
     let mut dbus = dbus::DbusBridge::start(Arc::clone(&registry))?;
+    let mut xnm = match xnm::XnmBridge::start() {
+        Ok(bridge) => Some(bridge),
+        Err(error) => {
+            eprintln!("XNM_BACKEND_FAILED error={error}");
+            None
+        }
+    };
+    let mut xnm_shadow = xnm::XnmShadowState::default();
     let trace = std::env::var_os("XBAR_TRACE").is_some();
     if trace {
         eprintln!("xbar trace: Xft Xlib connection fd={}", x11.text_raw_fd());
@@ -118,6 +127,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: xnm.as_ref().map_or(-1, xnm::XnmBridge::raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
         if result < 0 {
@@ -148,6 +162,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         if fds[5].revents & libc::POLLIN != 0 {
             dbus.notification_timer_fired();
+        }
+        if fds[6].revents & libc::POLLIN != 0 {
+            if let Some(bridge) = xnm.as_mut() {
+                for event in bridge.drain_events()? {
+                    if trace {
+                        eprintln!("xbar trace: xnm_shadow_event={event:?}");
+                    }
+                    xnm::apply_shadow_event(&mut xnm_shadow, event);
+                }
+                if trace {
+                    for device in &xnm_shadow.devices {
+                        eprintln!(
+                            "XNM_SHADOW device={} state={:?} ssid={:?} frequency={:?}",
+                            device.state.interface,
+                            device.state.device_state,
+                            device.state.ssid,
+                            device.state.frequency
+                        );
+                    }
+                }
+            }
         }
 
         if events
