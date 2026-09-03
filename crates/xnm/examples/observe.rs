@@ -45,6 +45,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     loop {
         match client.next_event().await? {
+            NetworkEvent::NetworkManagerChanged { wireless_enabled } => {
+                println!("NETWORK_MANAGER_CHANGED wireless_enabled={wireless_enabled}")
+            }
             NetworkEvent::DeviceAdded(d) => println!("DEVICE_ADDED {}", d.interface),
             NetworkEvent::DeviceRemoved(id) => println!("DEVICE_REMOVED {id}"),
             NetworkEvent::DeviceStateChanged {

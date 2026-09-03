@@ -171,6 +171,7 @@ pub enum NotificationSource {
     Internal,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum NetworkConnectivity {
     #[default]

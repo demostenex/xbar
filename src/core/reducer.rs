@@ -668,6 +668,9 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         }
         Event::AudioSelectOutput(_) | Event::AudioSelectInput(_) => false,
         Event::NetworkSnapshotReceived(network) => {
+            if state.network_status_authoritative {
+                return false;
+            }
             let visual_before = network_visual_state(&state.network);
             let mut network = network;
             if state.network_status_authoritative {
@@ -706,11 +709,26 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.network.signal_percent = status.strength;
             changed && visual_before != network_visual_state(&state.network)
         }
+        Event::NetworkPopupProjectionChanged(network) => {
+            if state.network.wifi_devices == network.wifi_devices
+                && state.network.access_points == network.access_points
+            {
+                false
+            } else {
+                state.network.wifi_devices = network.wifi_devices;
+                state.network.access_points = network.access_points;
+                state.network_popup_open
+            }
+        }
         Event::NetworkPopupOpenRequested => {
             if state.network_popup_open || state.network_popup_open_pending {
                 false
             } else {
-                state.network_popup_open_pending = true;
+                if state.network_status_authoritative {
+                    state.network_popup_open = true;
+                } else {
+                    state.network_popup_open_pending = true;
+                }
                 state.audio_popup_open = false;
                 state.audio_dragging = false;
                 state.audio_drag_input = false;
@@ -721,6 +739,9 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             }
         }
         Event::NetworkPopupSnapshotReceived(network) => {
+            if state.network_status_authoritative {
+                return false;
+            }
             if !state.network_popup_open_pending {
                 false
             } else {

@@ -125,6 +125,9 @@ impl Client {
     pub fn wifi_devices(&self) -> Vec<WifiDevice> {
         self.graph.devices.values().cloned().collect()
     }
+    pub fn wireless_enabled(&self) -> bool {
+        self.graph.wireless_enabled
+    }
     pub fn wifi_device(&self, id: &DeviceId) -> Option<WifiDevice> {
         self.graph.devices.get(id).cloned()
     }
@@ -356,6 +359,7 @@ impl Client {
         let n = ManagerProxy::new(&self.connection, SERVICE, ROOT)
             .await
             .map_err(e)?;
+        self.graph.wireless_enabled = n.wireless_enabled().await.map_err(e)?;
         for p in n.get_all_devices().await.map_err(e)? {
             self.materialize_device(&p.to_string()).await?;
         }
@@ -626,6 +630,9 @@ impl Client {
         v: &HashMap<String, OwnedValue>,
     ) -> Result<Option<NetworkEvent>, Error> {
         if changed == SERVICE {
+            if let Some(enabled) = v.get("WirelessEnabled").and_then(boolv) {
+                self.pending.push(set_wireless_enabled(&mut self.graph, enabled));
+            }
             if let Some(x) = v.get("ActiveConnections") {
                 let now = Vec::<OwnedObjectPath>::try_from(x.clone())
                     .unwrap_or_default()
@@ -796,6 +803,15 @@ fn u32v(v: &OwnedValue) -> Option<u32> {
 fn u8v(v: &OwnedValue) -> Option<u8> {
     u8::try_from(v.clone()).ok()
 }
+fn boolv(v: &OwnedValue) -> Option<bool> {
+    bool::try_from(v.clone()).ok()
+}
+fn set_wireless_enabled(graph: &mut NetworkGraph, enabled: bool) -> NetworkEvent {
+    graph.wireless_enabled = enabled;
+    NetworkEvent::NetworkManagerChanged {
+        wireless_enabled: enabled,
+    }
+}
 fn state_reason(v: &OwnedValue) -> Option<crate::model::DeviceStateReason> {
     let (state, reason) = <(u32, u32)>::try_from(v.clone()).ok()?;
     Some(crate::model::DeviceStateReason { state, reason })
@@ -803,4 +819,38 @@ fn state_reason(v: &OwnedValue) -> Option<crate::model::DeviceStateReason> {
 
 fn reason_from_tuple((state, reason): (u32, u32)) -> crate::model::DeviceStateReason {
     crate::model::DeviceStateReason { state, reason }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manager_wireless_enabled_true_updates_cache_and_event() {
+        let mut graph = NetworkGraph::default();
+        let event = set_wireless_enabled(&mut graph, true);
+        assert!(graph.wireless_enabled);
+        assert_eq!(
+            event,
+            NetworkEvent::NetworkManagerChanged {
+                wireless_enabled: true
+            }
+        );
+    }
+
+    #[test]
+    fn manager_wireless_enabled_false_updates_cache_and_event() {
+        let mut graph = NetworkGraph {
+            wireless_enabled: true,
+            ..Default::default()
+        };
+        let event = set_wireless_enabled(&mut graph, false);
+        assert!(!graph.wireless_enabled);
+        assert_eq!(
+            event,
+            NetworkEvent::NetworkManagerChanged {
+                wireless_enabled: false
+            }
+        );
+    }
 }

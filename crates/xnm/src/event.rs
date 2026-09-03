@@ -3,6 +3,7 @@ use crate::{AccessPointId, ActiveConnectionId, DeviceId, SavedConnectionId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkEvent {
+    NetworkManagerChanged { wireless_enabled: bool },
     DeviceAdded(WifiDevice),
     DeviceRemoved(DeviceId),
     DeviceStateChanged {

@@ -118,6 +118,7 @@ pub struct CurrentWifiState {
 
 #[derive(Debug, Default)]
 pub(crate) struct NetworkGraph {
+    pub wireless_enabled: bool,
     pub devices: HashMap<DeviceId, WifiDevice>,
     pub access_points: HashMap<AccessPointId, AccessPoint>,
     pub saved_connections: HashMap<SavedConnectionId, SavedConnection>,

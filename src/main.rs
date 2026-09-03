@@ -179,6 +179,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         frequency: status.frequency,
                         strength: status.strength,
                     }));
+                    events.push(Event::NetworkPopupProjectionChanged(
+                        xnm_shadow.popup_projection(),
+                    ));
                 }
                 if trace {
                     for device in &xnm_shadow.devices {
@@ -738,12 +741,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if trace {
                     eprintln!("xbar trace: NETWORK_POPUP_OPEN_REQUEST");
                 }
-                dbus.network_popup_snapshot();
-            }
-            if matches!(translated, Event::NetworkPopupSnapshotReceived(_))
-                && state.network_popup_open
-            {
-                dbus.network_scan();
+                if let Some(bridge) = xnm.as_ref() {
+                    for interface in xnm_shadow.interfaces() {
+                        bridge.request_scan(interface);
+                    }
+                }
             }
             if matches!(
                 translated,
@@ -771,6 +773,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 translated,
                 Event::NetworkStatusChanged(_)
                     | Event::NetworkSnapshotReceived(_)
+                    | Event::NetworkPopupProjectionChanged(_)
                     | Event::NetworkPopupSnapshotReceived(_)
                     | Event::NetworkActionFinished(_)
             ) && state.network_popup_open

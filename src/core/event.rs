@@ -110,10 +110,14 @@ pub enum Event {
     AudioSelectOutput(String),
     AudioSelectInput(String),
     AudioUnavailable,
+    #[allow(dead_code)]
     NetworkSnapshotReceived(NetworkState),
     NetworkStatusChanged(super::NetworkStatus),
+    NetworkPopupProjectionChanged(NetworkState),
     NetworkPopupOpenRequested,
+    #[allow(dead_code)]
     NetworkPopupSnapshotReceived(NetworkState),
+    #[allow(dead_code)]
     NetworkPopupSnapshotFailed,
     NetworkPopupToggled,
     NetworkSetWireless(bool),
