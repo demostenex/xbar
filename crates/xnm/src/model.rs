@@ -170,6 +170,14 @@ impl NetworkGraph {
         device: &DeviceId,
         ssid: &str,
     ) -> Result<CandidateSelection, crate::Error> {
+        self.activation_selection_for_band(device, ssid, None)
+    }
+    pub(crate) fn activation_selection_for_band(
+        &self,
+        device: &DeviceId,
+        ssid: &str,
+        band: Option<Band>,
+    ) -> Result<CandidateSelection, crate::Error> {
         let _d = self
             .devices
             .get(device)
@@ -181,6 +189,7 @@ impl NetworkGraph {
             .flatten()
             .filter_map(|id| self.access_points.get(id))
             .filter(|a| a.ssid == ssid)
+            .filter(|a| band.is_none_or(|wanted| a.band() == wanted))
             .max_by(|a, b| a.strength.cmp(&b.strength).then_with(|| b.id.cmp(&a.id)))
             .cloned();
         let Some(access_point) = access_point else {

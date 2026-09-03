@@ -38,6 +38,10 @@ pub enum XnmBridgeEvent {
         device: Option<XnmShadowDevice>,
     },
     BackendFailed(String),
+    ActivationPending {
+        interface: String,
+        ssid: String,
+    },
     ScanFailed {
         interface: String,
         error: String,
@@ -46,7 +50,14 @@ pub enum XnmBridgeEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum XnmBackendCommand {
-    RequestScan { interface: String },
+    RequestScan {
+        interface: String,
+    },
+    ConnectSavedWifi {
+        interface: String,
+        ssid: String,
+        band: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -57,6 +68,9 @@ pub struct XnmShadowState {
     pub saved_connections: Vec<SavedConnection>,
     pub active_connections: Vec<ActiveConnection>,
     pub available: bool,
+    pub pending_activation: Option<(String, String)>,
+    stable_status: Option<XnmStatus>,
+    stable_popup_devices: Option<Vec<WifiDevice>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -98,6 +112,15 @@ impl XnmShadowState {
             frequency: selected.and_then(|device| device.state.frequency),
             strength: selected.and_then(|device| device.state.strength),
         }
+    }
+
+    pub fn presentation_status(&self) -> XnmStatus {
+        if self.pending_activation.is_some() {
+            if let Some(status) = &self.stable_status {
+                return status.clone();
+            }
+        }
+        self.status()
     }
 
     pub fn popup_projection(&self) -> NetworkState {
@@ -194,6 +217,28 @@ impl XnmShadowState {
                 .cmp(&b.interface)
                 .then_with(|| a.path.cmp(&b.path))
         });
+        if let Some(stable_devices) = &self.stable_popup_devices {
+            for device in &mut devices {
+                if let Some(stable) = stable_devices
+                    .iter()
+                    .find(|stable| stable.interface == device.interface)
+                {
+                    device.state = stable.state;
+                    device.active_connection = stable.active_connection.clone();
+                    device.active_ap = stable.active_ap.clone();
+                    for row in &mut device.access_points {
+                        if let Some(stable_row) = stable.access_points.iter().find(|candidate| {
+                            candidate.interface == row.interface
+                                && candidate.ssid == row.ssid
+                                && crate::core::wifi_band(candidate.frequency)
+                                    == crate::core::wifi_band(row.frequency)
+                        }) {
+                            row.is_active = stable_row.is_active;
+                        }
+                    }
+                }
+            }
+        }
         let access_points = devices
             .iter()
             .flat_map(|device| device.access_points.iter().cloned())
@@ -247,6 +292,16 @@ pub fn apply_shadow_event(shadow: &mut XnmShadowState, event: XnmBridgeEvent) {
             shadow.saved_connections = initial.saved_connections;
             shadow.active_connections = initial.active_connections;
             shadow.available = true;
+            shadow.pending_activation = None;
+            shadow.stable_status = None;
+            shadow.stable_popup_devices = None;
+        }
+        XnmBridgeEvent::ActivationPending { interface, ssid } => {
+            if shadow.pending_activation.is_none() {
+                shadow.stable_status = Some(shadow.status());
+                shadow.stable_popup_devices = Some(shadow.popup_projection().wifi_devices);
+            }
+            shadow.pending_activation = Some((interface, ssid));
         }
         XnmBridgeEvent::Network { event, device } => {
             match event {
@@ -307,9 +362,41 @@ pub fn apply_shadow_event(shadow: &mut XnmShadowState, event: XnmBridgeEvent) {
                 }
             }
             shadow.available = true;
+            shadow.finish_activation_if_converged();
         }
-        XnmBridgeEvent::BackendFailed(_) => shadow.available = false,
+        XnmBridgeEvent::BackendFailed(_) => {
+            shadow.available = false;
+            shadow.pending_activation = None;
+            shadow.stable_status = None;
+            shadow.stable_popup_devices = None;
+        }
         XnmBridgeEvent::ScanFailed { .. } => {}
+    }
+}
+
+impl XnmShadowState {
+    fn finish_activation_if_converged(&mut self) {
+        let Some((interface, target_ssid)) = &self.pending_activation else {
+            return;
+        };
+        let target_converged = self.devices.iter().any(|device| {
+            device.state.interface == *interface
+                && device.state.device_state == xnm::DeviceState::Activated
+                && device.state.ssid.as_deref() == Some(target_ssid.as_str())
+        });
+        let terminal_failure = self.devices.iter().any(|device| {
+            device.state.interface == *interface
+                && device.state.device_state == xnm::DeviceState::Failed
+        });
+        let device_removed = !self
+            .devices
+            .iter()
+            .any(|device| device.state.interface == *interface);
+        if target_converged || terminal_failure || device_removed {
+            self.pending_activation = None;
+            self.stable_status = None;
+            self.stable_popup_devices = None;
+        }
     }
 }
 
@@ -359,6 +446,14 @@ impl XnmBridge {
         let _ = self
             .commands
             .try_send(XnmBackendCommand::RequestScan { interface });
+    }
+
+    pub fn connect_saved_wifi(&self, target: crate::core::NetworkWifiTarget) {
+        let _ = self.commands.try_send(XnmBackendCommand::ConnectSavedWifi {
+            interface: target.interface,
+            ssid: target.ssid,
+            band: target.band,
+        });
     }
 
     pub fn drain_events(&mut self) -> io::Result<Vec<XnmBridgeEvent>> {
@@ -481,6 +576,59 @@ async fn run(
                             error: error.to_string(),
                         },
                     );
+                }
+            }
+            WaitResult::Command(Ok(XnmBackendCommand::ConnectSavedWifi {
+                interface,
+                ssid,
+                band,
+            })) => {
+                let result = match band.as_str() {
+                    "2.4 GHz" => {
+                        client
+                            .activate_saved_wifi_target(&interface, &ssid, xnm::Band::Ghz2_4)
+                            .await
+                    }
+                    "5 GHz" => {
+                        client
+                            .activate_saved_wifi_target(&interface, &ssid, xnm::Band::Ghz5)
+                            .await
+                    }
+                    "6 GHz" => {
+                        client
+                            .activate_saved_wifi_target(&interface, &ssid, xnm::Band::Ghz6)
+                            .await
+                    }
+                    _ => Err(xnm::Error::InvalidId(band.clone())),
+                };
+                match result {
+                    Ok(Some(connection)) => {
+                        push(
+                            &queue,
+                            writer,
+                            XnmBridgeEvent::ActivationPending {
+                                interface: interface.clone(),
+                                ssid: ssid.clone(),
+                            },
+                        );
+                        if std::env::var_os("XBAR_TRACE").is_some() {
+                            eprintln!(
+                                "xbar trace: NETWORK_ACTIVATION_REQUEST_ACCEPTED interface={interface} ssid={ssid} active_connection={connection}"
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        if std::env::var_os("XBAR_TRACE").is_some() {
+                            eprintln!(
+                                "xbar trace: NETWORK_ACTION_NOOP_ALREADY_ACTIVE interface={interface} ssid={ssid}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "xbar: NETWORK_ACTION_REJECTED interface={interface} ssid={ssid} reason={error}"
+                        );
+                    }
                 }
             }
             WaitResult::Command(Err(_)) => return,
@@ -791,6 +939,176 @@ mod tests {
         assert_eq!(before.wifi_devices[0].access_points.len(), 1);
         assert_eq!(after.wifi_devices[0].access_points.len(), 1);
         assert_eq!(after.wifi_devices[0].access_points[0].path, "/ap/b");
+    }
+
+    #[test]
+    fn presentation_keeps_stable_status_during_activation_transients() {
+        let mut shadow = XnmShadowState {
+            available: true,
+            devices: vec![state("wlan0", Some("Foo"))],
+            ..Default::default()
+        };
+        apply(
+            &mut shadow,
+            XnmBridgeEvent::ActivationPending {
+                interface: "wlan0".into(),
+                ssid: "Bar".into(),
+            },
+        );
+        for transient_state in [
+            DeviceState::Prepare,
+            DeviceState::Config,
+            DeviceState::IpConfig,
+            DeviceState::Secondaries,
+        ] {
+            let mut transient = state("wlan0", None);
+            transient.state.device_state = transient_state;
+            apply(
+                &mut shadow,
+                XnmBridgeEvent::Network {
+                    event: NetworkEvent::DeviceChanged(xnm::WifiDevice {
+                        id: transient.device.clone(),
+                        interface: "wlan0".into(),
+                        driver: None,
+                        state: transient_state,
+                        active_connection: None,
+                        active_ap: None,
+                        last_scan: None,
+                        state_reason: None,
+                    }),
+                    device: Some(transient),
+                },
+            );
+        }
+        let status = shadow.presentation_status();
+        assert!(status.connected);
+        assert_eq!(status.ssid.as_deref(), Some("Foo"));
+        assert_eq!(
+            shadow
+                .pending_activation
+                .as_ref()
+                .map(|(interface, ssid)| (interface.as_str(), ssid.as_str())),
+            Some(("wlan0", "Bar"))
+        );
+    }
+
+    #[test]
+    fn presentation_promotes_target_only_after_real_activation() {
+        let mut shadow = XnmShadowState {
+            available: true,
+            devices: vec![state("wlan0", Some("Foo"))],
+            ..Default::default()
+        };
+        apply(
+            &mut shadow,
+            XnmBridgeEvent::ActivationPending {
+                interface: "wlan0".into(),
+                ssid: "Bar".into(),
+            },
+        );
+        apply(
+            &mut shadow,
+            XnmBridgeEvent::Network {
+                event: NetworkEvent::DeviceChanged(xnm::WifiDevice {
+                    id: "/device/1".parse().unwrap(),
+                    interface: "wlan0".into(),
+                    driver: None,
+                    state: DeviceState::Activated,
+                    active_connection: None,
+                    active_ap: None,
+                    last_scan: None,
+                    state_reason: None,
+                }),
+                device: Some(state("wlan0", Some("Bar"))),
+            },
+        );
+        assert_eq!(shadow.presentation_status().ssid.as_deref(), Some("Bar"));
+        assert!(shadow.pending_activation.is_none());
+    }
+
+    #[test]
+    fn terminal_failure_releases_stable_presentation() {
+        let mut shadow = XnmShadowState {
+            available: true,
+            devices: vec![state("wlan0", Some("Foo"))],
+            ..Default::default()
+        };
+        apply(
+            &mut shadow,
+            XnmBridgeEvent::ActivationPending {
+                interface: "wlan0".into(),
+                ssid: "Bar".into(),
+            },
+        );
+        let mut failed = state("wlan0", None);
+        failed.state.device_state = DeviceState::Failed;
+        apply(
+            &mut shadow,
+            XnmBridgeEvent::Network {
+                event: NetworkEvent::DeviceChanged(xnm::WifiDevice {
+                    id: failed.device.clone(),
+                    interface: "wlan0".into(),
+                    driver: None,
+                    state: DeviceState::Failed,
+                    active_connection: None,
+                    active_ap: None,
+                    last_scan: None,
+                    state_reason: None,
+                }),
+                device: Some(failed),
+            },
+        );
+        let status = shadow.presentation_status();
+        assert!(!status.connected);
+        assert!(status.ssid.is_none());
+        assert!(shadow.pending_activation.is_none());
+    }
+
+    #[test]
+    fn popup_keeps_stable_device_presentation_during_activation_transient() {
+        let mut device = state("wlan0", Some("Foo"));
+        device.device = "/device/0".parse().unwrap();
+        device.state.active_ap = Some("/ap/foo".parse().unwrap());
+        let mut shadow = XnmShadowState {
+            available: true,
+            devices: vec![device],
+            access_points: vec![access_point("/ap/foo", "/device/0", "Foo", 5765, 80)],
+            ..Default::default()
+        };
+        let before = shadow.popup_projection();
+        apply(
+            &mut shadow,
+            XnmBridgeEvent::ActivationPending {
+                interface: "wlan0".into(),
+                ssid: "Bar".into(),
+            },
+        );
+        let mut transient = state("wlan0", None);
+        transient.device = "/device/0".parse().unwrap();
+        transient.state.device_state = DeviceState::IpConfig;
+        apply(
+            &mut shadow,
+            XnmBridgeEvent::Network {
+                event: NetworkEvent::DeviceChanged(xnm::WifiDevice {
+                    id: transient.device.clone(),
+                    interface: "wlan0".into(),
+                    driver: None,
+                    state: DeviceState::IpConfig,
+                    active_connection: None,
+                    active_ap: None,
+                    last_scan: None,
+                    state_reason: None,
+                }),
+                device: Some(transient),
+            },
+        );
+        let during = shadow.popup_projection();
+        assert_eq!(during.wifi_devices[0].state, before.wifi_devices[0].state);
+        assert_eq!(
+            during.wifi_devices[0].active_ap,
+            before.wifi_devices[0].active_ap
+        );
+        assert!(during.wifi_devices[0].access_points[0].is_active);
     }
 
     fn apply(shadow: &mut XnmShadowState, event: XnmBridgeEvent) {

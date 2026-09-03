@@ -62,6 +62,15 @@ pub struct NetworkAccessPoint {
     pub saved_profile: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkWifiTarget {
+    pub interface: String,
+    pub ssid: String,
+    pub band: String,
+    pub saved: bool,
+    pub active: bool,
+}
+
 pub fn wifi_band(frequency: u32) -> &'static str {
     match frequency {
         2400..=2500 => "2.4 GHz",

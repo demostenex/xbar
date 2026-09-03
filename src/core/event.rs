@@ -114,6 +114,7 @@ pub enum Event {
     NetworkSnapshotReceived(NetworkState),
     NetworkStatusChanged(super::NetworkStatus),
     NetworkPopupProjectionChanged(NetworkState),
+    NetworkConnectSavedWifi(super::NetworkWifiTarget),
     NetworkPopupOpenRequested,
     #[allow(dead_code)]
     NetworkPopupSnapshotReceived(NetworkState),

@@ -720,6 +720,13 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.network_popup_open
             }
         }
+        Event::NetworkConnectSavedWifi(target) => state.network.access_points.iter().any(|ap| {
+            ap.interface == target.interface
+                && ap.ssid == target.ssid
+                && super::wifi_band(ap.frequency) == target.band
+                && ap.saved_profile.is_some()
+                && !ap.is_active
+        }),
         Event::NetworkPopupOpenRequested => {
             if state.network_popup_open || state.network_popup_open_pending {
                 false
@@ -1030,6 +1037,43 @@ mod tests {
             &mut registry,
         ));
         assert_eq!(state.network.signal_percent, Some(75));
+    }
+
+    #[test]
+    fn saved_wifi_intent_accepts_only_saved_inactive_matching_row() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        state.network.access_points = vec![super::super::NetworkAccessPoint {
+            interface: "wlan0".into(),
+            ssid: "Foo".into(),
+            frequency: 2412,
+            saved_profile: Some("/settings/1".into()),
+            ..Default::default()
+        }];
+        let target = super::super::NetworkWifiTarget {
+            interface: "wlan0".into(),
+            ssid: "Foo".into(),
+            band: "2.4 GHz".into(),
+            ..Default::default()
+        };
+        assert!(reduce(
+            &mut state,
+            Event::NetworkConnectSavedWifi(target.clone()),
+            &mut registry,
+        ));
+        state.network.access_points[0].is_active = true;
+        assert!(!reduce(
+            &mut state,
+            Event::NetworkConnectSavedWifi(target.clone()),
+            &mut registry,
+        ));
+        state.network.access_points[0].is_active = false;
+        state.network.access_points[0].saved_profile = None;
+        assert!(!reduce(
+            &mut state,
+            Event::NetworkConnectSavedWifi(target),
+            &mut registry,
+        ));
     }
 
     #[test]

@@ -169,19 +169,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if trace {
                         eprintln!("xbar trace: xnm_shadow_event={event:?}");
                     }
+                    let previous_status = xnm_shadow.presentation_status();
+                    let previous_popup = xnm_shadow.popup_projection();
                     xnm::apply_shadow_event(&mut xnm_shadow, event);
-                    let status = xnm_shadow.status();
-                    events.push(Event::NetworkStatusChanged(core::NetworkStatus {
-                        available: status.available,
-                        connected: status.connected,
-                        interface: status.interface,
-                        ssid: status.ssid,
-                        frequency: status.frequency,
-                        strength: status.strength,
-                    }));
-                    events.push(Event::NetworkPopupProjectionChanged(
-                        xnm_shadow.popup_projection(),
-                    ));
+                    let status = xnm_shadow.presentation_status();
+                    if status != previous_status {
+                        events.push(Event::NetworkStatusChanged(core::NetworkStatus {
+                            available: status.available,
+                            connected: status.connected,
+                            interface: status.interface,
+                            ssid: status.ssid,
+                            frequency: status.frequency,
+                            strength: status.strength,
+                        }));
+                    }
+                    let popup = xnm_shadow.popup_projection();
+                    if previous_popup.wifi_devices != popup.wifi_devices
+                        || previous_popup.access_points != popup.access_points
+                    {
+                        events.push(Event::NetworkPopupProjectionChanged(popup));
+                    }
                 }
                 if trace {
                     for device in &xnm_shadow.devices {
@@ -389,6 +396,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         Event::NetworkPopupOpenRequested
                     }
                 }
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::NetworkWifi(target)),
+                ) => Event::NetworkConnectSavedWifi(target.clone()),
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::NetworkWireless),
@@ -735,6 +746,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     dbus.network_set_wireless(enabled)
                 }
+                Event::NetworkConnectSavedWifi(ref target) if reduced => {
+                    if trace {
+                        eprintln!(
+                            "xbar trace: ConnectSavedWifi interface={} ssid={} band={} saved={} active={}",
+                            target.interface, target.ssid, target.band, target.saved, target.active
+                        );
+                    }
+                    if let Some(bridge) = xnm.as_ref() {
+                        bridge.connect_saved_wifi(target.clone());
+                    } else if trace {
+                        eprintln!("xbar trace: NETWORK_ACTION_REJECTED reason=xnm-unavailable");
+                    }
+                }
                 _ => {}
             }
             if matches!(translated, Event::NetworkPopupOpenRequested) && reduced {
@@ -1061,6 +1085,7 @@ fn render_target_for(
             | Some(HitTarget::Bluetooth) => None,
             Some(HitTarget::NetworkWireless)
             | Some(HitTarget::NetworkInside)
+            | Some(HitTarget::NetworkWifi(_))
             | Some(HitTarget::Network) => None,
         },
         Event::MenuClickedOutside => Some(RenderTarget::Popup),

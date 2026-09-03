@@ -1,7 +1,7 @@
 use crate::dbus::*;
 use crate::event::NetworkEvent;
 use crate::model::{
-    AccessPoint, ActiveConnection, CandidateSelection, CurrentWifiState, NetworkGraph,
+    AccessPoint, ActiveConnection, Band, CandidateSelection, CurrentWifiState, NetworkGraph,
     SavedConnection, WifiDevice,
 };
 use crate::{id, AccessPointId, ActiveConnectionId, DeviceId, Error, SavedConnectionId};
@@ -219,6 +219,43 @@ impl Client {
             profile,
             specific_ap,
         })
+    }
+    pub async fn activate_saved_wifi_target(
+        &mut self,
+        interface: &str,
+        ssid: &str,
+        band: Band,
+    ) -> Result<Option<ActiveConnectionId>, Error> {
+        if !self.graph.wireless_enabled {
+            return Err(Error::WirelessDisabled);
+        }
+        let device = self
+            .device_by_interface(interface)
+            .ok_or_else(|| Error::Dbus(format!("unknown Wi-Fi interface: {interface}")))?;
+        if self
+            .current_wifi_state(&device.id)
+            .is_some_and(|state| state.ssid.as_deref() == Some(ssid) && state.frequency.is_some_and(|f| band_matches(f, band)))
+        {
+            return Ok(None);
+        }
+        let selection = self
+            .graph
+            .activation_selection_for_band(&device.id, ssid, Some(band))?;
+        let (profile, access_point) = match selection {
+            CandidateSelection::Ready { profile, access_point } => (profile, access_point),
+            CandidateSelection::UnsavedNetwork => {
+                return Err(Error::UnsavedNetwork {
+                    device: device.id,
+                    ssid: ssid.to_owned(),
+                })
+            }
+            CandidateSelection::Ambiguous(profiles) => {
+                return Err(Error::AmbiguousSavedConnections(profiles))
+            }
+        };
+        self.activate_saved_wifi(&device.id, &profile.id, Some(access_point.id))
+            .await
+            .map(Some)
     }
     pub async fn activate_saved_wifi(
         &mut self,
@@ -811,6 +848,15 @@ fn set_wireless_enabled(graph: &mut NetworkGraph, enabled: bool) -> NetworkEvent
     NetworkEvent::NetworkManagerChanged {
         wireless_enabled: enabled,
     }
+}
+
+fn band_matches(frequency: u32, band: Band) -> bool {
+    matches!(
+        (frequency, band),
+        (2412..=2999, Band::Ghz2_4)
+        | (3000..=5999, Band::Ghz5)
+        | (6000.., Band::Ghz6)
+    )
 }
 fn state_reason(v: &OwnedValue) -> Option<crate::model::DeviceStateReason> {
     let (state, reason) = <(u32, u32)>::try_from(v.clone()).ok()?;

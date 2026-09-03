@@ -1,5 +1,6 @@
 use crate::core::{
-    GtkMenuEndpoint, OutputId, OutputState, State, StatusNotifierEndpoint, WindowId,
+    GtkMenuEndpoint, NetworkWifiTarget, OutputId, OutputState, State, StatusNotifierEndpoint,
+    WindowId,
 };
 use crate::ui::style::{self, TextMeasurer, BAR_STYLE};
 use crate::ui::{layout, view};
@@ -130,7 +131,7 @@ struct NetworkPopupWindow {
     window: u32,
     rect: layout::MenuRect,
     wireless: layout::MenuRect,
-    access_points: Vec<(String, layout::MenuRect)>,
+    access_points: Vec<(NetworkWifiTarget, layout::MenuRect)>,
 }
 struct NotificationWindow {
     window: u32,
@@ -167,6 +168,7 @@ pub enum HitTarget {
     BluetoothDevice(String),
     BluetoothInside,
     Network,
+    NetworkWifi(NetworkWifiTarget),
     NetworkWireless,
     NetworkInside,
     Outside,
@@ -1974,7 +1976,13 @@ impl X11Platform {
             row_index += 2;
             for access_point in &device.access_points {
                 rows.push((
-                    access_point.path.clone(),
+                    NetworkWifiTarget {
+                        interface: access_point.interface.clone(),
+                        ssid: access_point.ssid.clone(),
+                        band: crate::core::wifi_band(access_point.frequency).into(),
+                        saved: access_point.saved_profile.is_some(),
+                        active: access_point.is_active,
+                    },
                     layout::MenuRect {
                         x: output.x + output.width as i16 - 350 + 10,
                         y: output.y + 26 + 82 + row_index * 24,
@@ -2140,12 +2148,16 @@ impl X11Platform {
                 BAR_STYLE.popup_foreground,
             )?;
         }
-        for (path, row) in &rows {
+        for (target, row) in &rows {
             let access_point = state
                 .network
                 .access_points
                 .iter()
-                .find(|access_point| access_point.path == *path)
+                .find(|access_point| {
+                    access_point.interface == target.interface
+                        && access_point.ssid == target.ssid
+                        && crate::core::wifi_band(access_point.frequency) == target.band
+                })
                 .expect("network popup row has matching access point");
             let band = crate::core::wifi_band(access_point.frequency);
             let marker = if access_point.is_active { "●" } else { " " };
@@ -2729,13 +2741,13 @@ impl X11Platform {
                 {
                     return HitTarget::NetworkWireless;
                 }
-                if popup.access_points.iter().any(|(_, rect)| {
+                if let Some((target, _)) = popup.access_points.iter().find(|(_, rect)| {
                     rx >= rect.x
                         && rx < rect.x + rect.width as i16
                         && ry >= rect.y
                         && ry < rect.y + rect.height as i16
                 }) {
-                    return HitTarget::Network;
+                    return HitTarget::NetworkWifi(target.clone());
                 }
                 return HitTarget::NetworkInside;
             }

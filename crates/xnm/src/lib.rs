@@ -51,6 +51,7 @@ id_type!(ActiveConnectionId);
 pub enum Error {
     Dbus(String),
     InvalidId(String),
+    WirelessDisabled,
     NotWifi(DeviceId),
     UnknownDevice(DeviceId),
     DeviceDisappeared {
@@ -90,6 +91,7 @@ impl fmt::Display for Error {
         match self {
             Self::Dbus(x) => write!(f, "D-Bus: {x}"),
             Self::InvalidId(x) => write!(f, "invalid object path: {x}"),
+            Self::WirelessDisabled => write!(f, "wireless is disabled"),
             Self::NotWifi(x) => write!(f, "not a Wi-Fi device: {x}"),
             Self::UnknownDevice(x) => write!(f, "unknown device: {x}"),
             Self::DeviceDisappeared {
@@ -346,6 +348,37 @@ mod model_tests {
             panic!("expected candidate")
         };
         assert_eq!(access_point.id, "/ap/b".parse().unwrap());
+    }
+
+    #[test]
+    fn resolver_for_band_does_not_choose_stronger_ap_from_other_band() {
+        let mut g = NetworkGraph::default();
+        let d = device("/d0", "wlan0");
+        let mut two_four = ap("/ap/2", "/d0", "Foo", 2412);
+        two_four.strength = 40;
+        let mut five = ap("/ap/5", "/d0", "Foo", 5180);
+        five.strength = 90;
+        let did = d.id.clone();
+        g.devices.insert(did.clone(), d);
+        g.access_points.extend([
+            (two_four.id.clone(), two_four),
+            (five.id.clone(), five),
+        ]);
+        g.device_aps.insert(
+            did.clone(),
+            vec!["/ap/2".parse().unwrap(), "/ap/5".parse().unwrap()],
+        );
+        g.saved_connections.insert(
+            "/s/1".parse().unwrap(),
+            profile("/s/1", "global", None, "Foo"),
+        );
+        let CandidateSelection::Ready { access_point, .. } = g
+            .activation_selection_for_band(&did, "Foo", Some(Band::Ghz2_4))
+            .unwrap()
+        else {
+            panic!("expected band-specific candidate")
+        };
+        assert_eq!(access_point.id, "/ap/2".parse().unwrap());
     }
 
     #[test]
