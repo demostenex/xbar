@@ -5,6 +5,12 @@ use crate::{AccessPointId, ActiveConnectionId, DeviceId, SavedConnectionId};
 pub enum NetworkEvent {
     DeviceAdded(WifiDevice),
     DeviceRemoved(DeviceId),
+    DeviceStateChanged {
+        device: DeviceId,
+        new_state: u32,
+        old_state: u32,
+        reason: u32,
+    },
     DeviceChanged(WifiDevice),
     AccessPointAdded(AccessPoint),
     AccessPointRemoved {

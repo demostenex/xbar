@@ -16,6 +16,12 @@ pub enum DeviceState {
     Deactivating,
     Failed,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceStateReason {
+    pub state: u32,
+    pub reason: u32,
+}
 impl From<u32> for DeviceState {
     fn from(v: u32) -> Self {
         match v {
@@ -74,6 +80,7 @@ pub struct WifiDevice {
     pub active_connection: Option<ActiveConnectionId>,
     pub active_ap: Option<AccessPointId>,
     pub last_scan: Option<i64>,
+    pub state_reason: Option<DeviceStateReason>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedConnection {
@@ -92,6 +99,7 @@ pub struct ActiveConnection {
     pub state: u32,
     pub profile: Option<SavedConnectionId>,
     pub devices: Vec<DeviceId>,
+    pub state_reason: Option<DeviceStateReason>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentWifiState {
@@ -104,6 +112,8 @@ pub struct CurrentWifiState {
     pub ssid: Option<String>,
     pub frequency: Option<u32>,
     pub strength: Option<u8>,
+    pub device_state_reason: Option<DeviceStateReason>,
+    pub active_connection_state_reason: Option<DeviceStateReason>,
 }
 
 #[derive(Debug, Default)]
@@ -115,6 +125,81 @@ pub(crate) struct NetworkGraph {
     pub device_aps: HashMap<DeviceId, Vec<AccessPointId>>,
 }
 impl NetworkGraph {
+    pub(crate) fn saved_profile(
+        &self,
+        device: &DeviceId,
+        ssid: &str,
+    ) -> Result<SavedConnection, crate::Error> {
+        let d = self
+            .devices
+            .get(device)
+            .ok_or_else(|| crate::Error::UnknownDevice(device.clone()))?;
+        let wifi = |p: &&SavedConnection| {
+            (p.connection_type == "802-11-wireless" || p.connection_type == "wifi")
+                && p.ssid.as_deref() == Some(ssid)
+        };
+        let specific: Vec<_> = self
+            .saved_connections
+            .values()
+            .filter(|p| p.interface_name.as_deref() == Some(d.interface.as_str()))
+            .filter(wifi)
+            .cloned()
+            .collect();
+        let profiles = if specific.is_empty() {
+            self.saved_connections
+                .values()
+                .filter(|p| p.interface_name.is_none())
+                .filter(wifi)
+                .cloned()
+                .collect()
+        } else {
+            specific
+        };
+        match profiles.as_slice() {
+            [profile] => Ok(profile.clone()),
+            [] => Err(crate::Error::UnsavedNetwork {
+                device: device.clone(),
+                ssid: ssid.to_owned(),
+            }),
+            _ => Err(crate::Error::AmbiguousSavedConnections(profiles)),
+        }
+    }
+    pub(crate) fn activation_selection(
+        &self,
+        device: &DeviceId,
+        ssid: &str,
+    ) -> Result<CandidateSelection, crate::Error> {
+        let _d = self
+            .devices
+            .get(device)
+            .ok_or_else(|| crate::Error::UnknownDevice(device.clone()))?;
+        let access_point = self
+            .device_aps
+            .get(device)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.access_points.get(id))
+            .filter(|a| a.ssid == ssid)
+            .max_by(|a, b| a.strength.cmp(&b.strength).then_with(|| b.id.cmp(&a.id)))
+            .cloned();
+        let Some(access_point) = access_point else {
+            return Err(crate::Error::AccessPointNotFound {
+                device: device.clone(),
+                ssid: ssid.to_owned(),
+            });
+        };
+        match self.saved_profile(device, ssid) {
+            Ok(profile) => Ok(CandidateSelection::Ready {
+                profile: Box::new(profile),
+                access_point: Box::new(access_point),
+            }),
+            Err(crate::Error::UnsavedNetwork { .. }) => Ok(CandidateSelection::UnsavedNetwork),
+            Err(crate::Error::AmbiguousSavedConnections(profiles)) => {
+                Ok(CandidateSelection::Ambiguous(profiles))
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub(crate) fn current(&self, id: &DeviceId) -> Option<CurrentWifiState> {
         let d = self.devices.get(id)?;
         let c = d
@@ -132,6 +217,8 @@ impl NetworkGraph {
             ssid: a.map(|x| x.ssid.clone()),
             frequency: a.map(|x| x.frequency),
             strength: a.map(|x| x.strength),
+            device_state_reason: d.state_reason,
+            active_connection_state_reason: c.and_then(|x| x.state_reason),
         })
     }
     pub(crate) fn remove_device(&mut self, id: &DeviceId) {
@@ -144,4 +231,14 @@ impl NetworkGraph {
         self.active_connections
             .retain(|_, c| !c.devices.iter().any(|d| d == id));
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CandidateSelection {
+    Ready {
+        profile: Box<SavedConnection>,
+        access_point: Box<AccessPoint>,
+    },
+    Ambiguous(Vec<SavedConnection>),
+    UnsavedNetwork,
 }

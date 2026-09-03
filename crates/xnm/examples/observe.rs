@@ -47,6 +47,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         match client.next_event().await? {
             NetworkEvent::DeviceAdded(d) => println!("DEVICE_ADDED {}", d.interface),
             NetworkEvent::DeviceRemoved(id) => println!("DEVICE_REMOVED {id}"),
+            NetworkEvent::DeviceStateChanged {
+                device,
+                new_state,
+                old_state,
+                reason,
+            } => println!(
+                "DEVICE_STATE_CHANGED device={device} old_state={old_state} new_state={new_state} reason={reason}"
+            ),
             NetworkEvent::DeviceChanged(d) => println!(
                 "DEVICE_CHANGED {} state={:?} active={:?}",
                 d.interface, d.state, d.active_connection

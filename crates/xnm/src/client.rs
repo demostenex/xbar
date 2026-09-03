@@ -1,7 +1,8 @@
 use crate::dbus::*;
 use crate::event::NetworkEvent;
 use crate::model::{
-    AccessPoint, ActiveConnection, CurrentWifiState, NetworkGraph, SavedConnection, WifiDevice,
+    AccessPoint, ActiveConnection, CandidateSelection, CurrentWifiState, NetworkGraph,
+    SavedConnection, WifiDevice,
 };
 use crate::{id, AccessPointId, ActiveConnectionId, DeviceId, Error, SavedConnectionId};
 use futures_util::TryStreamExt;
@@ -11,16 +12,110 @@ use zbus::{Connection, MatchRule, MessageStream};
 
 pub struct Client {
     connection: Connection,
+    stream: MessageStream,
     graph: NetworkGraph,
     pending: Vec<NetworkEvent>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationCandidate {
+    pub profile: SavedConnection,
+    pub access_point: AccessPoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedActivation {
+    pub profile: SavedConnection,
+    pub specific_ap: Option<AccessPointId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateResolution {
+    Ready(Box<ActivationCandidate>),
+    AmbiguousSavedConnections(Vec<SavedConnection>),
+    UnsavedNetwork,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationFailure {
+    DeviceRemoved,
+    DeviceTerminal {
+        state: crate::model::DeviceState,
+        reason: Option<crate::model::DeviceStateReason>,
+    },
+    ActiveConnectionTerminal {
+        state: u32,
+        reason: Option<crate::model::DeviceStateReason>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationEvaluation {
+    Pending,
+    Succeeded,
+    Failed(ActivationFailure),
+}
+
+pub fn evaluate_activation(
+    state: Option<&CurrentWifiState>,
+    target_ssid: &str,
+) -> ActivationEvaluation {
+    let Some(state) = state else {
+        return ActivationEvaluation::Failed(ActivationFailure::DeviceRemoved);
+    };
+    if state.device_state == crate::model::DeviceState::Activated
+        && state.ssid.as_deref() == Some(target_ssid)
+    {
+        return ActivationEvaluation::Succeeded;
+    }
+    if matches!(state.device_state, crate::model::DeviceState::Failed) {
+        return ActivationEvaluation::Failed(ActivationFailure::DeviceTerminal {
+            state: state.device_state,
+            reason: state.device_state_reason,
+        });
+    }
+    if state.active_connection_state == Some(4) {
+        return ActivationEvaluation::Failed(ActivationFailure::ActiveConnectionTerminal {
+            state: 4,
+            reason: state.active_connection_state_reason,
+        });
+    }
+    ActivationEvaluation::Pending
+}
+
+#[cfg(test)]
+pub(crate) fn already_active(state: &CurrentWifiState, ssid: &str) -> bool {
+    state.device_state == crate::model::DeviceState::Activated
+        && state.ssid.as_deref() == Some(ssid)
+}
+
+#[cfg(test)]
+pub(crate) fn activation_succeeded(state: &CurrentWifiState, ssid: &str) -> bool {
+    state.device_state == crate::model::DeviceState::Activated
+        && state.ssid.as_deref() == Some(ssid)
+}
+
+#[cfg(test)]
+pub(crate) fn scan_event_matches(event: &NetworkEvent, device: &DeviceId, before: i64) -> bool {
+    matches!(event, NetworkEvent::ScanCompleted { device: event_device, last_scan } if event_device == device && *last_scan > before)
+}
+
 impl Client {
     pub async fn connect() -> Result<Self, Error> {
         let connection = Connection::system()
             .await
             .map_err(|e| Error::Dbus(e.to_string()))?;
+        let rule = MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .sender(SERVICE)
+            .map_err(e)?
+            .build();
+        let stream = MessageStream::for_match_rule(rule, &connection, Some(128))
+            .await
+            .map_err(e)?;
         let mut c = Self {
             connection,
+            stream,
             graph: NetworkGraph::default(),
             pending: Vec::new(),
         };
@@ -76,36 +171,178 @@ impl Client {
     pub fn current_wifi_state(&self, id: &DeviceId) -> Option<CurrentWifiState> {
         self.graph.current(id)
     }
-    pub async fn request_scan(&self, id: &DeviceId) -> Result<(), Error> {
+    pub fn device_by_interface(&self, interface: &str) -> Option<WifiDevice> {
+        self.graph
+            .devices
+            .values()
+            .find(|d| d.interface == interface)
+            .cloned()
+    }
+    pub fn activation_candidates(
+        &self,
+        device: &DeviceId,
+        ssid: &str,
+    ) -> Result<CandidateResolution, Error> {
+        match self.graph.activation_selection(device, ssid)? {
+            CandidateSelection::Ready {
+                profile,
+                access_point,
+            } => Ok(CandidateResolution::Ready(Box::new(ActivationCandidate {
+                profile: *profile,
+                access_point: *access_point,
+            }))),
+            CandidateSelection::Ambiguous(profiles) => {
+                Ok(CandidateResolution::AmbiguousSavedConnections(profiles))
+            }
+            CandidateSelection::UnsavedNetwork => Ok(CandidateResolution::UnsavedNetwork),
+        }
+    }
+    pub fn saved_profile(&self, device: &DeviceId, ssid: &str) -> Result<SavedConnection, Error> {
+        self.graph.saved_profile(device, ssid)
+    }
+    pub fn saved_activation(
+        &self,
+        device: &DeviceId,
+        ssid: &str,
+    ) -> Result<SavedActivation, Error> {
+        let profile = self.graph.saved_profile(device, ssid)?;
+        let specific_ap = self.graph.activation_selection(device, ssid).ok().and_then(
+            |selection| match selection {
+                CandidateSelection::Ready { access_point, .. } => Some(access_point.id.clone()),
+                _ => None,
+            },
+        );
+        Ok(SavedActivation {
+            profile,
+            specific_ap,
+        })
+    }
+    pub async fn activate_saved_wifi(
+        &mut self,
+        device: &DeviceId,
+        profile: &SavedConnectionId,
+        specific_ap: Option<AccessPointId>,
+    ) -> Result<ActiveConnectionId, Error> {
+        let rebound = self.late_bind_device(device).await?;
+        if rebound != *device {
+            return Err(Error::DeviceDisappeared {
+                interface: self.graph.devices[&rebound].interface.clone(),
+                expected: device.clone(),
+                actual: rebound,
+            });
+        }
         let d = self
             .graph
             .devices
-            .get(id)
-            .ok_or_else(|| Error::UnknownDevice(id.clone()))?;
+            .get(device)
+            .ok_or_else(|| Error::UnknownDevice(device.clone()))?;
+        let p = self
+            .graph
+            .saved_connections
+            .get(profile)
+            .ok_or_else(|| Error::UnknownSavedConnection(profile.clone()))?;
+        if p.connection_type != "802-11-wireless" && p.connection_type != "wifi" {
+            return Err(Error::NotWifiProfile(profile.clone()));
+        }
+        if let Some(interface) = &p.interface_name {
+            if interface != &d.interface {
+                return Err(Error::ProfileInterfaceMismatch {
+                    profile: profile.clone(),
+                    interface: interface.clone(),
+                    device: d.interface.clone(),
+                });
+            }
+        }
+        if let Some(access_point) = &specific_ap {
+            let a = self
+                .graph
+                .access_points
+                .get(access_point)
+                .ok_or_else(|| Error::UnknownAccessPoint(access_point.clone()))?;
+            if &a.device != device {
+                return Err(Error::AccessPointDeviceMismatch {
+                    access_point: access_point.clone(),
+                    device: device.clone(),
+                });
+            }
+            if let Some(profile_ssid) = &p.ssid {
+                if !profile_ssid.is_empty() && profile_ssid != &a.ssid {
+                    return Err(Error::ProfileSsidMismatch {
+                        profile: profile.clone(),
+                        profile_ssid: profile_ssid.clone(),
+                        ap_ssid: a.ssid.clone(),
+                    });
+                }
+            }
+        }
+        let n = ManagerProxy::new(&self.connection, SERVICE, ROOT)
+            .await
+            .map_err(e)?;
+        let path = n
+            .activate_connection(
+                profile.as_str().try_into().map_err(e)?,
+                device.as_str().try_into().map_err(e)?,
+                specific_ap.as_ref().map_or_else(
+                    || OwnedObjectPath::try_from("/").map_err(e),
+                    |ap| ap.as_str().try_into().map_err(e),
+                )?,
+            )
+            .await
+            .map_err(e)?;
+        Ok(id(path.to_string()))
+    }
+    pub async fn request_scan(&mut self, id: &DeviceId) -> Result<DeviceId, Error> {
+        let current = self.late_bind_device(id).await?;
         let w = WirelessProxy::builder(&self.connection)
             .destination(SERVICE)
             .map_err(e)?
-            .path(d.id.as_str())
+            .path(current.as_str())
             .map_err(e)?
             .build()
             .await
             .map_err(e)?;
-        w.request_scan(HashMap::new()).await.map_err(e)
+        w.request_scan(HashMap::new()).await.map_err(e)?;
+        Ok(current)
+    }
+    pub async fn late_bind_device(&mut self, device_id: &DeviceId) -> Result<DeviceId, Error> {
+        let old = self
+            .graph
+            .devices
+            .get(device_id)
+            .ok_or_else(|| Error::UnknownDevice(device_id.clone()))?
+            .clone();
+        let n = ManagerProxy::new(&self.connection, SERVICE, ROOT)
+            .await
+            .map_err(e)?;
+        let path = n.get_device_by_ip_iface(&old.interface).await.map_err(e)?;
+        let current = id::<DeviceId>(path.to_string());
+        if current != *device_id {
+            self.graph.remove_device(device_id);
+            self.materialize_device(current.as_str()).await?;
+        }
+        Ok(current)
+    }
+    pub async fn wait_for_scan(
+        &mut self,
+        id: &DeviceId,
+        last_scan_before: Option<i64>,
+    ) -> Result<i64, Error> {
+        let before = last_scan_before.unwrap_or(i64::MIN);
+        loop {
+            if let NetworkEvent::ScanCompleted { device, last_scan } = self.next_event().await? {
+                if &device == id && last_scan > before {
+                    return Ok(last_scan);
+                }
+            }
+        }
     }
     pub async fn next_event(&mut self) -> Result<NetworkEvent, Error> {
         if let Some(e) = self.pending.pop() {
             return Ok(e);
         }
-        let rule = MatchRule::builder()
-            .msg_type(zbus::message::Type::Signal)
-            .sender(SERVICE)
-            .map_err(e)?
-            .build();
-        let mut stream = MessageStream::for_match_rule(rule, &self.connection, Some(128))
-            .await
-            .map_err(e)?;
         loop {
-            let msg = stream
+            let msg = self
+                .stream
                 .try_next()
                 .await
                 .map_err(e)?
@@ -168,6 +405,7 @@ impl Client {
                 active_connection: obj(d.active_connection().await.map_err(e)?).map(id),
                 active_ap: None,
                 last_scan: None,
+                state_reason: Some(reason_from_tuple(d.state_reason().await.map_err(e)?)),
             },
         );
         let w = WirelessProxy::builder(&self.connection)
@@ -244,6 +482,9 @@ impl Client {
                 .into_iter()
                 .map(|x| id::<DeviceId>(x.to_string()))
                 .collect(),
+            state_reason: Some(reason_from_tuple(
+                a.state_reason().await.unwrap_or_default(),
+            )),
         })
     }
     async fn read_setting(&self, p: &str) -> Result<SavedConnection, Error> {
@@ -311,6 +552,24 @@ impl Client {
             let id = id::<DeviceId>(x.to_string());
             self.graph.remove_device(&id);
             return Ok(Some(NetworkEvent::DeviceRemoved(id)));
+        }
+        if i == "org.freedesktop.NetworkManager.Device" && member == "StateChanged" {
+            let (new_state, old_state, reason): (u32, u32, u32) =
+                msg.body().deserialize().map_err(e)?;
+            let did = id::<DeviceId>(p);
+            if let Some(device) = self.graph.devices.get_mut(&did) {
+                device.state = new_state.into();
+                device.state_reason = Some(crate::model::DeviceStateReason {
+                    state: new_state,
+                    reason,
+                });
+            }
+            return Ok(Some(NetworkEvent::DeviceStateChanged {
+                device: did,
+                new_state,
+                old_state,
+                reason,
+            }));
         }
         if i.ends_with("Device.Wireless")
             && (member == "AccessPointAdded" || member == "AccessPointRemoved")
@@ -406,6 +665,9 @@ impl Client {
                     active = v.get("ActiveConnection").and_then(wire_path);
                     d.active_connection = active.clone().map(id);
                 }
+                if let Some(x) = v.get("StateReason").and_then(state_reason) {
+                    d.state_reason = Some(x);
+                }
             }
             if let Some(x) = active {
                 let a = id::<ActiveConnectionId>(x);
@@ -494,6 +756,9 @@ impl Client {
                 if let Some(x) = v.get("State").and_then(u32v) {
                     a.state = x;
                 }
+                if let Some(x) = v.get("StateReason").and_then(state_reason) {
+                    a.state_reason = Some(x);
+                }
                 if let Some(x) = v.get("Connection").and_then(wire_path) {
                     a.profile = Some(id(x));
                 }
@@ -530,4 +795,12 @@ fn u32v(v: &OwnedValue) -> Option<u32> {
 }
 fn u8v(v: &OwnedValue) -> Option<u8> {
     u8::try_from(v.clone()).ok()
+}
+fn state_reason(v: &OwnedValue) -> Option<crate::model::DeviceStateReason> {
+    let (state, reason) = <(u32, u32)>::try_from(v.clone()).ok()?;
+    Some(crate::model::DeviceStateReason { state, reason })
+}
+
+fn reason_from_tuple((state, reason): (u32, u32)) -> crate::model::DeviceStateReason {
+    crate::model::DeviceStateReason { state, reason }
 }

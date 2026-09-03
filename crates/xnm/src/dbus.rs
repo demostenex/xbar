@@ -8,6 +8,13 @@ pub(crate) const SETTINGS: &str = "/org/freedesktop/NetworkManager/Settings";
 #[zbus::proxy(interface = "org.freedesktop.NetworkManager")]
 pub(crate) trait Manager {
     fn get_all_devices(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+    fn activate_connection(
+        &self,
+        connection: OwnedObjectPath,
+        device: OwnedObjectPath,
+        specific_object: OwnedObjectPath,
+    ) -> zbus::Result<OwnedObjectPath>;
+    fn get_device_by_ip_iface(&self, interface: &str) -> zbus::Result<OwnedObjectPath>;
     #[zbus(property)]
     fn active_connections(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
 }
@@ -23,6 +30,8 @@ pub(crate) trait Device {
     fn state(&self) -> zbus::Result<u32>;
     #[zbus(property)]
     fn active_connection(&self) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(property)]
+    fn state_reason(&self) -> zbus::Result<(u32, u32)>;
 }
 #[zbus::proxy(interface = "org.freedesktop.NetworkManager.Device.Wireless")]
 pub(crate) trait Wireless {
@@ -66,6 +75,8 @@ pub(crate) trait Active {
     fn uuid(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn state(&self) -> zbus::Result<u32>;
+    #[zbus(property)]
+    fn state_reason(&self) -> zbus::Result<(u32, u32)>;
     #[zbus(property)]
     fn connection(&self) -> zbus::Result<OwnedObjectPath>;
     #[zbus(property)]
