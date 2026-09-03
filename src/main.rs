@@ -170,6 +170,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                         eprintln!("xbar trace: xnm_shadow_event={event:?}");
                     }
                     xnm::apply_shadow_event(&mut xnm_shadow, event);
+                    let status = xnm_shadow.status();
+                    events.push(Event::NetworkStatusChanged(core::NetworkStatus {
+                        available: status.available,
+                        connected: status.connected,
+                        interface: status.interface,
+                        ssid: status.ssid,
+                        frequency: status.frequency,
+                        strength: status.strength,
+                    }));
                 }
                 if trace {
                     for device in &xnm_shadow.devices {
@@ -760,7 +769,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             if matches!(
                 translated,
-                Event::NetworkSnapshotReceived(_)
+                Event::NetworkStatusChanged(_)
+                    | Event::NetworkSnapshotReceived(_)
                     | Event::NetworkPopupSnapshotReceived(_)
                     | Event::NetworkActionFinished(_)
             ) && state.network_popup_open
@@ -1060,6 +1070,7 @@ fn render_target_for(
         Event::ClockUpdated(_) => Some(RenderTarget::Dock),
         Event::AudioSnapshotReceived(_)
         | Event::AudioUnavailable
+        | Event::NetworkStatusChanged(_)
         | Event::NetworkSnapshotReceived(_)
         | Event::BluetoothSnapshotReceived(_)
         | Event::BluetoothUnavailable => Some(RenderTarget::DockRight),

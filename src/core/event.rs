@@ -111,6 +111,7 @@ pub enum Event {
     AudioSelectInput(String),
     AudioUnavailable,
     NetworkSnapshotReceived(NetworkState),
+    NetworkStatusChanged(super::NetworkStatus),
     NetworkPopupOpenRequested,
     NetworkPopupSnapshotReceived(NetworkState),
     NetworkPopupSnapshotFailed,

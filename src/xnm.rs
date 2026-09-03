@@ -45,6 +45,37 @@ pub struct XnmShadowState {
     pub available: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct XnmStatus {
+    pub available: bool,
+    pub connected: bool,
+    pub interface: Option<String>,
+    pub ssid: Option<String>,
+    pub frequency: Option<u32>,
+    pub strength: Option<u8>,
+}
+
+impl XnmShadowState {
+    pub fn status(&self) -> XnmStatus {
+        let selected = self
+            .devices
+            .iter()
+            .filter(|device| {
+                device.state.device_state == xnm::DeviceState::Activated
+                    && device.state.ssid.is_some()
+            })
+            .min_by(|a, b| a.state.interface.cmp(&b.state.interface));
+        XnmStatus {
+            available: self.available,
+            connected: selected.is_some(),
+            interface: selected.map(|device| device.state.interface.clone()),
+            ssid: selected.and_then(|device| device.state.ssid.clone()),
+            frequency: selected.and_then(|device| device.state.frequency),
+            strength: selected.and_then(|device| device.state.strength),
+        }
+    }
+}
+
 pub fn apply_shadow_event(shadow: &mut XnmShadowState, event: XnmBridgeEvent) {
     match event {
         XnmBridgeEvent::InitialState(initial) => {
@@ -335,6 +366,21 @@ mod tests {
         apply(&mut shadow, XnmBridgeEvent::BackendFailed("offline".into()));
         assert!(!shadow.available);
         assert_eq!(shadow.devices[0].state.ssid.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn summary_policy_is_deterministic_without_merging_devices() {
+        let wlan0 = state("wlan0", Some("Foo"));
+        let wlan1 = state("wlan1", Some("Bar"));
+        let shadow = XnmShadowState {
+            available: true,
+            devices: vec![wlan1, wlan0],
+            ..Default::default()
+        };
+        let status = shadow.status();
+        assert_eq!(shadow.devices.len(), 2);
+        assert_eq!(status.interface.as_deref(), Some("wlan0"));
+        assert_eq!(status.ssid.as_deref(), Some("Foo"));
     }
 
     fn apply(shadow: &mut XnmShadowState, event: XnmBridgeEvent) {

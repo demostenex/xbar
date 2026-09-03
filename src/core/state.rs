@@ -114,6 +114,16 @@ pub struct NetworkState {
     pub wifi_devices: Vec<WifiDevice>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NetworkStatus {
+    pub available: bool,
+    pub connected: bool,
+    pub interface: Option<String>,
+    pub ssid: Option<String>,
+    pub frequency: Option<u32>,
+    pub strength: Option<u8>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BluetoothDevice {
     pub path: String,
@@ -210,6 +220,8 @@ pub struct State {
     pub clock: Option<ClockState>,
     pub audio: AudioState,
     pub network: NetworkState,
+    pub network_status: NetworkStatus,
+    pub network_status_authoritative: bool,
     pub network_pending: Vec<NetworkPendingAction>,
     pub bluetooth: BluetoothState,
     pub bluetooth_pending: Vec<BluetoothPendingAction>,

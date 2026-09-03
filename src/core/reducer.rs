@@ -669,13 +669,42 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         Event::AudioSelectOutput(_) | Event::AudioSelectInput(_) => false,
         Event::NetworkSnapshotReceived(network) => {
             let visual_before = network_visual_state(&state.network);
-            let visual_after = network_visual_state(&network);
+            let mut network = network;
+            if state.network_status_authoritative {
+                network.available = state.network.available;
+                network.connectivity = state.network.connectivity.clone();
+                network.link_kind = state.network.link_kind.clone();
+                network.interface = state.network.interface.clone();
+                network.display_name = state.network.display_name.clone();
+                network.signal_percent = state.network.signal_percent;
+            }
             if state.network == network {
                 false
             } else {
                 state.network = network;
-                visual_before != visual_after || state.network_popup_open
+                visual_before != network_visual_state(&state.network) || state.network_popup_open
             }
+        }
+        Event::NetworkStatusChanged(status) => {
+            let visual_before = network_visual_state(&state.network);
+            let changed = state.network_status != status;
+            state.network_status = status.clone();
+            state.network_status_authoritative = true;
+            state.network.available = status.available;
+            state.network.connectivity = if !status.available || !status.connected {
+                super::NetworkConnectivity::Disconnected
+            } else {
+                super::NetworkConnectivity::Connected
+            };
+            state.network.link_kind = if status.connected {
+                super::NetworkLinkKind::Wifi
+            } else {
+                super::NetworkLinkKind::Other
+            };
+            state.network.interface = status.interface;
+            state.network.display_name = status.ssid;
+            state.network.signal_percent = status.strength;
+            changed && visual_before != network_visual_state(&state.network)
         }
         Event::NetworkPopupOpenRequested => {
             if state.network_popup_open || state.network_popup_open_pending {
@@ -696,6 +725,15 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 false
             } else {
                 state.network_popup_open_pending = false;
+                let mut network = network;
+                if state.network_status_authoritative {
+                    network.available = state.network.available;
+                    network.connectivity = state.network.connectivity.clone();
+                    network.link_kind = state.network.link_kind.clone();
+                    network.interface = state.network.interface.clone();
+                    network.display_name = state.network.display_name.clone();
+                    network.signal_percent = state.network.signal_percent;
+                }
                 state.network = network;
                 state.network_popup_open = true;
                 true
@@ -2918,5 +2956,95 @@ mod tests {
         ));
         let item = &state.active_menu_model().unwrap().root.children[0].children[0];
         assert!(item.enabled && item.visible);
+    }
+
+    fn xnm_status(
+        connected: bool,
+        interface: Option<&str>,
+        ssid: Option<&str>,
+    ) -> super::super::NetworkStatus {
+        super::super::NetworkStatus {
+            available: true,
+            connected,
+            interface: interface.map(str::to_owned),
+            ssid: ssid.map(str::to_owned),
+            frequency: connected.then_some(5765),
+            strength: connected.then_some(74),
+        }
+    }
+
+    #[test]
+    fn xnm_status_is_authoritative_and_updates_summary() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        assert!(reduce(
+            &mut state,
+            Event::NetworkStatusChanged(xnm_status(true, Some("wlan0"), Some("Foo"))),
+            &mut registry,
+        ));
+        assert!(state.network_status_authoritative);
+        assert_eq!(state.network.display_name.as_deref(), Some("Foo"));
+        assert_eq!(state.network.interface.as_deref(), Some("wlan0"));
+        assert_eq!(state.network.signal_percent, Some(74));
+    }
+
+    #[test]
+    fn identical_xnm_status_has_zero_delta() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let status = xnm_status(true, Some("wlan0"), Some("Foo"));
+        assert!(reduce(
+            &mut state,
+            Event::NetworkStatusChanged(status.clone()),
+            &mut registry
+        ));
+        assert!(!reduce(
+            &mut state,
+            Event::NetworkStatusChanged(status),
+            &mut registry
+        ));
+    }
+
+    #[test]
+    fn legacy_popup_snapshot_cannot_overwrite_xnm_status() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        assert!(reduce(
+            &mut state,
+            Event::NetworkStatusChanged(xnm_status(true, Some("wlan0"), Some("Foo"))),
+            &mut registry,
+        ));
+        assert!(!reduce(
+            &mut state,
+            Event::NetworkSnapshotReceived(super::super::NetworkState {
+                available: false,
+                display_name: Some("legacy".into()),
+                ..Default::default()
+            }),
+            &mut registry,
+        ));
+        assert_eq!(state.network.display_name.as_deref(), Some("Foo"));
+        assert!(state.network.available);
+    }
+
+    #[test]
+    fn xnm_unavailable_is_explicit_disconnected_status() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        reduce(
+            &mut state,
+            Event::NetworkStatusChanged(xnm_status(true, Some("wlan0"), Some("Foo"))),
+            &mut registry,
+        );
+        assert!(reduce(
+            &mut state,
+            Event::NetworkStatusChanged(super::super::NetworkStatus::default()),
+            &mut registry,
+        ));
+        assert!(!state.network.available);
+        assert_eq!(
+            state.network.connectivity,
+            super::super::NetworkConnectivity::Disconnected
+        );
     }
 }
