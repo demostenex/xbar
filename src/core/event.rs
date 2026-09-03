@@ -123,6 +123,8 @@ pub enum Event {
     NetworkPopupToggled,
     NetworkSetWireless(bool),
     NetworkActionFinished(NetworkPendingAction),
+    #[allow(dead_code)]
+    ActiveAiUsageChanged(Vec<super::ActiveAgentUsage>),
     BluetoothSnapshotReceived(super::BluetoothState),
     BluetoothUnavailable,
     BluetoothPopupToggled,

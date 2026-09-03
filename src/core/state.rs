@@ -133,6 +133,131 @@ pub struct NetworkStatus {
     pub strength: Option<u8>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PluginId(pub String);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PluginStatus {
+    Ready,
+    Stale,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginSummary {
+    pub id: PluginId,
+    pub display_name: String,
+    pub text: String,
+    pub status: PluginStatus,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PluginZoneState {
+    pub plugins: Vec<PluginSummary>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
+pub enum AccountIdentity {
+    Default,
+    Named(String),
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum UsageStatus {
+    Fresh,
+    Stale,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+pub enum UsageValue {
+    Percentage {
+        remaining_pct: Option<u16>,
+        used_pct: Option<u16>,
+    },
+    Amount {
+        value: String,
+        unit: Option<String>,
+    },
+    Count {
+        value: u64,
+        unit: Option<String>,
+    },
+    Text {
+        value: String,
+        unit: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageMeter {
+    pub id: String,
+    pub label: String,
+    pub remaining_pct: Option<u16>,
+    pub used_pct: Option<u16>,
+    pub value: Option<UsageValue>,
+    pub reset_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UsageSummary {
+    pub label: String,
+    pub remaining_pct: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveAgentUsage {
+    pub agent_id: String,
+    pub provider_id: String,
+    pub account_id: AccountIdentity,
+    pub display_name: String,
+    pub active_instances: u32,
+    pub meters: Vec<UsageMeter>,
+    pub summary: UsageSummary,
+    pub status: UsageStatus,
+    pub fetched_at: Option<u64>,
+}
+
+impl ActiveAgentUsage {
+    pub fn plugin_summary(&self) -> PluginSummary {
+        let account = match &self.account_id {
+            AccountIdentity::Default => "default".to_owned(),
+            AccountIdentity::Named(value) => format!("named:{value}"),
+            AccountIdentity::Unknown => "unknown".to_owned(),
+        };
+        let text = match self.status {
+            UsageStatus::Fresh | UsageStatus::Stale => self
+                .summary
+                .remaining_pct
+                .map(|percent| format!("{} {}%", self.display_name, percent))
+                .unwrap_or_else(|| format!("{} ?", self.display_name)),
+            UsageStatus::Unavailable | UsageStatus::Unknown => {
+                format!("{} ?", self.display_name)
+            }
+        };
+        PluginSummary {
+            id: PluginId(format!(
+                "ai-usage:{}:{}:{account}",
+                self.provider_id, self.agent_id
+            )),
+            display_name: self.display_name.clone(),
+            text,
+            status: match self.status {
+                UsageStatus::Fresh => PluginStatus::Ready,
+                UsageStatus::Stale => PluginStatus::Stale,
+                UsageStatus::Unavailable => PluginStatus::Unavailable,
+                UsageStatus::Unknown => PluginStatus::Unknown,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BluetoothDevice {
     pub path: String,
@@ -238,6 +363,8 @@ pub struct State {
     pub bluetooth_popup_open: bool,
     pub network_popup_open: bool,
     pub network_popup_open_pending: bool,
+    pub ai_usage: Vec<ActiveAgentUsage>,
+    pub plugin_zone: PluginZoneState,
     pub audio_popup_open: bool,
     pub notifications: Vec<Notification>,
     pub audio_dragging: bool,

@@ -311,6 +311,32 @@ pub fn allocate_tray(future: MenuRect, count: usize) -> Vec<MenuRect> {
     result.reverse();
     result
 }
+
+pub fn allocate_plugins(
+    left: i16,
+    right: i16,
+    labels: &[String],
+    measurer: &impl TextMeasurer,
+) -> Vec<MenuRect> {
+    let mut cursor = right as i32;
+    let mut rects = Vec::with_capacity(labels.len());
+    for label in labels.iter().rev() {
+        let width = (measurer.measure_width(label) as i32 + 12).max(20);
+        let x = cursor - width;
+        if x < left as i32 {
+            break;
+        }
+        rects.push(MenuRect {
+            x: x as i16,
+            y: 0,
+            width: width as u16,
+            height: 26,
+        });
+        cursor = x - crate::ui::style::STATUS_ITEM_GAP as i32;
+    }
+    rects.reverse();
+    rects
+}
 #[cfg(test)]
 pub fn allocate(output: &OutputState, workspaces: &[WorkspaceState]) -> Vec<WorkspaceRect> {
     if workspaces.is_empty() {

@@ -1162,7 +1162,7 @@ impl X11Platform {
                         .iter()
                         .any(|candidate| candidate.id == output.id && candidate.name == *name)
                 });
-            let context = view::context_view_with_app_name_and_audio_and_bluetooth(
+            let context = view::context_view_with_app_name_and_audio_and_bluetooth_and_plugins(
                 output,
                 &workspace_values,
                 if active_output {
@@ -1183,6 +1183,7 @@ impl X11Platform {
                 Some(&state.audio),
                 Some(&state.network),
                 Some(&state.bluetooth),
+                &state.plugin_zone.plugins,
                 &self.text,
             );
             self.bar_hits.push((
@@ -1412,6 +1413,18 @@ impl X11Platform {
                         )?;
                     }
                 }
+            }
+            for plugin in &context.plugins {
+                if context_only && !right_only {
+                    continue;
+                }
+                let x = plugin.rect.x.saturating_sub(output.x) as i32 + 6;
+                self.text.draw_utf8(
+                    &plugin.text,
+                    x,
+                    self.text.baseline(BAR_HEIGHT) as i32,
+                    BAR_STYLE.foreground,
+                )?;
             }
             if let Some(datetime) = &context.datetime {
                 if context_only {

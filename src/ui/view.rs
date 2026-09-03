@@ -23,7 +23,15 @@ pub struct ContextView {
     pub network: Option<NetworkVisual>,
     pub bluetooth: Option<BluetoothVisual>,
     pub tray: Vec<TrayVisualItem>,
+    pub plugins: Vec<PluginVisualItem>,
     pub datetime: Option<DateTimeVisual>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginVisualItem {
+    pub id: crate::core::PluginId,
+    pub text: String,
+    pub rect: MenuRect,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -171,6 +179,35 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth<M: TextMeasurer>(
     bluetooth: Option<&crate::core::BluetoothState>,
     measurer: &M,
 ) -> ContextView {
+    context_view_with_app_name_and_audio_and_bluetooth_and_plugins(
+        output,
+        workspaces,
+        model,
+        clock,
+        tray_items,
+        app_name,
+        audio,
+        network,
+        bluetooth,
+        &[],
+        measurer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn context_view_with_app_name_and_audio_and_bluetooth_and_plugins<M: TextMeasurer>(
+    output: &crate::core::OutputState,
+    workspaces: &[crate::core::WorkspaceState],
+    model: Option<&MenuModel>,
+    clock: Option<&ClockState>,
+    tray_items: &[StatusNotifierItem],
+    app_name: Option<&str>,
+    audio: Option<&crate::core::AudioState>,
+    network: Option<&crate::core::NetworkState>,
+    bluetooth: Option<&crate::core::BluetoothState>,
+    plugins: &[crate::core::PluginSummary],
+    measurer: &M,
+) -> ContextView {
     let focused_workspace = workspaces
         .iter()
         .filter(|workspace| workspace.focused)
@@ -282,7 +319,32 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth<M: TextMeasurer>(
         height: future.height,
     };
     let tray_rects = allocate_tray(tray_future, tray_items.len());
-    future.width = tray_left.saturating_sub(future.x) as u16;
+    let plugin_labels = plugins
+        .iter()
+        .map(|plugin| plugin.text.clone())
+        .collect::<Vec<_>>();
+    let plugin_right = tray_rects.first().map(|rect| rect.x).unwrap_or(tray_left);
+    let plugin_rects =
+        crate::ui::layout::allocate_plugins(future.x, plugin_right, &plugin_labels, measurer);
+    let plugin_left = plugin_rects
+        .first()
+        .map(|rect| rect.x)
+        .unwrap_or(plugin_right);
+    future.width = plugin_left.saturating_sub(future.x) as u16;
+    let plugin_start = plugins.len().saturating_sub(plugin_rects.len());
+    let plugins = plugins
+        .iter()
+        .skip(plugin_start)
+        .zip(plugin_rects)
+        .map(|(plugin, mut rect)| {
+            rect.y = future.y;
+            PluginVisualItem {
+                id: plugin.id.clone(),
+                text: plugin.text.clone(),
+                rect,
+            }
+        })
+        .collect();
     let audio = audio.filter(|audio| audio.available).and_then(|audio| {
         (audio_width > 0).then(|| AudioVisual {
             text: audio_glyph(audio).to_owned(),
@@ -333,6 +395,7 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth<M: TextMeasurer>(
         audio,
         network,
         bluetooth,
+        plugins,
         tray: tray_items
             .into_iter()
             .zip(tray_rects)
@@ -918,5 +981,100 @@ mod tests {
         assert_eq!(compact.tray.len(), 2);
         assert_eq!(compact.tray[0].endpoint.object_path, "/a");
         assert_eq!(compact.tray[1].endpoint.object_path, "/c");
+    }
+
+    #[test]
+    fn plugin_zone_is_between_flex_and_tray_and_is_zero_width_when_empty() {
+        let empty = context_view(&output(640), &workspace(), None, None, &[]);
+        assert!(empty.plugins.is_empty());
+
+        let audio = crate::core::AudioState {
+            available: true,
+            ..Default::default()
+        };
+        let network = crate::core::NetworkState {
+            available: true,
+            connectivity: NetworkConnectivity::Connected,
+            link_kind: NetworkLinkKind::Wifi,
+            signal_percent: Some(72),
+            ..Default::default()
+        };
+        let bluetooth = crate::core::BluetoothState {
+            available: true,
+            powered: true,
+            ..Default::default()
+        };
+        let mut baseline_tray = tray_item(StatusNotifierStatus::Active);
+        baseline_tray.endpoint.object_path = "/baseline".into();
+        let baseline = context_view_with_app_name_and_audio_and_bluetooth(
+            &output(640),
+            &workspace(),
+            None,
+            Some(&ClockState {
+                hour: 12,
+                minute: 34,
+                day: 1,
+                month: 9,
+            }),
+            &[baseline_tray.clone()],
+            Some("app"),
+            Some(&audio),
+            Some(&network),
+            Some(&bluetooth),
+            &BAR_STYLE,
+        );
+        let empty_plugin_path = context_view_with_app_name_and_audio_and_bluetooth_and_plugins(
+            &output(640),
+            &workspace(),
+            None,
+            Some(&ClockState {
+                hour: 12,
+                minute: 34,
+                day: 1,
+                month: 9,
+            }),
+            &[baseline_tray.clone()],
+            Some("app"),
+            Some(&audio),
+            Some(&network),
+            Some(&bluetooth),
+            &[],
+            &BAR_STYLE,
+        );
+        assert_eq!(baseline.future, empty_plugin_path.future);
+        assert_eq!(baseline.tray, empty_plugin_path.tray);
+        assert_eq!(baseline.network, empty_plugin_path.network);
+        assert_eq!(baseline.bluetooth, empty_plugin_path.bluetooth);
+        assert_eq!(baseline.audio, empty_plugin_path.audio);
+        assert_eq!(baseline.datetime, empty_plugin_path.datetime);
+
+        let plugin = crate::core::PluginSummary {
+            id: crate::core::PluginId("test:plugin:default".into()),
+            display_name: "Test".into(),
+            text: "Test 72%".into(),
+            status: crate::core::PluginStatus::Ready,
+        };
+        let mut tray = tray_item(StatusNotifierStatus::Active);
+        tray.endpoint.object_path = "/tray".into();
+        let view = context_view_with_app_name_and_audio_and_bluetooth_and_plugins(
+            &output(640),
+            &workspace(),
+            None,
+            None,
+            &[tray],
+            None,
+            None,
+            None,
+            None,
+            &[plugin],
+            &BAR_STYLE,
+        );
+        assert_eq!(view.plugins.len(), 1);
+        assert_eq!(view.tray.len(), 1);
+        assert!(view.plugins[0].rect.x + view.plugins[0].rect.width as i16 <= view.tray[0].rect.x);
+        assert_eq!(
+            view.future.x + view.future.width as i16,
+            view.plugins[0].rect.x
+        );
     }
 }

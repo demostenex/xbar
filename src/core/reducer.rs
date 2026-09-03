@@ -20,6 +20,26 @@ fn begin_bluetooth_action(state: &mut State, action: super::BluetoothPendingActi
     }
 }
 
+// ActiveAiUsageChanged is expected to contain collector-canonical semantic identities.
+fn canonicalize_ai_usage_order(
+    mut usage: Vec<super::ActiveAgentUsage>,
+) -> Vec<super::ActiveAgentUsage> {
+    for agent in &mut usage {
+        agent.meters.sort_by(|left, right| left.id.cmp(&right.id));
+    }
+    usage.sort_by(|left, right| {
+        left.provider_id
+            .cmp(&right.provider_id)
+            .then_with(|| left.agent_id.cmp(&right.agent_id))
+            .then_with(|| left.account_id.cmp(&right.account_id))
+    });
+    usage
+}
+
+fn plugin_visual_key(plugin: &super::PluginSummary) -> (&super::PluginId, &str) {
+    (&plugin.id, &plugin.text)
+}
+
 fn normalize_interaction(state: &mut State) {
     let Some(model) = state.active_menu_model().cloned() else {
         state.menu_interaction = Default::default();
@@ -800,6 +820,22 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             let before = state.network_pending.len();
             state.network_pending.retain(|pending| pending != &action);
             before != state.network_pending.len()
+        }
+        Event::ActiveAiUsageChanged(usage) => {
+            let usage = canonicalize_ai_usage_order(usage);
+            let plugins = usage
+                .iter()
+                .map(super::ActiveAgentUsage::plugin_summary)
+                .collect::<Vec<_>>();
+            let visual_changed = state
+                .plugin_zone
+                .plugins
+                .iter()
+                .map(plugin_visual_key)
+                .ne(plugins.iter().map(plugin_visual_key));
+            state.ai_usage = usage;
+            state.plugin_zone.plugins = plugins;
+            visual_changed
         }
         Event::BluetoothSnapshotReceived(bluetooth) => {
             let before = bluetooth_visual_state(&state.bluetooth);
@@ -3137,5 +3173,371 @@ mod tests {
             state.network.connectivity,
             super::super::NetworkConnectivity::Disconnected
         );
+    }
+
+    fn ai_usage(
+        provider: &str,
+        agent: &str,
+        account: super::super::AccountIdentity,
+        remaining: Option<u16>,
+        status: super::super::UsageStatus,
+    ) -> super::super::ActiveAgentUsage {
+        super::super::ActiveAgentUsage {
+            agent_id: agent.into(),
+            provider_id: provider.into(),
+            account_id: account,
+            display_name: agent.into(),
+            active_instances: 1,
+            meters: vec![super::super::UsageMeter {
+                id: "primary".into(),
+                label: "primary".into(),
+                remaining_pct: remaining,
+                used_pct: remaining.map(|value| 100 - value),
+                value: Some(super::super::UsageValue::Percentage {
+                    remaining_pct: remaining,
+                    used_pct: remaining.map(|value| 100 - value),
+                }),
+                reset_at: None,
+            }],
+            summary: super::super::UsageSummary {
+                label: "primary".into(),
+                remaining_pct: remaining,
+            },
+            status,
+            fetched_at: None,
+        }
+    }
+
+    #[test]
+    fn ai_usage_is_canonicalized_before_dirtying() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let mut usage = vec![
+            ai_usage(
+                "anthropic",
+                "claude",
+                super::super::AccountIdentity::Unknown,
+                Some(41),
+                super::super::UsageStatus::Fresh,
+            ),
+            ai_usage(
+                "openai",
+                "codex",
+                super::super::AccountIdentity::Default,
+                Some(72),
+                super::super::UsageStatus::Unavailable,
+            ),
+        ];
+        usage[1].active_instances = 2;
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(usage.clone()),
+            &mut registry,
+        ));
+        assert_eq!(state.ai_usage.len(), 2);
+        assert_eq!(state.ai_usage[0].agent_id, "claude");
+        assert_eq!(state.plugin_zone.plugins[0].text, "claude 41%");
+        assert_eq!(state.plugin_zone.plugins[1].text, "codex ?");
+        assert_eq!(
+            state.plugin_zone.plugins[1].status,
+            super::super::PluginStatus::Unavailable
+        );
+        assert!(!reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(usage.clone()),
+            &mut registry,
+        ));
+        usage[1].status = super::super::UsageStatus::Fresh;
+        usage[1].summary.remaining_pct = Some(71);
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(usage),
+            &mut registry,
+        ));
+    }
+
+    #[test]
+    fn ai_usage_unknown_and_non_percentage_values_are_not_invented() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let mut unknown = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Named("work".into()),
+            None,
+            super::super::UsageStatus::Unknown,
+        );
+        unknown.meters.extend([
+            super::super::UsageMeter {
+                id: "balance".into(),
+                label: "balance".into(),
+                remaining_pct: None,
+                used_pct: None,
+                value: Some(super::super::UsageValue::Amount {
+                    value: "12.00".into(),
+                    unit: Some("USD".into()),
+                }),
+                reset_at: None,
+            },
+            super::super::UsageMeter {
+                id: "requests".into(),
+                label: "requests".into(),
+                remaining_pct: None,
+                used_pct: None,
+                value: Some(super::super::UsageValue::Count {
+                    value: 3,
+                    unit: Some("requests".into()),
+                }),
+                reset_at: None,
+            },
+            super::super::UsageMeter {
+                id: "note".into(),
+                label: "note".into(),
+                remaining_pct: None,
+                used_pct: None,
+                value: Some(super::super::UsageValue::Text {
+                    value: "unknown".into(),
+                    unit: None,
+                }),
+                reset_at: None,
+            },
+        ]);
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![unknown]),
+            &mut registry,
+        ));
+        assert_eq!(state.plugin_zone.plugins[0].text, "codex ?");
+        assert_eq!(state.ai_usage[0].meters[0].reset_at, None);
+        assert!(matches!(
+            state.ai_usage[0]
+                .meters
+                .iter()
+                .find(|meter| meter.id == "balance")
+                .and_then(|meter| meter.value.as_ref()),
+            Some(super::super::UsageValue::Amount { .. })
+        ));
+        assert!(matches!(
+            state.ai_usage[0]
+                .meters
+                .iter()
+                .find(|meter| meter.id == "requests")
+                .and_then(|meter| meter.value.as_ref()),
+            Some(super::super::UsageValue::Count { .. })
+        ));
+        assert!(matches!(
+            state.ai_usage[0]
+                .meters
+                .iter()
+                .find(|meter| meter.id == "note")
+                .and_then(|meter| meter.value.as_ref()),
+            Some(super::super::UsageValue::Text { .. })
+        ));
+    }
+
+    #[test]
+    fn ai_usage_supports_stale_status_without_removing_agent() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![ai_usage(
+                "openai",
+                "codex",
+                super::super::AccountIdentity::Default,
+                None,
+                super::super::UsageStatus::Stale,
+            )]),
+            &mut registry,
+        ));
+        assert_eq!(state.plugin_zone.plugins.len(), 1);
+        assert_eq!(
+            state.plugin_zone.plugins[0].status,
+            super::super::PluginStatus::Stale
+        );
+    }
+
+    #[test]
+    fn one_canonical_ai_agent_creates_one_namespaced_plugin() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let mut agent = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Default,
+            Some(72),
+            super::super::UsageStatus::Fresh,
+        );
+        agent.active_instances = 2;
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![agent]),
+            &mut registry,
+        ));
+        assert_eq!(state.plugin_zone.plugins.len(), 1);
+        assert_eq!(state.ai_usage[0].active_instances, 2);
+        assert_eq!(
+            state.plugin_zone.plugins[0].id.0,
+            "ai-usage:openai:codex:default"
+        );
+        assert_eq!(state.plugin_zone.plugins[0].text, "codex 72%");
+    }
+
+    #[test]
+    fn empty_ai_usage_clears_state_and_plugin_zone() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![ai_usage(
+                "openai",
+                "codex",
+                super::super::AccountIdentity::Default,
+                Some(72),
+                super::super::UsageStatus::Fresh,
+            )]),
+            &mut registry,
+        );
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(Vec::new()),
+            &mut registry,
+        ));
+        assert!(state.ai_usage.is_empty());
+        assert!(state.plugin_zone.plugins.is_empty());
+    }
+
+    #[test]
+    fn non_visual_ai_state_changes_update_state_without_dirtying() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let mut initial = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Default,
+            Some(72),
+            super::super::UsageStatus::Fresh,
+        );
+        initial.fetched_at = Some(100);
+        initial.active_instances = 1;
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![initial.clone()]),
+            &mut registry,
+        ));
+
+        let mut updated = initial;
+        updated.fetched_at = Some(200);
+        updated.active_instances = 2;
+        updated.status = super::super::UsageStatus::Stale;
+        assert!(!reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![updated]),
+            &mut registry,
+        ));
+        assert_eq!(state.ai_usage[0].fetched_at, Some(200));
+        assert_eq!(state.ai_usage[0].active_instances, 2);
+        assert_eq!(state.ai_usage[0].status, super::super::UsageStatus::Stale);
+        assert_eq!(state.plugin_zone.plugins[0].text, "codex 72%");
+    }
+
+    #[test]
+    fn unavailable_and_unknown_never_present_accidental_percentages() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        for status in [
+            super::super::UsageStatus::Unavailable,
+            super::super::UsageStatus::Unknown,
+        ] {
+            let unavailable = matches!(&status, super::super::UsageStatus::Unavailable);
+            let dirty = reduce(
+                &mut state,
+                Event::ActiveAiUsageChanged(vec![ai_usage(
+                    "openai",
+                    "codex",
+                    super::super::AccountIdentity::Default,
+                    Some(72),
+                    status,
+                )]),
+                &mut registry,
+            );
+            assert_eq!(state.plugin_zone.plugins[0].text, "codex ?");
+            if unavailable {
+                assert!(dirty);
+            } else {
+                assert!(!dirty);
+            }
+        }
+    }
+
+    #[test]
+    fn account_identity_change_is_dirty_even_when_text_is_equal() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let first = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Default,
+            Some(72),
+            super::super::UsageStatus::Fresh,
+        );
+        reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![first]),
+            &mut registry,
+        );
+        let second = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Named("work".into()),
+            Some(72),
+            super::super::UsageStatus::Fresh,
+        );
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![second]),
+            &mut registry,
+        ));
+        assert_eq!(state.plugin_zone.plugins[0].text, "codex 72%");
+        assert_eq!(
+            state.plugin_zone.plugins[0].id.0,
+            "ai-usage:openai:codex:named:work"
+        );
+    }
+
+    #[test]
+    fn canonical_order_is_independent_of_unique_input_order() {
+        let records = vec![
+            ai_usage(
+                "openai",
+                "codex",
+                super::super::AccountIdentity::Named("work".into()),
+                Some(72),
+                super::super::UsageStatus::Fresh,
+            ),
+            ai_usage(
+                "anthropic",
+                "claude",
+                super::super::AccountIdentity::Default,
+                Some(41),
+                super::super::UsageStatus::Fresh,
+            ),
+        ];
+        let mut left = State::default();
+        let mut right = State::default();
+        let mut left_registry = MenuRegistry::default();
+        let mut right_registry = MenuRegistry::default();
+        reduce(
+            &mut left,
+            Event::ActiveAiUsageChanged(records.clone()),
+            &mut left_registry,
+        );
+        reduce(
+            &mut right,
+            Event::ActiveAiUsageChanged(records.into_iter().rev().collect()),
+            &mut right_registry,
+        );
+        assert_eq!(left.ai_usage, right.ai_usage);
+        assert_eq!(left.plugin_zone.plugins, right.plugin_zone.plugins);
     }
 }
