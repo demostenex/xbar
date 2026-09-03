@@ -1,0 +1,10 @@
+[package]
+name = "xnm"
+version = "0.1.0"
+edition = "2021"
+description = "Event-driven NetworkManager observation model"
+license = "MIT"
+
+[dependencies]
+futures-util = "0.3"
+zbus = { version = "5", default-features = false, features = ["async-io"] }
