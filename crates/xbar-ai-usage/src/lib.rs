@@ -4,6 +4,13 @@ use std::time::Duration;
 use ai_usagebar::cache::{Cache, DEFAULT_TTL};
 use ai_usagebar::usage::{AnthropicSnapshot, ExtraUsage, OpenAiSnapshot, UsageWindow};
 
+pub mod discovery;
+
+pub use discovery::{
+    ActiveAgentSet, AgentInstance, AgentKind, Discovery, DiscoveryError, DiscoveryEvent,
+    ProcessIdentity, ProcessRecord, ProviderKind,
+};
+
 const PROVIDER_OPENAI: &str = "openai";
 const PROVIDER_ANTHROPIC: &str = "anthropic";
 

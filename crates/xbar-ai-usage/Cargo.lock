@@ -3384,6 +3384,7 @@ version = "0.1.0"
 dependencies = [
  "ai-usagebar",
  "chrono",
+ "libc",
  "reqwest",
  "tokio",
 ]
