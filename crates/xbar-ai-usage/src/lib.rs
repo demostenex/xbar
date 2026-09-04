@@ -4,8 +4,10 @@ use std::time::Duration;
 use ai_usagebar::cache::{Cache, DEFAULT_TTL};
 use ai_usagebar::usage::{AnthropicSnapshot, ExtraUsage, OpenAiSnapshot, UsageWindow};
 
+pub mod composition;
 pub mod discovery;
 
+pub use composition::{ActiveAgentUsage, CollectorModel};
 pub use discovery::{
     ActiveAgentSet, AgentInstance, AgentKind, Discovery, DiscoveryError, DiscoveryEvent,
     ProcessIdentity, ProcessRecord, ProviderKind,
