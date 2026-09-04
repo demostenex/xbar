@@ -5,7 +5,10 @@ edition = "2021"
 
 [dependencies]
 ai-usagebar = "=0.20.1"
+xbar-ai-protocol = { path = "../xbar-ai-protocol" }
 chrono = "=0.4.44"
 libc = "0.2"
 reqwest = { version = "=0.12.28", default-features = true }
+sha2 = "0.10"
 tokio = { version = "=1.52.3", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }

@@ -15,12 +15,18 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 
 use crate::discovery::{AccountScopeResolution, CnProcError, DiscoveryEvent};
+use crate::publisher::{Publisher, PublisherError};
+use crate::wire::encode_active_usage;
 use crate::{
     fetch_anthropic, fetch_openai, AccountIdentity, ActiveAgentUsage, CollectorModel, Discovery,
     DiscoveryError, ProviderKind, ProviderUsage,
 };
 
 pub const DEFAULT_USAGE_REFRESH: Duration = Duration::from_secs(300);
+
+fn next_refresh_at(completed_at: Instant, refresh: Duration) -> Instant {
+    completed_at + refresh
+}
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -54,6 +60,8 @@ pub enum RuntimeError {
     Discovery(DiscoveryError),
     Io(io::Error),
     TaskJoin(String),
+    Protocol(xbar_ai_protocol::ProtocolError),
+    Publisher(PublisherError),
 }
 
 impl fmt::Display for RuntimeError {
@@ -63,6 +71,8 @@ impl fmt::Display for RuntimeError {
             Self::Discovery(error) => write!(f, "discovery: {error}"),
             Self::Io(error) => write!(f, "runtime I/O: {error}"),
             Self::TaskJoin(error) => write!(f, "refresh task: {error}"),
+            Self::Protocol(error) => write!(f, "protocol: {error}"),
+            Self::Publisher(error) => write!(f, "publisher: {error}"),
         }
     }
 }
@@ -73,6 +83,21 @@ impl std::error::Error for RuntimeError {}
 struct RefreshKey {
     provider: ProviderKind,
     account: AccountIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefreshDemandReason {
+    InitialScope,
+    PeriodicDeadline,
+}
+
+impl RefreshDemandReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InitialScope => "InitialScope",
+            Self::PeriodicDeadline => "PeriodicDeadline",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -89,7 +114,7 @@ impl RefreshScheduler {
         self.pending.retain(|key| self.relevant.contains(key));
     }
 
-    fn demand(&mut self, key: RefreshKey) -> bool {
+    fn demand(&mut self, key: RefreshKey, reason: RefreshDemandReason) -> bool {
         if self.stopped {
             return false;
         }
@@ -97,7 +122,9 @@ impl RefreshScheduler {
             return false;
         }
         if self.in_flight.contains(&key) {
-            self.pending.insert(key);
+            if reason == RefreshDemandReason::PeriodicDeadline {
+                self.pending.insert(key);
+            }
             false
         } else {
             self.in_flight.insert(key);
@@ -148,6 +175,35 @@ struct RefreshResult {
     usage: ProviderUsage,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublishedState {
+    revision: u64,
+    canonical: Vec<ActiveAgentUsage>,
+    encoded: Vec<u8>,
+}
+
+impl PublishedState {
+    fn new(revision: u64, canonical: Vec<ActiveAgentUsage>) -> Result<Self, RuntimeError> {
+        let encoded = encode_active_usage(revision, &canonical).map_err(RuntimeError::Protocol)?;
+        Ok(Self {
+            revision,
+            canonical,
+            encoded,
+        })
+    }
+}
+
+fn advance_published(
+    previous: &PublishedState,
+    canonical: Vec<ActiveAgentUsage>,
+) -> Result<Option<PublishedState>, RuntimeError> {
+    if canonical == previous.canonical {
+        Ok(None)
+    } else {
+        PublishedState::new(previous.revision + 1, canonical).map(Some)
+    }
+}
+
 pub async fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
     let (discovery, initial_events) = Discovery::start().map_err(RuntimeError::Discovery)?;
     set_nonblocking(discovery.as_raw_fd()).map_err(RuntimeError::Io)?;
@@ -160,6 +216,14 @@ pub async fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
 
     let mut provider_usage = QuotaSnapshot::default();
     let mut canonical = model.active_usage();
+    let mut published = PublishedState::new(1, canonical.clone())?;
+    let mut publisher = Publisher::start(published.encoded.clone())
+        .await
+        .map_err(RuntimeError::Publisher)?;
+    let mut publisher_errors = publisher.take_errors();
+    if config.debug {
+        println!("DBUS_READY name=org.xbar.AiUsage1");
+    }
     emit_state(&config, "STARTUP", &canonical);
 
     let (result_tx, mut result_rx) = mpsc::unbounded_channel();
@@ -167,18 +231,27 @@ pub async fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
     let initial_scopes = refresh_scopes(&canonical);
     scheduler.reconcile_relevance(initial_scopes.iter().cloned());
     for key in initial_scopes {
-        if scheduler.demand(key.clone()) {
-            spawn_refresh(&config, key, result_tx.clone());
+        if scheduler.demand(key.clone(), RefreshDemandReason::InitialScope) {
+            spawn_refresh(
+                &config,
+                key,
+                RefreshDemandReason::InitialScope,
+                result_tx.clone(),
+            );
         }
     }
 
-    let mut next_refresh = Instant::now() + config.usage_refresh;
+    let mut next_refresh = next_refresh_at(Instant::now(), config.usage_refresh);
     let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
 
     loop {
         let wait = tokio::time::sleep_until(tokio::time::Instant::from_std(next_refresh));
         tokio::pin!(wait);
         tokio::select! {
+            publisher_error = publisher_errors.recv() => {
+                let _ = publisher_error;
+                return Err(RuntimeError::Publisher(PublisherError::SignalFailed));
+            }
             signal = &mut shutdown => {
                 signal.map_err(RuntimeError::Io)?;
                 scheduler.shutdown();
@@ -187,25 +260,47 @@ pub async fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
             result = result_rx.recv() => {
                 let Some(result) = result else { return Err(RuntimeError::TaskJoin("refresh channel closed".into())); };
                 provider_usage.update(result.usage);
+                next_refresh = next_refresh_at(Instant::now(), config.usage_refresh);
                 model.replace_provider_usage(provider_usage.records());
                 let updated = model.active_usage();
-                if updated != canonical {
+                if let Some(next) = advance_published(&published, updated.clone())? {
                     canonical = updated;
+                    published = next;
+                    publisher
+                        .update(published.encoded.clone())
+                        .map_err(RuntimeError::Publisher)?;
+                    if config.debug {
+                        println!(
+                            "STATE_PUBLISHED revision={} agents={}",
+                            published.revision,
+                            canonical.len()
+                        );
+                    }
                     emit_state(&config, "STATE_CHANGED", &canonical);
                 }
                 if scheduler.complete(&result.key) {
-                    spawn_refresh(&config, result.key, result_tx.clone());
+                    spawn_refresh(
+                        &config,
+                        result.key,
+                        RefreshDemandReason::PeriodicDeadline,
+                        result_tx.clone(),
+                    );
                 }
             }
             _ = &mut wait => {
                 let relevant = refresh_scopes(&canonical);
                 scheduler.reconcile_relevance(relevant.iter().cloned());
                 for key in relevant {
-                    if scheduler.demand(key.clone()) {
-                        spawn_refresh(&config, key, result_tx.clone());
+                    if scheduler.demand(key.clone(), RefreshDemandReason::PeriodicDeadline) {
+                        spawn_refresh(
+                            &config,
+                            key,
+                            RefreshDemandReason::PeriodicDeadline,
+                            result_tx.clone(),
+                        );
                     }
                 }
-                next_refresh = Instant::now() + config.usage_refresh;
+            next_refresh = next_refresh_at(Instant::now(), config.usage_refresh);
             }
             readiness = discovery.readable_mut() => {
                 let mut guard = readiness.map_err(RuntimeError::Io)?;
@@ -244,14 +339,30 @@ pub async fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
                     model.apply_discovery_event(event);
                     let updated = model.active_usage();
                     let after = refresh_scopes(&updated);
-                    if updated != canonical {
+                    if let Some(next) = advance_published(&published, updated.clone())? {
                         canonical = updated;
+                        published = next;
+                        publisher
+                            .update(published.encoded.clone())
+                            .map_err(RuntimeError::Publisher)?;
+                        if config.debug {
+                            println!(
+                                "STATE_PUBLISHED revision={} agents={}",
+                                published.revision,
+                                canonical.len()
+                            );
+                        }
                         emit_state(&config, "STATE_CHANGED", &canonical);
                     }
                     scheduler.reconcile_relevance(after.iter().cloned());
                     for key in after.into_iter().filter(|key| !before.contains(key)) {
-                        if scheduler.demand(key.clone()) {
-                            spawn_refresh(&config, key, result_tx.clone());
+                        if scheduler.demand(key.clone(), RefreshDemandReason::InitialScope) {
+                            spawn_refresh(
+                                &config,
+                                key,
+                                RefreshDemandReason::InitialScope,
+                                result_tx.clone(),
+                            );
                         }
                     }
                 }
@@ -263,11 +374,13 @@ pub async fn run(config: RuntimeConfig) -> Result<(), RuntimeError> {
 fn spawn_refresh(
     config: &RuntimeConfig,
     key: RefreshKey,
+    reason: RefreshDemandReason,
     tx: mpsc::UnboundedSender<RefreshResult>,
 ) {
     let config = config.clone();
     tokio::spawn(async move {
-        debug_refresh(&config, "REFRESH_STARTED", &key);
+        debug_refresh(&config, "REFRESH_DEMAND", &key, reason);
+        debug_refresh(&config, "REFRESH_STARTED", &key, reason);
         let usage = match key.provider {
             ProviderKind::OpenAi => {
                 fetch_openai(
@@ -286,7 +399,7 @@ fn spawn_refresh(
                 .await
             }
         };
-        debug_refresh(&config, "REFRESH_FINISHED", &key);
+        debug_refresh(&config, "REFRESH_FINISHED", &key, reason);
         let _ = tx.send(RefreshResult { key, usage });
     });
 }
@@ -346,11 +459,17 @@ fn debug_discovery(config: &RuntimeConfig, event: &DiscoveryEvent) {
     }
 }
 
-fn debug_refresh(config: &RuntimeConfig, event: &str, key: &RefreshKey) {
+fn debug_refresh(
+    config: &RuntimeConfig,
+    event: &str,
+    key: &RefreshKey,
+    reason: RefreshDemandReason,
+) {
     if config.debug {
         println!(
-            "{event} provider={} account=default",
-            provider_id(key.provider)
+            "{event} provider={} account=default reason={}",
+            provider_id(key.provider),
+            reason.label()
         );
     }
 }
@@ -447,7 +566,7 @@ mod tests {
     fn no_active_scopes_create_no_refresh_demand() {
         let mut scheduler = RefreshScheduler::default();
         scheduler.reconcile_relevance([]);
-        assert!(!scheduler.demand(key(ProviderKind::OpenAi)));
+        assert!(!scheduler.demand(key(ProviderKind::OpenAi), RefreshDemandReason::InitialScope));
     }
 
     #[test]
@@ -455,7 +574,7 @@ mod tests {
         let mut scheduler = RefreshScheduler::default();
         let openai = key(ProviderKind::OpenAi);
         scheduler.reconcile_relevance([openai.clone()]);
-        assert!(scheduler.demand(openai));
+        assert!(scheduler.demand(openai, RefreshDemandReason::InitialScope));
     }
 
     #[test]
@@ -463,8 +582,9 @@ mod tests {
         let mut scheduler = RefreshScheduler::default();
         let openai = key(ProviderKind::OpenAi);
         scheduler.reconcile_relevance([openai.clone()]);
-        assert!(scheduler.demand(openai.clone()));
-        assert!(!scheduler.demand(openai));
+        assert!(scheduler.demand(openai.clone(), RefreshDemandReason::InitialScope));
+        assert!(!scheduler.demand(openai, RefreshDemandReason::InitialScope));
+        assert!(scheduler.pending.is_empty());
     }
 
     #[test]
@@ -472,10 +592,73 @@ mod tests {
         let mut scheduler = RefreshScheduler::default();
         let openai = key(ProviderKind::OpenAi);
         scheduler.reconcile_relevance([openai.clone()]);
-        assert!(scheduler.demand(openai.clone()));
-        assert!(!scheduler.demand(openai.clone()));
+        assert!(scheduler.demand(openai.clone(), RefreshDemandReason::InitialScope));
+        assert!(!scheduler.demand(openai.clone(), RefreshDemandReason::PeriodicDeadline));
         assert!(scheduler.complete(&openai));
         assert!(!scheduler.complete(&openai));
+    }
+
+    #[test]
+    fn initial_fetch_completion_does_not_schedule_another_refresh() {
+        let mut scheduler = RefreshScheduler::default();
+        let openai = key(ProviderKind::OpenAi);
+        scheduler.reconcile_relevance([openai.clone()]);
+        assert!(scheduler.demand(openai.clone(), RefreshDemandReason::InitialScope));
+        assert!(!scheduler.complete(&openai));
+        assert!(scheduler.in_flight.is_empty());
+        assert!(scheduler.pending.is_empty());
+    }
+
+    #[test]
+    fn publication_revision_change_does_not_schedule_refresh() {
+        let mut scheduler = RefreshScheduler::default();
+        let openai = key(ProviderKind::OpenAi);
+        scheduler.reconcile_relevance([openai.clone()]);
+        assert!(scheduler.demand(openai.clone(), RefreshDemandReason::InitialScope));
+        assert!(!scheduler.complete(&openai));
+        let previous = PublishedState::new(1, Vec::new()).unwrap();
+        let changed = vec![ActiveAgentUsage {
+            agent_id: "codex".into(),
+            provider_id: "openai".into(),
+            account_id: AccountIdentity::Default,
+            display_name: "Codex".into(),
+            active_instances: 1,
+            meters: Vec::new(),
+            summary: UsageSummary {
+                primary_meter_id: None,
+                remaining_pct: None,
+            },
+            status: UsageStatus::Fresh,
+            fetched_at: None,
+            cache_age_secs: None,
+        }];
+        assert!(advance_published(&previous, changed).unwrap().is_some());
+        assert!(scheduler.in_flight.is_empty());
+        assert!(scheduler.pending.is_empty());
+    }
+
+    #[test]
+    fn same_scope_reconciliation_does_not_retrigger_initial_fetch() {
+        let mut scheduler = RefreshScheduler::default();
+        let openai = key(ProviderKind::OpenAi);
+        scheduler.reconcile_relevance([openai.clone()]);
+        assert!(scheduler.demand(openai.clone(), RefreshDemandReason::InitialScope));
+        scheduler.reconcile_relevance([openai]);
+        assert!(scheduler.pending.is_empty());
+    }
+
+    #[test]
+    fn periodic_deadline_allows_one_demand_only_when_due() {
+        let completed = Instant::now();
+        let due = next_refresh_at(completed, DEFAULT_USAGE_REFRESH);
+        assert!(completed < due);
+        let mut scheduler = RefreshScheduler::default();
+        let openai = key(ProviderKind::OpenAi);
+        scheduler.reconcile_relevance([openai.clone()]);
+        assert!(scheduler.demand(openai.clone(), RefreshDemandReason::InitialScope));
+        assert!(!scheduler.complete(&openai));
+        assert!(scheduler.demand(openai.clone(), RefreshDemandReason::PeriodicDeadline));
+        assert!(!scheduler.demand(openai, RefreshDemandReason::PeriodicDeadline));
     }
 
     #[test]
@@ -483,7 +666,7 @@ mod tests {
         let mut scheduler = RefreshScheduler::default();
         let openai = key(ProviderKind::OpenAi);
         scheduler.reconcile_relevance([openai.clone()]);
-        assert!(scheduler.demand(openai.clone()));
+        assert!(scheduler.demand(openai.clone(), RefreshDemandReason::InitialScope));
         scheduler.reconcile_relevance([]);
         assert!(!scheduler.complete(&openai));
     }
@@ -494,7 +677,7 @@ mod tests {
         let openai = key(ProviderKind::OpenAi);
         scheduler.reconcile_relevance([openai.clone()]);
         scheduler.shutdown();
-        assert!(!scheduler.demand(openai));
+        assert!(!scheduler.demand(openai, RefreshDemandReason::InitialScope));
     }
 
     #[test]
@@ -503,8 +686,8 @@ mod tests {
         let openai = key(ProviderKind::OpenAi);
         let anthropic = key(ProviderKind::Anthropic);
         scheduler.reconcile_relevance([openai.clone(), anthropic.clone()]);
-        assert!(scheduler.demand(openai));
-        assert!(scheduler.demand(anthropic));
+        assert!(scheduler.demand(openai, RefreshDemandReason::InitialScope));
+        assert!(scheduler.demand(anthropic, RefreshDemandReason::InitialScope));
     }
 
     #[test]
@@ -592,6 +775,106 @@ mod tests {
         assert!(refresh_scopes(&usage).is_empty());
     }
 
+    #[test]
+    fn initial_published_snapshot_starts_at_revision_one() {
+        let state = PublishedState::new(1, Vec::new()).unwrap();
+        assert_eq!(state.revision, 1);
+        assert!(xbar_ai_protocol::decode_snapshot(&state.encoded)
+            .unwrap()
+            .agents
+            .is_empty());
+    }
+
+    #[test]
+    fn semantic_state_change_increments_revision_once() {
+        let previous = PublishedState::new(1, Vec::new()).unwrap();
+        let next = advance_published(
+            &previous,
+            vec![ActiveAgentUsage {
+                agent_id: "codex".into(),
+                provider_id: "openai".into(),
+                account_id: AccountIdentity::Default,
+                display_name: "Codex".into(),
+                active_instances: 1,
+                meters: Vec::new(),
+                summary: UsageSummary {
+                    primary_meter_id: None,
+                    remaining_pct: None,
+                },
+                status: UsageStatus::Unavailable,
+                fetched_at: None,
+                cache_age_secs: None,
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(next.revision, 2);
+        assert!(advance_published(&next, next.canonical.clone())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn quota_only_and_active_instance_changes_increment_revision() {
+        let mut model = CollectorModel::new();
+        model.apply_discovery_event(DiscoveryEvent::AgentStarted(instance(9001)));
+        let first = PublishedState::new(1, model.active_usage()).unwrap();
+        let mut second_usage = first.canonical.clone();
+        second_usage[0].active_instances = 2;
+        let second = advance_published(&first, second_usage).unwrap().unwrap();
+        assert_eq!(second.revision, 2);
+        let mut third_usage = second.canonical.clone();
+        third_usage[0].status = UsageStatus::Fresh;
+        let third = advance_published(&second, third_usage).unwrap().unwrap();
+        assert_eq!(third.revision, 3);
+    }
+
+    #[test]
+    fn transition_to_empty_increments_revision() {
+        let mut model = CollectorModel::new();
+        let agent = instance(9001);
+        model.apply_discovery_event(DiscoveryEvent::AgentStarted(agent.clone()));
+        let previous = PublishedState::new(1, model.active_usage()).unwrap();
+        model.apply_discovery_event(DiscoveryEvent::AgentExited(agent.process));
+        let next = advance_published(&previous, model.active_usage())
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.revision, 2);
+        assert!(next.canonical.is_empty());
+    }
+
+    #[test]
+    fn get_state_does_not_change_revision() {
+        let state = PublishedState::new(4, Vec::new()).unwrap();
+        let decoded = xbar_ai_protocol::decode_snapshot(&state.encoded).unwrap();
+        let again = xbar_ai_protocol::decode_snapshot(&state.encoded).unwrap();
+        assert_eq!(decoded.state_revision, 4);
+        assert_eq!(again.state_revision, state.revision);
+    }
+
+    #[test]
+    fn encoding_failure_does_not_advance_committed_state() {
+        let previous = PublishedState::new(1, Vec::new()).unwrap();
+        let mut invalid = vec![ActiveAgentUsage {
+            agent_id: "codex".into(),
+            provider_id: "openai".into(),
+            account_id: AccountIdentity::Default,
+            display_name: "Codex".into(),
+            active_instances: 1,
+            meters: Vec::new(),
+            summary: UsageSummary {
+                primary_meter_id: None,
+                remaining_pct: None,
+            },
+            status: UsageStatus::Unavailable,
+            fetched_at: None,
+            cache_age_secs: None,
+        }];
+        invalid[0].display_name = "x".repeat(5000);
+        assert!(advance_published(&previous, invalid).is_err());
+        assert_eq!(previous.revision, 1);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn quota_fetch_in_flight_does_not_block_discovery() {
         let mut model = CollectorModel::new();
@@ -646,7 +929,7 @@ mod tests {
         model.apply_discovery_event(DiscoveryEvent::AgentStarted(first));
         let initial = model.active_usage();
         scheduler.reconcile_relevance(refresh_scopes(&initial));
-        assert!(scheduler.demand(key.clone()));
+        assert!(scheduler.demand(key.clone(), RefreshDemandReason::InitialScope));
         refreshes_started += 1;
 
         for pid in [9002, 9003] {
@@ -656,7 +939,7 @@ mod tests {
             let after = refresh_scopes(&active);
             scheduler.reconcile_relevance(after.iter().cloned());
             for scope in after.into_iter().filter(|scope| !before.contains(scope)) {
-                assert!(scheduler.demand(scope));
+                assert!(scheduler.demand(scope, RefreshDemandReason::InitialScope));
                 refreshes_started += 1;
             }
         }
