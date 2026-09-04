@@ -2031,11 +2031,56 @@ fn install_gmenu_signal_watcher(
 }
 
 pub(crate) fn push_event(events: &EventQueue, wake: &Arc<Mutex<UnixStream>>, event: Event) {
+    let ai_event = matches!(&event, Event::ActiveAiUsageChanged(_));
+    let mut wake = wake.lock().expect("DBus wake poisoned");
+    let wake_result = push_event_with_writer(events, &mut *wake, event);
+    if ai_event && std::env::var_os("XBAR_TRACE").is_some() {
+        eprintln!("xbar trace: AI_BRIDGE_WAKE_SENT result={wake_result:?}");
+    }
+}
+
+fn push_event_with_writer<W: Write>(
+    events: &EventQueue,
+    wake: &mut W,
+    event: Event,
+) -> io::Result<()> {
     events
         .lock()
         .expect("DBus event queue poisoned")
         .push_back(event);
-    let _ = wake.lock().expect("DBus wake poisoned").write_all(&[1]);
+    wake.write_all(&[1])
+}
+
+#[cfg(test)]
+mod ai_usage_bridge_tests {
+    use super::*;
+
+    fn queued_ai_event_wakes_main_loop() {
+        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let mut wake = Vec::new();
+        push_event_with_writer(&events, &mut wake, Event::ActiveAiUsageChanged(Vec::new()))
+            .expect("test wake writer");
+        assert_eq!(wake, [1]);
+        assert!(matches!(
+            events.lock().expect("event queue").pop_front(),
+            Some(Event::ActiveAiUsageChanged(usage)) if usage.is_empty()
+        ));
+    }
+
+    #[test]
+    fn late_collector_get_state_completion_wakes_main_loop() {
+        queued_ai_event_wakes_main_loop();
+    }
+
+    #[test]
+    fn ai_state_changed_signal_wakes_main_loop() {
+        queued_ai_event_wakes_main_loop();
+    }
+
+    #[test]
+    fn owner_loss_wakes_main_loop() {
+        queued_ai_event_wakes_main_loop();
+    }
 }
 
 #[cfg(test)]
