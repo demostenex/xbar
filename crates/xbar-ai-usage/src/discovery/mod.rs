@@ -179,7 +179,7 @@ mod tests {
     }
 
     const CODEX: &str = "/x/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/a/bin/codex";
-    const CLAUDE: &str = "/home/u/.local/share/claude/versions/2.9.1/claude";
+    const CLAUDE: &str = "/home/u/.local/share/claude/versions/2.9.1";
 
     #[test]
     fn descendants_never_become_agents() {

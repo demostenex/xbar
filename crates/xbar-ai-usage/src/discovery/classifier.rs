@@ -46,10 +46,7 @@ fn classify_executable(path: &Path, comm: &str) -> Option<AgentKind> {
     {
         return Some(AgentKind::Codex);
     }
-    if path.file_name().and_then(|n| n.to_str()) == Some("claude")
-        && comm == "claude"
-        && is_versioned_claude_path(&components)
-    {
+    if comm == "claude" && is_versioned_claude_path(&components) {
         return Some(AgentKind::ClaudeCode);
     }
     None
@@ -64,11 +61,10 @@ fn is_versioned_claude_path(components: &[&str]) -> bool {
     };
     index >= 2
         && components[index - 2..index + 1] == [".local", "share", "claude"]
-        && components.len() == index + 4
+        && components.len() == index + 3
         && !components[index + 2].is_empty()
         && components[index + 2] != "."
         && components[index + 2] != ".."
-        && components[index + 3] == "claude"
 }
 
 #[cfg(test)]
@@ -173,11 +169,84 @@ mod tests {
     fn valid_claude() {
         assert_eq!(
             classify_executable(
-                Path::new("/home/u/.local/share/claude/versions/2.9.1/claude"),
+                Path::new("/home/u/.local/share/claude/versions/2.1.260"),
                 "claude"
             ),
             Some(AgentKind::ClaudeCode)
         );
+    }
+
+    #[test]
+    fn claude_version_component_is_variable() {
+        assert_eq!(
+            classify_executable(
+                Path::new("/home/u/.local/share/claude/versions/99.0.0"),
+                "claude"
+            ),
+            Some(AgentKind::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn claude_helper_near_miss_is_rejected() {
+        assert_eq!(
+            classify_executable(
+                Path::new("/home/u/.local/share/claude/versions/2.1.260/helper"),
+                "claude"
+            ),
+            None
+        );
+        assert_eq!(
+            classify_executable(
+                Path::new("/home/u/.local/share/claude-helper/versions/2.1.260"),
+                "claude"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn account_scope_is_applied_only_after_positive_claude_classification() {
+        let dir = std::env::temp_dir().join(format!("xbar-claude-scope-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let scoped = classify(ProcessRecord {
+            process: super::super::ProcessIdentity {
+                pid: 1,
+                starttime: 1,
+            },
+            executable: Path::new("/home/u/.local/share/claude/versions/2.1.260").into(),
+            comm: "claude".into(),
+            environment: Some(vec![(
+                "CLAUDE_CONFIG_DIR".into(),
+                dir.to_string_lossy().into_owned(),
+            )]),
+        })
+        .expect("current Claude topology should classify");
+        assert_eq!(scoped.agent, AgentKind::ClaudeCode);
+        assert_eq!(
+            scoped.account_scope,
+            AccountIdentity::Named(
+                fs::canonicalize(&dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+
+        assert!(classify(ProcessRecord {
+            process: super::super::ProcessIdentity {
+                pid: 2,
+                starttime: 1,
+            },
+            executable: Path::new("/home/u/.local/share/claude-helper/versions/2.1.260").into(),
+            comm: "claude".into(),
+            environment: Some(vec![(
+                "CLAUDE_CONFIG_DIR".into(),
+                dir.to_string_lossy().into_owned()
+            )]),
+        })
+        .is_none());
+        fs::remove_dir(&dir).unwrap();
     }
     #[test]
     fn arbitrary_claude_is_rejected() {
