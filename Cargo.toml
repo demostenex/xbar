@@ -15,3 +15,4 @@ x11rb = { version = "0.14", features = ["allow-unsafe-code", "randr"] }
 x11 = { version = "2.21", features = ["xlib", "xft"] }
 zbus = { version = "5", default-features = false, features = ["async-io"] }
 xnm = { path = "crates/xnm" }
+xbar-ai-protocol = { path = "crates/xbar-ai-protocol" }

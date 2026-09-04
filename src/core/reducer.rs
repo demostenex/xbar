@@ -3205,6 +3205,7 @@ mod tests {
             },
             status,
             fetched_at: None,
+            cache_age_secs: None,
         }
     }
 
@@ -3236,8 +3237,8 @@ mod tests {
         ));
         assert_eq!(state.ai_usage.len(), 2);
         assert_eq!(state.ai_usage[0].agent_id, "claude");
-        assert_eq!(state.plugin_zone.plugins[0].text, "claude 41%");
-        assert_eq!(state.plugin_zone.plugins[1].text, "codex ?");
+        assert_eq!(state.plugin_zone.plugins[0].text, "󰚩 claude 41%");
+        assert_eq!(state.plugin_zone.plugins[1].text, "󰚩 codex ?");
         assert_eq!(
             state.plugin_zone.plugins[1].status,
             super::super::PluginStatus::Unavailable
@@ -3307,7 +3308,7 @@ mod tests {
             Event::ActiveAiUsageChanged(vec![unknown]),
             &mut registry,
         ));
-        assert_eq!(state.plugin_zone.plugins[0].text, "codex ?");
+        assert_eq!(state.plugin_zone.plugins[0].text, "󰚩 codex ?");
         assert_eq!(state.ai_usage[0].meters[0].reset_at, None);
         assert!(matches!(
             state.ai_usage[0]
@@ -3380,7 +3381,7 @@ mod tests {
             state.plugin_zone.plugins[0].id.0,
             "ai-usage:openai:codex:default"
         );
-        assert_eq!(state.plugin_zone.plugins[0].text, "codex 72%");
+        assert_eq!(state.plugin_zone.plugins[0].text, "󰚩 codex 72%");
     }
 
     #[test]
@@ -3438,7 +3439,184 @@ mod tests {
         assert_eq!(state.ai_usage[0].fetched_at, Some(200));
         assert_eq!(state.ai_usage[0].active_instances, 2);
         assert_eq!(state.ai_usage[0].status, super::super::UsageStatus::Stale);
-        assert_eq!(state.plugin_zone.plugins[0].text, "codex 72%");
+        assert_eq!(state.plugin_zone.plugins[0].text, "󰚩 codex 72%");
+    }
+
+    #[test]
+    fn ai_usage_remaining_change_marks_visual_dirty() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let first = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Default,
+            Some(99),
+            super::super::UsageStatus::Fresh,
+        );
+        reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![first]),
+            &mut registry,
+        );
+        let mut second = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Default,
+            Some(98),
+            super::super::UsageStatus::Fresh,
+        );
+        second.active_instances = 2;
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![second]),
+            &mut registry,
+        ));
+        assert_eq!(state.plugin_zone.plugins[0].text, "󰚩 codex 98%");
+    }
+
+    #[test]
+    fn ai_usage_fetched_at_only_change_is_not_visual_dirty() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let mut first = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Default,
+            Some(99),
+            super::super::UsageStatus::Fresh,
+        );
+        first.fetched_at = Some(100);
+        reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![first.clone()]),
+            &mut registry,
+        );
+        first.fetched_at = Some(200);
+        assert!(!reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![first]),
+            &mut registry,
+        ));
+        assert_eq!(state.ai_usage[0].fetched_at, Some(200));
+        assert_eq!(state.plugin_zone.plugins[0].text, "󰚩 codex 99%");
+    }
+
+    #[test]
+    fn ai_usage_dirty_event_renders_without_followup_focus_event() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let codex = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Default,
+            Some(81),
+            super::super::UsageStatus::Fresh,
+        );
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![codex]),
+            &mut registry,
+        ));
+        assert_eq!(state.plugin_zone.plugins.len(), 1);
+    }
+
+    #[test]
+    fn two_agents_produce_two_plugin_entries() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let agents = vec![
+            ai_usage(
+                "openai",
+                "codex",
+                super::super::AccountIdentity::Default,
+                Some(81),
+                super::super::UsageStatus::Fresh,
+            ),
+            ai_usage(
+                "anthropic",
+                "claude-code",
+                super::super::AccountIdentity::Default,
+                None,
+                super::super::UsageStatus::Unavailable,
+            ),
+        ];
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(agents),
+            &mut registry,
+        ));
+        assert_eq!(state.plugin_zone.plugins.len(), 2);
+        assert!(state
+            .plugin_zone
+            .plugins
+            .iter()
+            .any(|plugin| plugin.id.0 == "ai-usage:openai:codex:default"));
+        assert!(state
+            .plugin_zone
+            .plugins
+            .iter()
+            .any(|plugin| plugin.id.0 == "ai-usage:anthropic:claude-code:default"));
+    }
+
+    #[test]
+    fn codex_and_claude_unavailable_both_remain_visible() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let agents = vec![
+            ai_usage(
+                "openai",
+                "codex",
+                super::super::AccountIdentity::Default,
+                None,
+                super::super::UsageStatus::Unavailable,
+            ),
+            ai_usage(
+                "anthropic",
+                "claude-code",
+                super::super::AccountIdentity::Unknown,
+                None,
+                super::super::UsageStatus::Unknown,
+            ),
+        ];
+        assert!(reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(agents),
+            &mut registry,
+        ));
+        assert_eq!(state.plugin_zone.plugins.len(), 2);
+        assert!(state
+            .plugin_zone
+            .plugins
+            .iter()
+            .all(|plugin| plugin.text.ends_with(" ?")));
+    }
+
+    #[test]
+    fn ai_state_persists_across_unrelated_focus_window_events() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let codex = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Default,
+            Some(81),
+            super::super::UsageStatus::Fresh,
+        );
+        reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![codex]),
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::WindowFocusedWithApp {
+                window: Some(WindowId(42)),
+                app_name: Some("unrelated-window".into()),
+            },
+            &mut registry,
+        );
+        assert_eq!(state.ai_usage.len(), 1);
+        assert_eq!(state.plugin_zone.plugins[0].text, "󰚩 codex 81%");
     }
 
     #[test]
@@ -3461,7 +3639,7 @@ mod tests {
                 )]),
                 &mut registry,
             );
-            assert_eq!(state.plugin_zone.plugins[0].text, "codex ?");
+            assert_eq!(state.plugin_zone.plugins[0].text, "󰚩 codex ?");
             if unavailable {
                 assert!(dirty);
             } else {
@@ -3498,7 +3676,7 @@ mod tests {
             Event::ActiveAiUsageChanged(vec![second]),
             &mut registry,
         ));
-        assert_eq!(state.plugin_zone.plugins[0].text, "codex 72%");
+        assert_eq!(state.plugin_zone.plugins[0].text, "󰚩 codex 72%");
         assert_eq!(
             state.plugin_zone.plugins[0].id.0,
             "ai-usage:openai:codex:named:work"

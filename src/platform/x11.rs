@@ -1199,6 +1199,19 @@ impl X11Platform {
             ));
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!(
+                    "xbar trace: PLUGINZONE_VIEW items={}",
+                    context.plugins.len()
+                );
+                eprintln!(
+                    "xbar trace: PLUGINZONE_LAYOUT items={} rects={:?}",
+                    context.plugins.len(),
+                    context
+                        .plugins
+                        .iter()
+                        .map(|plugin| (plugin.rect.x, plugin.rect.width))
+                        .collect::<Vec<_>>()
+                );
+                eprintln!(
                     "xbar trace: context output={} workspaces={:?} menu={:?} bluetooth={:?} audio={:?} tray={:?} datetime={:?}",
                     output.name, context.workspaces, context.menu, context.bluetooth, context.audio, context.tray, context.datetime
                 );
@@ -1219,19 +1232,30 @@ impl X11Platform {
                         .map(|rect| rect.x + rect.width as i16)
                         .unwrap_or(output.x)
                 };
-                let right = context
-                    .tray
-                    .first()
-                    .map(|tray| tray.rect.x)
-                    .or_else(|| context.network.as_ref().map(|network| network.rect.x))
-                    .or_else(|| context.audio.as_ref().map(|audio| audio.rect.x))
-                    .or_else(|| {
-                        context
-                            .datetime
-                            .as_ref()
-                            .map(|date| date.rect.x - crate::ui::layout::RIGHT_PADDING as i16)
-                    })
-                    .unwrap_or(output.x + output.width as i16);
+                let right = if context_only && !right_only {
+                    context
+                        .plugins
+                        .first()
+                        .map(|plugin| plugin.rect.x)
+                        .or_else(|| context.tray.first().map(|tray| tray.rect.x))
+                        .or_else(|| context.network.as_ref().map(|network| network.rect.x))
+                        .or_else(|| context.audio.as_ref().map(|audio| audio.rect.x))
+                        .unwrap_or(output.x + output.width as i16)
+                } else {
+                    context
+                        .tray
+                        .first()
+                        .map(|tray| tray.rect.x)
+                        .or_else(|| context.network.as_ref().map(|network| network.rect.x))
+                        .or_else(|| context.audio.as_ref().map(|audio| audio.rect.x))
+                        .or_else(|| {
+                            context
+                                .datetime
+                                .as_ref()
+                                .map(|date| date.rect.x - crate::ui::layout::RIGHT_PADDING as i16)
+                        })
+                        .unwrap_or(output.x + output.width as i16)
+                };
                 if right > left {
                     self.conn.poly_fill_rectangle(
                         bar.window,
@@ -1243,6 +1267,9 @@ impl X11Platform {
                             height: BAR_HEIGHT,
                         }],
                     )?;
+                }
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!("xbar trace: CONTEXT_DRAW");
                 }
             }
             for (workspace, rect) in workspace_values.iter().zip(rects) {
@@ -1415,7 +1442,7 @@ impl X11Platform {
                 }
             }
             for plugin in &context.plugins {
-                if context_only && !right_only {
+                if !draw_plugins(context_only, right_only) {
                     continue;
                 }
                 let x = plugin.rect.x.saturating_sub(output.x) as i32 + 6;
@@ -1425,6 +1452,15 @@ impl X11Platform {
                     self.text.baseline(BAR_HEIGHT) as i32,
                     BAR_STYLE.foreground,
                 )?;
+            }
+            if std::env::var_os("XBAR_TRACE").is_some() && !context_only && !right_only {
+                eprintln!(
+                    "xbar trace: PLUGINZONE_DRAW items={}",
+                    context.plugins.len()
+                );
+            }
+            if std::env::var_os("XBAR_TRACE").is_some() && (right_only || !context_only) {
+                eprintln!("xbar trace: RIGHT_STATUS_DRAW");
             }
             if let Some(datetime) = &context.datetime {
                 if context_only {
@@ -2795,6 +2831,10 @@ impl X11Platform {
     }
 }
 
+fn draw_plugins(context_only: bool, right_only: bool) -> bool {
+    !context_only && !right_only
+}
+
 fn tray_hit(items: &[view::TrayVisualItem], x: i16, y: i16) -> Option<StatusNotifierEndpoint> {
     items
         .iter()
@@ -2831,7 +2871,7 @@ fn is_xbar_owned_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_xbar_owned_window, tray_hit, RenderTarget};
+    use super::{draw_plugins, is_xbar_owned_window, tray_hit, RenderTarget};
     use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
     use crate::ui::{layout::MenuRect, view::TrayVisualItem};
 
@@ -2861,6 +2901,26 @@ mod tests {
             RenderTarget::All.merge(RenderTarget::Popup),
             RenderTarget::All
         );
+    }
+
+    #[test]
+    fn focus_change_does_not_draw_pluginzone() {
+        assert!(!draw_plugins(true, false));
+    }
+
+    #[test]
+    fn global_menu_change_does_not_draw_pluginzone() {
+        assert!(!draw_plugins(true, false));
+    }
+
+    #[test]
+    fn plugin_visual_change_draws_pluginzone() {
+        assert!(draw_plugins(false, false));
+    }
+
+    #[test]
+    fn plugin_geometry_change_draws_pluginzone() {
+        assert!(draw_plugins(false, false));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use crate::core::{
     NotificationId, StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierIcon,
     StatusNotifierItem, StatusNotifierStatus,
 };
+mod ai_usage;
 mod gmenu;
 mod menu;
 use crate::notifications::{self, SharedStore, SharedTimer, REASON_CLOSED, REASON_EXPIRED};
@@ -242,6 +243,10 @@ enum Request {
         app_name: String,
         attention: bool,
     },
+    AiUsageSnapshot {
+        owner: String,
+        payload: Vec<u8>,
+    },
 }
 
 type EventQueue = Arc<Mutex<VecDeque<Event>>>;
@@ -268,6 +273,7 @@ impl DbusBridge {
         let notification_timer = Arc::new(Mutex::new(notifications::DeadlineTimer::new()?));
         let timer_for_thread = Arc::clone(&notification_timer);
         let thread_events = Arc::clone(&events);
+        let requests_for_thread = requests.clone();
         let thread = thread::Builder::new()
             .name("xbar-dbus".into())
             .spawn(move || {
@@ -275,6 +281,7 @@ impl DbusBridge {
                     thread_events,
                     writer,
                     registry,
+                    requests_for_thread,
                     request_receiver,
                     timer_for_thread,
                 )) {
@@ -1166,6 +1173,7 @@ async fn run(
     events: EventQueue,
     writer: UnixStream,
     registry: Arc<Mutex<MenuRegistry>>,
+    request_sender: Sender<Request>,
     requests: Receiver<Request>,
     notification_timer: SharedTimer,
 ) -> zbus::Result<()> {
@@ -1219,6 +1227,13 @@ async fn run(
     *watcher_connection.lock().expect("SNI connection poisoned") = Some(connection.clone());
     let dbus = zbus::fdo::DBusProxy::new(&connection).await?;
     let mut owner_changes = dbus.receive_name_owner_changed().await?;
+    let mut ai_usage = ai_usage::AiUsageSubscription::default();
+    ai_usage::subscribe_signal_watcher(&connection, &request_sender).await?;
+    if let Ok(owner) = dbus.get_name_owner(ai_usage::BUS_NAME.try_into()?).await {
+        let owner = owner.to_string();
+        ai_usage.owner_appeared(owner.clone());
+        ai_usage::spawn_get_state(&connection, &request_sender, owner);
+    }
     setup_status_notifier(&connection, &events, &wake, watcher_exists).await?;
     if std::env::var_os("XBAR_TRACE").is_some() {
         eprintln!("xbar trace: NetworkManager system connection starting");
@@ -1275,6 +1290,21 @@ async fn run(
             Either::Network => continue,
             Either::Owner(Some(signal)) => {
                 let args = signal.args()?;
+                if args.name().as_str() == ai_usage::BUS_NAME {
+                    let new_owner = args.new_owner().as_ref().map(ToString::to_string);
+                    let old_owner = args.old_owner().as_ref().map(ToString::to_string);
+                    if let Some(owner) = new_owner {
+                        if ai_usage.owner_appeared(owner.clone()) {
+                            push_event(&events, &wake, Event::ActiveAiUsageChanged(Vec::new()));
+                        }
+                        ai_usage::spawn_get_state(&connection, &request_sender, owner);
+                    } else if let Some(owner) = old_owner {
+                        if ai_usage.owner_disappeared(&owner) {
+                            push_event(&events, &wake, Event::ActiveAiUsageChanged(Vec::new()));
+                        }
+                    }
+                    continue;
+                }
                 if args.name().as_str().starts_with(':') && args.new_owner().is_none() {
                     push_event(
                         &events,
@@ -1597,6 +1627,25 @@ async fn run(
                     .expect("notification store poisoned")
                     .attention(window, app_name, attention);
                 notifications::publish(&notification_store, &notification_timer, &events, &wake);
+            }
+            Either::Request(Ok(Request::AiUsageSnapshot { owner, payload })) => {
+                match ai_usage.accept_snapshot(&owner, &payload) {
+                    Ok(ai_usage::SnapshotDisposition::Accepted(usage)) => {
+                        if std::env::var_os("XBAR_TRACE").is_some() {
+                            eprintln!(
+                                "xbar trace: AI_BRIDGE_QUEUED owner={owner} agents={}",
+                                usage.len()
+                            );
+                        }
+                        push_event(&events, &wake, Event::ActiveAiUsageChanged(usage));
+                    }
+                    Ok(ai_usage::SnapshotDisposition::Rejected) => {}
+                    Err(error) => {
+                        if std::env::var_os("XBAR_TRACE").is_some() {
+                            eprintln!("xbar trace: AI_USAGE_SNAPSHOT_REJECTED reason={error}");
+                        }
+                    }
+                }
             }
         }
     }

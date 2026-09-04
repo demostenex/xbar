@@ -222,7 +222,10 @@ pub struct ActiveAgentUsage {
     pub summary: UsageSummary,
     pub status: UsageStatus,
     pub fetched_at: Option<u64>,
+    pub cache_age_secs: Option<u64>,
 }
+
+const AI_USAGE_GLYPH: &str = "\u{f06a9}";
 
 impl ActiveAgentUsage {
     pub fn plugin_summary(&self) -> PluginSummary {
@@ -235,10 +238,10 @@ impl ActiveAgentUsage {
             UsageStatus::Fresh | UsageStatus::Stale => self
                 .summary
                 .remaining_pct
-                .map(|percent| format!("{} {}%", self.display_name, percent))
-                .unwrap_or_else(|| format!("{} ?", self.display_name)),
+                .map(|percent| format!("{AI_USAGE_GLYPH} {} {}%", self.display_name, percent))
+                .unwrap_or_else(|| format!("{AI_USAGE_GLYPH} {} ?", self.display_name)),
             UsageStatus::Unavailable | UsageStatus::Unknown => {
-                format!("{} ?", self.display_name)
+                format!("{AI_USAGE_GLYPH} {} ?", self.display_name)
             }
         };
         PluginSummary {

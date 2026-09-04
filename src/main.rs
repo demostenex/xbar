@@ -227,6 +227,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut dirty = false;
         let mut outputs_changed = false;
         let mut render_target: Option<RenderTarget> = None;
+        let mut render_cause: Option<&'static str> = None;
         let mut event_index = 0;
         while event_index < events.len() {
             let event = events[event_index].clone();
@@ -678,11 +679,36 @@ fn main() -> Result<(), Box<dyn Error>> {
                 } => Some((endpoint.clone(), *action, *root_x, *root_y)),
                 _ => None,
             };
+            if trace && matches!(translated, Event::WindowFocusedWithApp { .. }) {
+                eprintln!(
+                    "xbar trace: PLUGINZONE_STATE before_reducer items={}",
+                    state.plugin_zone.plugins.len()
+                );
+            }
             let reduced = core::reduce(
                 &mut state,
                 translated.clone(),
                 &mut registry.lock().expect("registry poisoned"),
             );
+            if trace && matches!(translated, Event::WindowFocusedWithApp { .. }) {
+                eprintln!(
+                    "xbar trace: PLUGINZONE_STATE after_reducer items={}",
+                    state.plugin_zone.plugins.len()
+                );
+            }
+            if reduced {
+                render_cause = Some(match &translated {
+                    Event::ActiveAiUsageChanged(_) => "ActiveAiUsageChanged",
+                    Event::WindowFocusedWithApp { .. } => "WindowFocusedWithApp",
+                    _ => "other",
+                });
+            }
+            if trace && matches!(translated, Event::ActiveAiUsageChanged(_)) {
+                eprintln!(
+                    "xbar trace: AI_MAIN_EVENT_RECEIVED agents={} AI_REDUCER_CHANGED dirty={reduced}",
+                    state.ai_usage.len()
+                );
+            }
             if trace && matches!(translated, Event::NetworkPopupSnapshotReceived(_)) && reduced {
                 let active = state
                     .network
@@ -1047,8 +1073,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     dirty |= request_dirty;
                     if request_dirty {
                         render_target = Some(match render_target {
-                            Some(current) => current.merge(RenderTarget::All),
-                            None => RenderTarget::All,
+                            Some(current) => current.merge(RenderTarget::DockContext),
+                            None => RenderTarget::DockContext,
                         });
                     }
                     match endpoint {
@@ -1074,6 +1100,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         if dirty {
+            if trace {
+                eprintln!(
+                    "xbar trace: RENDER_REQUESTED cause={}",
+                    render_cause.unwrap_or("unknown")
+                );
+            }
             if outputs_changed {
                 x11.sync_windows(&state.outputs)?;
             }

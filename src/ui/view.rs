@@ -230,26 +230,50 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth_and_plugins<M: TextMea
         None => Vec::new(),
     };
     let datetime = clock.map(format_clock);
-    let (workspace_rects, mut menu_rects, datetime_rect, mut future) =
-        crate::ui::layout::allocate_context_with_measurer(
-            output,
-            &focused_workspace,
-            &visible,
-            datetime.as_deref(),
-            measurer,
-        );
     let tray_items = tray_items
         .iter()
         .filter(|item| !matches!(item.status, StatusNotifierStatus::Passive))
         .filter_map(|item| item.icon.as_ref().map(|icon| (item, icon.clone())))
         .collect::<Vec<_>>();
+    let plugin_labels = plugins
+        .iter()
+        .map(|plugin| plugin.text.clone())
+        .collect::<Vec<_>>();
+    let reserved_right = right_cluster_reservation(
+        &plugin_labels,
+        tray_items.len(),
+        audio,
+        network,
+        bluetooth,
+        measurer,
+    );
+    let (workspace_rects, mut menu_rects, datetime_rect, mut future) =
+        crate::ui::layout::allocate_context_with_reserved_right(
+            output,
+            &focused_workspace,
+            &visible,
+            datetime.as_deref(),
+            reserved_right,
+            measurer,
+        );
+    let right_cluster_right = future.x + future.width as i16;
+    let reserved_right = reserved_right.clamp(0, u16::MAX as i32) as u16;
     let app_name = app_name
         .filter(|text| !text.is_empty())
         .map(capitalize_app_name)
         .filter(|text| !text.is_empty())
-        .and_then(|text| truncate_text(&text, future.width.saturating_sub(8), measurer));
+        .and_then(|text| {
+            let available = future
+                .width
+                .saturating_sub(reserved_right)
+                .saturating_sub(8);
+            (available > 0)
+                .then(|| truncate_text(&text, available, measurer))
+                .flatten()
+        });
     let app_visual = app_name.map(|text| {
-        let width = (measurer.measure_width(&text) + 12).min(future.width);
+        let width =
+            (measurer.measure_width(&text) + 12).min(future.width.saturating_sub(reserved_right));
         let app_left = workspace_rects
             .first()
             .map(|rect| rect.x + rect.width as i16 + 8)
@@ -285,7 +309,7 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth_and_plugins<M: TextMea
     let network_width = if network_enabled { 24 } else { 0 };
     let bluetooth_enabled = bluetooth.and_then(bluetooth_glyph).is_some();
     let bluetooth_width = if bluetooth_enabled { 24 } else { 0 };
-    let status_right = future.x + future.width as i16;
+    let status_right = right_cluster_right;
     let audio_left = status_right - audio_width as i16;
     let bluetooth_left = audio_left
         - if bluetooth_enabled && audio_enabled {
@@ -319,11 +343,11 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth_and_plugins<M: TextMea
         height: future.height,
     };
     let tray_rects = allocate_tray(tray_future, tray_items.len());
-    let plugin_labels = plugins
-        .iter()
-        .map(|plugin| plugin.text.clone())
-        .collect::<Vec<_>>();
-    let plugin_right = tray_rects.first().map(|rect| rect.x).unwrap_or(tray_left);
+    let plugin_right = tray_rects
+        .first()
+        .map(|rect| rect.x)
+        .unwrap_or(tray_left)
+        .min(right_cluster_right);
     let plugin_rects =
         crate::ui::layout::allocate_plugins(future.x, plugin_right, &plugin_labels, measurer);
     let plugin_left = plugin_rects
@@ -410,6 +434,52 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth_and_plugins<M: TextMea
             rect,
         }),
     }
+}
+
+fn right_cluster_reservation<M: TextMeasurer>(
+    plugin_labels: &[String],
+    tray_count: usize,
+    audio: Option<&crate::core::AudioState>,
+    network: Option<&crate::core::NetworkState>,
+    bluetooth: Option<&crate::core::BluetoothState>,
+    measurer: &M,
+) -> i32 {
+    let plugin_width = plugin_labels
+        .iter()
+        .map(|label| measurer.measure_width(label) as i32 + 12)
+        .sum::<i32>();
+    let plugin_gaps = plugin_labels.len().saturating_sub(1) as i32 * STATUS_ITEM_GAP as i32;
+    let tray_width = tray_count as i32 * 20;
+    let audio_width = if audio.is_some_and(|state| state.available) {
+        ["󰖁", "󰕿", "󰖀", "󰕾"]
+            .iter()
+            .map(|glyph| measurer.measure_status_icon_width(glyph) as i32)
+            .max()
+            .unwrap_or(0)
+            .max(12)
+            + 12
+    } else {
+        0
+    };
+    let network_width = network.is_some_and(|state| state.available) as i32 * 24;
+    let bluetooth_width = bluetooth.and_then(bluetooth_glyph).is_some() as i32 * 24;
+    let status_count = (audio_width > 0) as i32
+        + (network_width > 0) as i32
+        + (bluetooth_width > 0) as i32
+        + (tray_count > 0) as i32;
+    let gaps = status_count.saturating_sub(1) * STATUS_ITEM_GAP as i32;
+    plugin_width
+        + plugin_gaps
+        + tray_width
+        + audio_width
+        + network_width
+        + bluetooth_width
+        + gaps
+        + if plugin_labels.is_empty() {
+            0
+        } else {
+            STATUS_ITEM_GAP as i32
+        }
 }
 
 fn truncate_text<M: TextMeasurer>(text: &str, width: u16, measurer: &M) -> Option<String> {
@@ -1076,5 +1146,95 @@ mod tests {
             view.future.x + view.future.width as i16,
             view.plugins[0].rect.x
         );
+    }
+
+    #[test]
+    fn focus_render_preserves_pluginzone() {
+        let plugin = crate::core::PluginSummary {
+            id: crate::core::PluginId("ai-usage:openai:codex:default".into()),
+            display_name: "Codex".into(),
+            text: "󰚩 Codex 78%".into(),
+            status: crate::core::PluginStatus::Ready,
+        };
+        let view = context_view_with_app_name_and_audio_and_bluetooth_and_plugins(
+            &output(640),
+            &workspace(),
+            None,
+            None,
+            &[],
+            Some("Focused application"),
+            None,
+            None,
+            None,
+            std::slice::from_ref(&plugin),
+            &BAR_STYLE,
+        );
+        assert_eq!(view.plugins.len(), 1);
+        assert_eq!(view.plugins[0].text, "󰚩 Codex 78%");
+        assert!(view.plugins[0].rect.width > 0);
+    }
+
+    #[test]
+    fn focus_change_with_global_menu_preserves_pluginzone() {
+        let model = loaded(vec![item(1, Some("Global menu"), true)]);
+        let plugin = crate::core::PluginSummary {
+            id: crate::core::PluginId("ai-usage:anthropic:claude-code:default".into()),
+            display_name: "Claude".into(),
+            text: "󰚩 Claude ?".into(),
+            status: crate::core::PluginStatus::Unknown,
+        };
+        let view = context_view_with_app_name_and_audio_and_bluetooth_and_plugins(
+            &output(640),
+            &workspace(),
+            Some(&model),
+            None,
+            &[],
+            Some("Focused application"),
+            None,
+            None,
+            None,
+            std::slice::from_ref(&plugin),
+            &BAR_STYLE,
+        );
+        assert_eq!(view.plugins.len(), 1);
+        assert!(view.plugins[0].rect.width > 0);
+    }
+
+    #[test]
+    fn long_app_or_menu_does_not_drop_pluginzone() {
+        let model = loaded(vec![
+            item(1, Some("Arquivo muito longo para o menu global"), true),
+            item(2, Some("Preferências e configurações avançadas"), true),
+            item(3, Some("Ajuda e documentação completa"), true),
+        ]);
+        let plugins = vec![
+            crate::core::PluginSummary {
+                id: crate::core::PluginId("ai-usage:openai:codex:default".into()),
+                display_name: "Codex".into(),
+                text: "󰚩 Codex 78%".into(),
+                status: crate::core::PluginStatus::Ready,
+            },
+            crate::core::PluginSummary {
+                id: crate::core::PluginId("ai-usage:anthropic:claude-code:default".into()),
+                display_name: "Claude".into(),
+                text: "󰚩 Claude ?".into(),
+                status: crate::core::PluginStatus::Unknown,
+            },
+        ];
+        let view = context_view_with_app_name_and_audio_and_bluetooth_and_plugins(
+            &output(640),
+            &workspace(),
+            Some(&model),
+            None,
+            &[],
+            Some("A very long focused application name"),
+            None,
+            None,
+            None,
+            &plugins,
+            &BAR_STYLE,
+        );
+        assert_eq!(view.plugins.len(), 2);
+        assert!(view.plugins.iter().all(|plugin| plugin.rect.width > 0));
     }
 }

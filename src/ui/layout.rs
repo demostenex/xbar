@@ -214,6 +214,22 @@ pub fn allocate_context_with_measurer<M: TextMeasurer>(
     Option<MenuRect>,
     MenuRect,
 ) {
+    allocate_context_with_reserved_right(output, workspaces, menu, datetime, 0, measurer)
+}
+
+pub fn allocate_context_with_reserved_right<M: TextMeasurer>(
+    output: &OutputState,
+    workspaces: &[WorkspaceState],
+    menu: &[(MenuItemId, String, bool)],
+    datetime: Option<&str>,
+    reserved_right: i32,
+    measurer: &M,
+) -> (
+    Vec<WorkspaceRect>,
+    Vec<MenuRect>,
+    Option<MenuRect>,
+    MenuRect,
+) {
     let output_left = output.x as i32;
     let output_right = output_left + output.width as i32;
     let workspace_width = workspaces
@@ -233,7 +249,8 @@ pub fn allocate_context_with_measurer<M: TextMeasurer>(
     let datetime_x = output_right - RIGHT_PADDING - datetime_width;
     let content_right = datetime_x - if datetime.is_some() { RIGHT_PADDING } else { 0 };
     let content_left = output_left + LEFT_PADDING;
-    let available_menu = (content_right - content_left - workspace_width as i32).max(0);
+    let available_menu =
+        (content_right - content_left - workspace_width as i32 - reserved_right.max(0)).max(0);
     let mut menu_width = 0_i32;
     let mut widths = Vec::new();
     for (_, label, _) in menu {
