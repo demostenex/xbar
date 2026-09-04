@@ -3,6 +3,16 @@ use std::path::Path;
 use super::{AgentInstance, AgentKind, ProcessRecord, ProviderKind};
 use crate::AccountIdentity;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AccountScopeResolution {
+    DefaultVariableAbsent,
+    ExplicitScope,
+    EnvironmentUnreadable { errno: Option<i32> },
+    EnvironmentMalformed,
+    DuplicateVariable,
+    ScopeCanonicalizationFailed,
+}
+
 pub fn classify(record: ProcessRecord) -> Option<AgentInstance> {
     let executable = std::fs::canonicalize(&record.executable).unwrap_or(record.executable);
     let agent = classify_executable(&executable, &record.comm)?;
@@ -10,12 +20,14 @@ pub fn classify(record: ProcessRecord) -> Option<AgentInstance> {
         AgentKind::Codex => (ProviderKind::OpenAi, "CODEX_HOME"),
         AgentKind::ClaudeCode => (ProviderKind::Anthropic, "CLAUDE_CONFIG_DIR"),
     };
-    let account_scope = account_scope(record.environment.as_deref(), variable);
+    let (account_scope, account_scope_resolution) =
+        account_scope_resolution(record.environment.as_deref(), variable);
     Some(AgentInstance {
         process: record.process,
         agent,
         provider,
         account_scope,
+        account_scope_resolution,
         executable,
     })
 }
@@ -59,15 +71,35 @@ fn is_versioned_claude_path(components: &[&str]) -> bool {
         && components[index + 3] == "claude"
 }
 
+#[cfg(test)]
 fn account_scope(environment: Option<&[(String, String)]>, variable: &str) -> AccountIdentity {
+    account_scope_resolution(environment, variable).0
+}
+
+pub(crate) fn account_scope_resolution(
+    environment: Option<&[(String, String)]>,
+    variable: &str,
+) -> (AccountIdentity, AccountScopeResolution) {
     let Some(environment) = environment else {
-        return AccountIdentity::Default;
+        return (
+            AccountIdentity::Default,
+            AccountScopeResolution::DefaultVariableAbsent,
+        );
     };
-    if environment
+    if let Some((_, detail)) = environment
         .iter()
-        .any(|(name, _)| name == "__XBAR_DISCOVERY_ENV_UNREADABLE")
+        .find(|(name, _)| name == "__XBAR_DISCOVERY_ENV_UNREADABLE")
     {
-        return AccountIdentity::Unknown;
+        let resolution = if detail == "malformed" {
+            AccountScopeResolution::EnvironmentMalformed
+        } else {
+            AccountScopeResolution::EnvironmentUnreadable {
+                errno: detail
+                    .strip_prefix("errno:")
+                    .and_then(|value| value.parse().ok()),
+            }
+        };
+        return (AccountIdentity::Unknown, resolution);
     }
     let values: Vec<_> = environment
         .iter()
@@ -75,13 +107,31 @@ fn account_scope(environment: Option<&[(String, String)]>, variable: &str) -> Ac
         .map(|(_, value)| value)
         .collect();
     match values.as_slice() {
-        [] => AccountIdentity::Default,
-        [value] if !value.is_empty() => std::fs::canonicalize(value)
+        [] => (
+            AccountIdentity::Default,
+            AccountScopeResolution::DefaultVariableAbsent,
+        ),
+        [value] if value.is_empty() => (
+            AccountIdentity::Unknown,
+            AccountScopeResolution::EnvironmentMalformed,
+        ),
+        [value] => match std::fs::canonicalize(value)
             .ok()
             .filter(|path| path.is_absolute())
-            .map(|path| AccountIdentity::Named(path.to_string_lossy().into_owned()))
-            .unwrap_or(AccountIdentity::Unknown),
-        _ => AccountIdentity::Unknown,
+        {
+            Some(path) => (
+                AccountIdentity::Named(path.to_string_lossy().into_owned()),
+                AccountScopeResolution::ExplicitScope,
+            ),
+            None => (
+                AccountIdentity::Unknown,
+                AccountScopeResolution::ScopeCanonicalizationFailed,
+            ),
+        },
+        _ => (
+            AccountIdentity::Unknown,
+            AccountScopeResolution::DuplicateVariable,
+        ),
     }
 }
 
@@ -152,6 +202,51 @@ mod tests {
                 "CODEX_HOME"
             ),
             AccountIdentity::Unknown
+        );
+    }
+
+    #[test]
+    fn unreadable_environment_is_unknown_with_sanitized_reason() {
+        assert_eq!(
+            account_scope_resolution(
+                Some(&[("__XBAR_DISCOVERY_ENV_UNREADABLE".into(), "errno:13".into(),)]),
+                "CODEX_HOME",
+            ),
+            (
+                AccountIdentity::Unknown,
+                AccountScopeResolution::EnvironmentUnreadable { errno: Some(13) },
+            )
+        );
+    }
+
+    #[test]
+    fn duplicate_scope_variable_is_unknown_with_sanitized_reason() {
+        assert_eq!(
+            account_scope_resolution(
+                Some(&[
+                    ("CODEX_HOME".into(), "/one".into()),
+                    ("CODEX_HOME".into(), "/two".into()),
+                ]),
+                "CODEX_HOME",
+            ),
+            (
+                AccountIdentity::Unknown,
+                AccountScopeResolution::DuplicateVariable,
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_environment_is_unknown_with_sanitized_reason() {
+        assert_eq!(
+            account_scope_resolution(
+                Some(&[("__XBAR_DISCOVERY_ENV_UNREADABLE".into(), "malformed".into(),)]),
+                "CLAUDE_CONFIG_DIR",
+            ),
+            (
+                AccountIdentity::Unknown,
+                AccountScopeResolution::EnvironmentMalformed,
+            )
         );
     }
     #[test]

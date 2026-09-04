@@ -6,6 +6,7 @@ use ai_usagebar::usage::{AnthropicSnapshot, ExtraUsage, OpenAiSnapshot, UsageWin
 
 pub mod composition;
 pub mod discovery;
+pub mod runtime;
 
 pub use composition::{ActiveAgentUsage, CollectorModel};
 pub use discovery::{

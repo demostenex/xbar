@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use crate::AccountIdentity;
 
 pub use classifier::classify;
+pub(crate) use classifier::AccountScopeResolution;
 pub use cn_proc::{CnProc, CnProcError};
 pub use procfs::{startup_snapshot, ProcFsError};
 
@@ -43,6 +44,7 @@ pub struct AgentInstance {
     pub agent: AgentKind,
     pub provider: ProviderKind,
     pub account_scope: AccountIdentity,
+    pub(crate) account_scope_resolution: classifier::AccountScopeResolution,
     pub executable: PathBuf,
 }
 
@@ -245,6 +247,7 @@ mod tests {
                 agent: AgentKind::ClaudeCode,
                 provider: ProviderKind::Anthropic,
                 account_scope: AccountIdentity::Default,
+                account_scope_resolution: AccountScopeResolution::DefaultVariableAbsent,
                 executable: CLAUDE.into()
             })]
         );

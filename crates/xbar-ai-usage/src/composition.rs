@@ -205,6 +205,8 @@ mod tests {
                 AgentKind::ClaudeCode => ProviderKind::Anthropic,
             },
             account_scope: account,
+            account_scope_resolution:
+                crate::discovery::AccountScopeResolution::DefaultVariableAbsent,
             executable: PathBuf::from("/safe/executable"),
         }
     }

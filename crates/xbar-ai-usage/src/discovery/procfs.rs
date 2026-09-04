@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 
+use super::classifier::AccountScopeResolution;
 use super::{classify, ProcessIdentity, ProcessRecord};
 
 #[derive(Debug)]
@@ -51,8 +52,16 @@ pub(crate) fn inspect(pid: u32) -> Option<ProcessRecord> {
             super::AgentKind::ClaudeCode => "CLAUDE_CONFIG_DIR",
         };
         Some(
-            read_environment(&root.join("environ"), variable)
-                .unwrap_or_else(|| vec![("__XBAR_DISCOVERY_ENV_UNREADABLE".into(), String::new())]),
+            read_environment(&root.join("environ"), variable).unwrap_or_else(|error| {
+                let detail = match error {
+                    AccountScopeResolution::EnvironmentUnreadable { errno } => {
+                        format!("errno:{}", errno.unwrap_or_default())
+                    }
+                    AccountScopeResolution::EnvironmentMalformed => "malformed".into(),
+                    _ => "malformed".into(),
+                };
+                vec![("__XBAR_DISCOVERY_ENV_UNREADABLE".into(), detail)]
+            }),
         )
     } else {
         None
@@ -78,21 +87,34 @@ fn parse_starttime(stat: &str) -> Option<u64> {
     stat[end..].split_whitespace().nth(19)?.parse().ok()
 }
 
-fn read_environment(path: &std::path::Path, wanted: &str) -> Option<Vec<(String, String)>> {
-    let bytes = fs::read(path).ok()?;
+fn read_environment(
+    path: &std::path::Path,
+    wanted: &str,
+) -> Result<Vec<(String, String)>, AccountScopeResolution> {
+    let bytes = fs::read(path).map_err(|error| AccountScopeResolution::EnvironmentUnreadable {
+        errno: error.raw_os_error(),
+    })?;
     let mut values = Vec::new();
     for item in bytes.split(|byte| *byte == 0) {
-        let separator = item.iter().position(|byte| *byte == b'=')?;
+        if item.is_empty() {
+            continue;
+        }
+        let separator = item
+            .iter()
+            .position(|byte| *byte == b'=')
+            .ok_or(AccountScopeResolution::EnvironmentMalformed)?;
         let (name, value) = item.split_at(separator);
         let value = &value[1..];
         if name == wanted.as_bytes() {
             values.push((
-                String::from_utf8(name.to_vec()).ok()?,
-                String::from_utf8(value.to_vec()).ok()?,
+                String::from_utf8(name.to_vec())
+                    .map_err(|_| AccountScopeResolution::EnvironmentMalformed)?,
+                String::from_utf8(value.to_vec())
+                    .map_err(|_| AccountScopeResolution::EnvironmentMalformed)?,
             ));
         }
     }
-    Some(values)
+    Ok(values)
 }
 
 #[cfg(test)]
