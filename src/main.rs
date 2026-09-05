@@ -1105,6 +1105,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     "xbar trace: RENDER_REQUESTED cause={}",
                     render_cause.unwrap_or("unknown")
                 );
+                let target = render_target.unwrap_or(RenderTarget::All);
+                eprintln!("xbar trace: DIRTY_REGIONS={}", target.debug_regions());
             }
             if outputs_changed {
                 x11.sync_windows(&state.outputs)?;
@@ -1129,8 +1131,30 @@ fn render_target_for(
                 None
             }
         }
+        Event::X11(platform::x11::X11Event::RandrChanged) => Some(RenderTarget::Dock),
+        Event::X11(
+            platform::x11::X11Event::GtkWindowChanged(_)
+            | platform::x11::X11Event::GtkWindowsChanged
+            | platform::x11::X11Event::GtkWindowDestroyed(_),
+        ) => Some(RenderTarget::DockContext),
+        Event::X11(platform::x11::X11Event::WindowAttentionChanged { .. }) => None,
+        Event::X11(platform::x11::X11Event::InstanceLost)
+        | Event::X11(platform::x11::X11Event::Close) => None,
         Event::WindowFocusedWithApp { .. } => Some(RenderTarget::DockContext),
-        Event::MenuLoaded { .. } | Event::MenuLoadFailed { .. } => Some(RenderTarget::DockContext),
+        Event::MenuRegistered { .. }
+        | Event::GtkMenuDiscovered { .. }
+        | Event::GtkMenuRemoved { .. }
+        | Event::MenuUnregistered { .. }
+        | Event::MenuOwnerVanished { .. }
+        | Event::MenuLoadRequested { .. }
+        | Event::MenuLoaded { .. }
+        | Event::MenuLoadFailed { .. }
+        | Event::MenuLayoutInvalidated { .. }
+        | Event::MenuPropertiesUpdated { .. } => Some(RenderTarget::DockContext),
+        Event::WorkspacesSnapshot(_) | Event::WorkspaceFocused { .. } => {
+            Some(RenderTarget::Workspaces)
+        }
+        Event::OutputsChanged(_) => Some(RenderTarget::Dock),
         Event::X11(platform::x11::X11Event::MotionNotify { .. })
         | Event::MenuItemHovered { .. } => match mouse_target {
             Some(HitTarget::Item(_)) => Some(RenderTarget::Popup),
@@ -1163,33 +1187,48 @@ fn render_target_for(
         } else {
             RenderTarget::Popup
         }),
-        Event::ClockUpdated(_) => Some(RenderTarget::Dock),
-        Event::AudioSnapshotReceived(_)
-        | Event::AudioUnavailable
-        | Event::NetworkStatusChanged(_)
-        | Event::NetworkSnapshotReceived(_)
-        | Event::BluetoothSnapshotReceived(_)
-        | Event::BluetoothUnavailable => Some(RenderTarget::DockRight),
-        Event::AudioInventoryReceived { .. } => Some(RenderTarget::Popup),
-        Event::AudioSelectOutput(_) | Event::AudioSelectInput(_) => Some(RenderTarget::Popup),
-        Event::AudioPopupToggled => Some(RenderTarget::Popup),
-        Event::AudioTrackChanged { .. }
-        | Event::AudioDragReleased
-        | Event::AudioMuteToggled { .. } => Some(RenderTarget::Popup),
-        Event::BluetoothPopupToggled
-        | Event::BluetoothSetPowered(_)
-        | Event::BluetoothConnectDevice(_)
-        | Event::BluetoothDisconnectDevice(_)
-        | Event::BluetoothActionFinished(_) => Some(RenderTarget::Popup),
-        Event::NetworkPopupToggled
+        Event::ClockUpdated(_) => Some(RenderTarget::DateTime),
+        Event::AudioSnapshotReceived(_) | Event::AudioUnavailable => Some(RenderTarget::Audio),
+        Event::NetworkStatusChanged(_) | Event::NetworkSnapshotReceived(_) => {
+            Some(RenderTarget::Network)
+        }
+        Event::BluetoothSnapshotReceived(_) | Event::BluetoothUnavailable => {
+            Some(RenderTarget::Bluetooth)
+        }
+        Event::ActiveAiUsageChanged(_) => Some(RenderTarget::PluginZone),
+        Event::StatusNotifierRegistered(_)
+        | Event::StatusNotifierUnregistered(_)
+        | Event::StatusNotifierOwnerVanished(_)
+        | Event::StatusNotifierItemUpdated(_) => Some(RenderTarget::Tray),
+        Event::StatusNotifierHostRegistered => Some(RenderTarget::Tray),
+        Event::MenuRootClicked(_)
+        | Event::MenuItemActivateRequested { .. }
+        | Event::TrayMenuOpenRequested { .. }
+        | Event::TrayMenuLoaded { .. }
+        | Event::TrayMenuLoadFailed { .. }
+        | Event::NetworkPopupProjectionChanged(_)
+        | Event::NetworkConnectSavedWifi(_)
         | Event::NetworkPopupOpenRequested
         | Event::NetworkPopupSnapshotReceived(_)
         | Event::NetworkPopupSnapshotFailed
+        | Event::NetworkPopupToggled
         | Event::NetworkSetWireless(_)
-        | Event::NetworkActionFinished(_) => Some(RenderTarget::Popup),
+        | Event::NetworkActionFinished(_)
+        | Event::BluetoothPopupToggled
+        | Event::BluetoothSetPowered(_)
+        | Event::BluetoothConnectDevice(_)
+        | Event::BluetoothDisconnectDevice(_)
+        | Event::BluetoothActionFinished(_)
+        | Event::AudioInventoryReceived { .. }
+        | Event::AudioSelectOutput(_)
+        | Event::AudioSelectInput(_)
+        | Event::AudioPopupToggled
+        | Event::AudioTrackChanged { .. }
+        | Event::AudioDragReleased
+        | Event::AudioMuteToggled { .. } => Some(RenderTarget::Popup),
+        Event::WindowFocused(_) => Some(RenderTarget::DockContext),
+        Event::WindowAttentionChanged { .. } | Event::StatusNotifierActionRequested { .. } => None,
         Event::NotificationsSnapshot(_) => Some(RenderTarget::Notification),
-        Event::WindowAttentionChanged { .. } => None,
-        Event::StatusNotifierActionRequested { .. } => None,
         _ => Some(RenderTarget::All),
     }
 }

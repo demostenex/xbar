@@ -4,6 +4,7 @@ use crate::core::{
 };
 use crate::ui::style::{self, TextMeasurer, BAR_STYLE};
 use crate::ui::{layout, view};
+use std::collections::HashMap;
 use std::error::Error;
 use std::os::fd::{AsRawFd, RawFd};
 use x11rb::connection::Connection;
@@ -77,6 +78,7 @@ pub struct X11Platform {
     notification: Option<NotificationWindow>,
     pointer_grabbed: bool,
     bar_hits: Vec<BarHitMap>,
+    previous_contexts: HashMap<u32, view::ContextView>,
 }
 struct Atoms {
     instance: Atom,
@@ -175,44 +177,138 @@ pub enum HitTarget {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RenderTarget {
-    Dock,
-    DockContext,
-    DockRight,
-    DockRightPopup,
-    Popup,
-    Notification,
-    All,
-}
+pub struct RenderTarget(u16);
 
 impl RenderTarget {
+    const WORKSPACES: u16 = 1 << 0;
+    const CONTEXT: u16 = 1 << 1;
+    const PLUGIN_ZONE: u16 = 1 << 2;
+    const TRAY: u16 = 1 << 3;
+    const NETWORK: u16 = 1 << 4;
+    const BLUETOOTH: u16 = 1 << 5;
+    const AUDIO: u16 = 1 << 6;
+    const DATETIME: u16 = 1 << 7;
+    const POPUP: u16 = 1 << 8;
+    const NOTIFICATION: u16 = 1 << 9;
+    const DOCK: u16 = Self::WORKSPACES
+        | Self::CONTEXT
+        | Self::PLUGIN_ZONE
+        | Self::TRAY
+        | Self::NETWORK
+        | Self::BLUETOOTH
+        | Self::AUDIO
+        | Self::DATETIME;
+
+    #[allow(non_upper_case_globals)]
+    pub const Dock: Self = Self(Self::DOCK);
+    #[allow(non_upper_case_globals)]
+    pub const DockContext: Self = Self(Self::CONTEXT);
+    #[allow(non_upper_case_globals)]
+    #[allow(dead_code)]
+    pub const DockRight: Self = Self(
+        Self::PLUGIN_ZONE
+            | Self::TRAY
+            | Self::NETWORK
+            | Self::BLUETOOTH
+            | Self::AUDIO
+            | Self::DATETIME,
+    );
+    #[allow(non_upper_case_globals)]
+    #[allow(dead_code)]
+    pub const DockRightPopup: Self = Self(Self::DockRight.0 | Self::POPUP);
+    #[allow(non_upper_case_globals)]
+    pub const Popup: Self = Self(Self::POPUP);
+    #[allow(non_upper_case_globals)]
+    pub const Notification: Self = Self(Self::NOTIFICATION);
+    #[allow(non_upper_case_globals)]
+    pub const All: Self = Self(Self::DOCK | Self::POPUP | Self::NOTIFICATION);
+    #[allow(non_upper_case_globals)]
+    pub const Workspaces: Self = Self(Self::WORKSPACES);
+    #[allow(non_upper_case_globals)]
+    pub const PluginZone: Self = Self(Self::PLUGIN_ZONE);
+    #[allow(non_upper_case_globals)]
+    pub const Tray: Self = Self(Self::TRAY);
+    #[allow(non_upper_case_globals)]
+    pub const Network: Self = Self(Self::NETWORK);
+    #[allow(non_upper_case_globals)]
+    pub const Bluetooth: Self = Self(Self::BLUETOOTH);
+    #[allow(non_upper_case_globals)]
+    pub const Audio: Self = Self(Self::AUDIO);
+    #[allow(non_upper_case_globals)]
+    pub const DateTime: Self = Self(Self::DATETIME);
+
     pub fn merge(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::All, _) | (_, Self::All) => Self::All,
-            (Self::DockContext, Self::DockContext) => Self::DockContext,
-            (Self::DockRight, Self::DockRight) => Self::DockRight,
-            (Self::DockRight, Self::DockContext) | (Self::DockContext, Self::DockRight) => {
-                Self::Dock
-            }
-            (Self::DockRight, Self::Dock) | (Self::Dock, Self::DockRight) => Self::Dock,
-            (Self::DockContext, Self::Dock) | (Self::Dock, Self::DockContext) => Self::Dock,
-            (Self::DockContext, Self::Popup) | (Self::Popup, Self::DockContext) => Self::All,
-            (Self::DockRight, Self::Popup) | (Self::Popup, Self::DockRight) => Self::DockRightPopup,
-            (Self::DockRightPopup, Self::DockRightPopup)
-            | (Self::DockRightPopup, Self::DockRight)
-            | (Self::DockRight, Self::DockRightPopup)
-            | (Self::DockRightPopup, Self::Popup)
-            | (Self::Popup, Self::DockRightPopup) => Self::DockRightPopup,
-            (Self::Dock, Self::DockRightPopup)
-            | (Self::DockRightPopup, Self::Dock)
-            | (Self::DockContext, Self::DockRightPopup)
-            | (Self::DockRightPopup, Self::DockContext) => Self::All,
-            (Self::Dock, Self::Popup) | (Self::Popup, Self::Dock) => Self::All,
-            (Self::Dock, Self::Dock) => Self::Dock,
-            (Self::Popup, Self::Popup) => Self::Popup,
-            (Self::Notification, Self::Notification) => Self::Notification,
-            (Self::Notification, _) | (_, Self::Notification) => Self::All,
-        }
+        Self(self.0 | other.0)
+    }
+    fn contains(self, region: u16) -> bool {
+        self.0 & region != 0
+    }
+    fn includes_dock(self) -> bool {
+        self.contains(Self::DOCK)
+    }
+    fn is_full_dock(self) -> bool {
+        self.0 & Self::DOCK == Self::DOCK
+    }
+
+    pub fn debug_regions(self) -> String {
+        let regions = [
+            (Self::WORKSPACES, "WORKSPACES"),
+            (Self::CONTEXT, "CONTEXT"),
+            (Self::PLUGIN_ZONE, "PLUGIN_ZONE"),
+            (Self::TRAY, "TRAY"),
+            (Self::NETWORK, "NETWORK"),
+            (Self::BLUETOOTH, "BLUETOOTH"),
+            (Self::AUDIO, "AUDIO"),
+            (Self::DATETIME, "DATETIME"),
+            (Self::POPUP, "POPUP"),
+            (Self::NOTIFICATION, "NOTIFICATION"),
+        ];
+        let names = regions
+            .into_iter()
+            .filter_map(|(region, name)| self.contains(region).then_some(name))
+            .collect::<Vec<_>>();
+        format!("[{}]", names.join(","))
+    }
+}
+
+fn context_bounds(context: &view::ContextView, output: &OutputState) -> layout::MenuRect {
+    let left = context
+        .workspaces
+        .last()
+        .map(|rect| rect.x + rect.width as i16)
+        .unwrap_or(output.x);
+    let right = context
+        .plugins
+        .first()
+        .map(|item| item.rect.x)
+        .or_else(|| context.tray.first().map(|item| item.rect.x))
+        .or_else(|| context.network.as_ref().map(|item| item.rect.x))
+        .or_else(|| context.bluetooth.as_ref().map(|item| item.rect.x))
+        .or_else(|| context.audio.as_ref().map(|item| item.rect.x))
+        .unwrap_or(output.x + output.width as i16);
+    layout::MenuRect {
+        x: left,
+        y: output.y,
+        width: right.saturating_sub(left) as u16,
+        height: BAR_HEIGHT,
+    }
+}
+
+fn x11_rect(rect: layout::MenuRect, output: &OutputState) -> xproto::Rectangle {
+    xproto::Rectangle {
+        x: rect.x.saturating_sub(output.x),
+        y: rect.y.saturating_sub(output.y),
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+fn workspace_as_menu(rect: layout::WorkspaceRect) -> layout::MenuRect {
+    layout::MenuRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
     }
 }
 
@@ -276,6 +372,7 @@ impl X11Platform {
             notification: None,
             pointer_grabbed: false,
             bar_hits: Vec::new(),
+            previous_contexts: HashMap::new(),
         })
     }
     pub fn connection(&self) -> &XCBConnection {
@@ -773,6 +870,7 @@ impl X11Platform {
     }
     pub fn sync_windows(&mut self, outputs: &[OutputState]) -> Result<(), Box<dyn Error>> {
         self.close_popups(None)?;
+        self.previous_contexts.clear();
         for old in self.windows.drain(..) {
             self.text.release_drawable(old.window);
             self.conn.destroy_window(old.window)?.check()?;
@@ -886,20 +984,10 @@ impl X11Platform {
         Ok(())
     }
     pub fn render(&mut self, state: &State, target: RenderTarget) -> Result<(), Box<dyn Error>> {
-        if matches!(target, RenderTarget::Dock | RenderTarget::All) {
-            self.render_dock(state, false, false)?;
-        } else if target == RenderTarget::DockContext {
-            self.render_dock(state, true, false)?;
-        } else if matches!(
-            target,
-            RenderTarget::DockRight | RenderTarget::DockRightPopup
-        ) {
-            self.render_dock(state, true, true)?;
+        if target.includes_dock() {
+            self.render_dock(state, target)?;
         }
-        if matches!(
-            target,
-            RenderTarget::Popup | RenderTarget::DockRightPopup | RenderTarget::All
-        ) {
+        if target.contains(RenderTarget::POPUP) {
             self.reconcile_interactive_popup_surfaces(state)?;
             if !state.audio_popup_open && !state.bluetooth_popup_open && !state.network_popup_open {
                 self.render_popups(state)?;
@@ -920,7 +1008,7 @@ impl X11Platform {
                 self.render_audio_popup(state)?;
             }
         }
-        if matches!(target, RenderTarget::Notification | RenderTarget::All) {
+        if target.contains(RenderTarget::NOTIFICATION) {
             self.render_notification(state)?;
         }
         self.conn.flush()?;
@@ -1094,13 +1182,34 @@ impl X11Platform {
         Ok(())
     }
 
-    fn render_dock(
-        &mut self,
-        state: &State,
-        context_only: bool,
-        right_only: bool,
-    ) -> Result<(), Box<dyn Error>> {
+    fn render_dock(&mut self, state: &State, target: RenderTarget) -> Result<(), Box<dyn Error>> {
         self.bar_hits.clear();
+        let full = target.is_full_dock();
+        let draw_workspaces = full || target.contains(RenderTarget::WORKSPACES);
+        let draw_context = full || target.contains(RenderTarget::CONTEXT);
+        let draw_plugins = full || target.contains(RenderTarget::PLUGIN_ZONE);
+        let draw_tray = full || target.contains(RenderTarget::TRAY);
+        let draw_network = full || target.contains(RenderTarget::NETWORK);
+        let draw_bluetooth = full || target.contains(RenderTarget::BLUETOOTH);
+        let draw_audio = full || target.contains(RenderTarget::AUDIO);
+        let draw_datetime = full || target.contains(RenderTarget::DATETIME);
+        let trace = std::env::var_os("XBAR_TRACE").is_some();
+        if trace {
+            for (draw, name) in [
+                (draw_workspaces, "WORKSPACES"),
+                (draw_context, "CONTEXT"),
+                (draw_plugins, "PLUGIN_ZONE"),
+                (draw_tray, "TRAY"),
+                (draw_network, "NETWORK"),
+                (draw_bluetooth, "BLUETOOTH"),
+                (draw_audio, "AUDIO"),
+                (draw_datetime, "DATETIME"),
+            ] {
+                if draw {
+                    eprintln!("xbar trace: DRAW region={name}");
+                }
+            }
+        }
         for bar in &self.windows {
             let Some(output) = state.outputs.iter().find(|output| output.id == bar.output) else {
                 continue;
@@ -1117,18 +1226,7 @@ impl X11Platform {
                     &xproto::CreateGCAux::new().foreground(BAR_STYLE.background),
                 )?
                 .check()?;
-            if !context_only {
-                self.conn.poly_fill_rectangle(
-                    bar.window,
-                    gc,
-                    &[xproto::Rectangle {
-                        x: 0,
-                        y: 0,
-                        width: output.width,
-                        height: BAR_HEIGHT,
-                    }],
-                )?;
-            }
+            let previous_context = self.previous_contexts.get(&bar.window).cloned();
             let workspaces: Vec<_> = state
                 .workspaces
                 .iter()
@@ -1186,6 +1284,16 @@ impl X11Platform {
                 &state.plugin_zone.plugins,
                 &self.text,
             );
+            let old_context = previous_context.as_ref().unwrap_or(&context);
+            let draw_context = draw_context
+                || old_context.menu != context.menu
+                || old_context.app_name != context.app_name;
+            let draw_plugins = draw_plugins || old_context.plugins != context.plugins;
+            let draw_tray = draw_tray || old_context.tray != context.tray;
+            let draw_network = draw_network || old_context.network != context.network;
+            let draw_bluetooth = draw_bluetooth || old_context.bluetooth != context.bluetooth;
+            let draw_audio = draw_audio || old_context.audio != context.audio;
+            let draw_datetime = draw_datetime || old_context.datetime != context.datetime;
             self.bar_hits.push((
                 bar.window,
                 bar.output,
@@ -1197,6 +1305,78 @@ impl X11Platform {
                 context.audio.clone(),
                 context.bluetooth.clone(),
             ));
+            if full {
+                self.conn.poly_fill_rectangle(
+                    bar.window,
+                    gc,
+                    &[xproto::Rectangle {
+                        x: 0,
+                        y: 0,
+                        width: output.width,
+                        height: BAR_HEIGHT,
+                    }],
+                )?;
+            } else {
+                let old = old_context;
+                let mut clear: Vec<layout::MenuRect> = Vec::new();
+                if draw_workspaces {
+                    clear.extend(old.workspaces.iter().map(|rect| workspace_as_menu(*rect)));
+                    clear.extend(
+                        context
+                            .workspaces
+                            .iter()
+                            .map(|rect| workspace_as_menu(*rect)),
+                    );
+                }
+                if draw_context {
+                    clear.push(context_bounds(old, output));
+                    clear.push(context_bounds(&context, output));
+                }
+                if draw_plugins {
+                    clear.extend(old.plugins.iter().map(|item| item.rect));
+                    clear.extend(context.plugins.iter().map(|item| item.rect));
+                }
+                if draw_tray {
+                    clear.extend(old.tray.iter().map(|item| item.rect));
+                    clear.extend(context.tray.iter().map(|item| item.rect));
+                }
+                if draw_network {
+                    if let Some(item) = &old.network {
+                        clear.push(item.rect);
+                    }
+                    if let Some(item) = &context.network {
+                        clear.push(item.rect);
+                    }
+                }
+                if draw_bluetooth {
+                    if let Some(item) = &old.bluetooth {
+                        clear.push(item.rect);
+                    }
+                    if let Some(item) = &context.bluetooth {
+                        clear.push(item.rect);
+                    }
+                }
+                if draw_audio {
+                    if let Some(item) = &old.audio {
+                        clear.push(item.rect);
+                    }
+                    if let Some(item) = &context.audio {
+                        clear.push(item.rect);
+                    }
+                }
+                if draw_datetime {
+                    if let Some(item) = &old.datetime {
+                        clear.push(item.rect);
+                    }
+                    if let Some(item) = &context.datetime {
+                        clear.push(item.rect);
+                    }
+                }
+                for rect in clear {
+                    self.conn
+                        .poly_fill_rectangle(bar.window, gc, &[x11_rect(rect, output)])?;
+                }
+            }
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!(
                     "xbar trace: PLUGINZONE_VIEW items={}",
@@ -1216,64 +1396,12 @@ impl X11Platform {
                     output.name, context.workspaces, context.menu, context.bluetooth, context.audio, context.tray, context.datetime
                 );
             }
-            let rects = context.workspaces;
-            if context_only {
-                let left = if right_only {
-                    context
-                        .tray
-                        .first()
-                        .map(|tray| tray.rect.x)
-                        .or_else(|| context.network.as_ref().map(|network| network.rect.x))
-                        .or_else(|| context.audio.as_ref().map(|audio| audio.rect.x))
-                        .unwrap_or(output.x + output.width as i16)
-                } else {
-                    rects
-                        .first()
-                        .map(|rect| rect.x + rect.width as i16)
-                        .unwrap_or(output.x)
-                };
-                let right = if context_only && !right_only {
-                    context
-                        .plugins
-                        .first()
-                        .map(|plugin| plugin.rect.x)
-                        .or_else(|| context.tray.first().map(|tray| tray.rect.x))
-                        .or_else(|| context.network.as_ref().map(|network| network.rect.x))
-                        .or_else(|| context.audio.as_ref().map(|audio| audio.rect.x))
-                        .unwrap_or(output.x + output.width as i16)
-                } else {
-                    context
-                        .tray
-                        .first()
-                        .map(|tray| tray.rect.x)
-                        .or_else(|| context.network.as_ref().map(|network| network.rect.x))
-                        .or_else(|| context.audio.as_ref().map(|audio| audio.rect.x))
-                        .or_else(|| {
-                            context
-                                .datetime
-                                .as_ref()
-                                .map(|date| date.rect.x - crate::ui::layout::RIGHT_PADDING as i16)
-                        })
-                        .unwrap_or(output.x + output.width as i16)
-                };
-                if right > left {
-                    self.conn.poly_fill_rectangle(
-                        bar.window,
-                        gc,
-                        &[xproto::Rectangle {
-                            x: left - output.x,
-                            y: 0,
-                            width: (right - left) as u16,
-                            height: BAR_HEIGHT,
-                        }],
-                    )?;
-                }
-                if std::env::var_os("XBAR_TRACE").is_some() {
-                    eprintln!("xbar trace: CONTEXT_DRAW");
-                }
+            let rects = &context.workspaces;
+            if draw_context && std::env::var_os("XBAR_TRACE").is_some() {
+                eprintln!("xbar trace: CONTEXT_DRAW");
             }
             for (workspace, rect) in workspace_values.iter().zip(rects) {
-                if context_only {
+                if !draw_workspaces {
                     break;
                 }
                 let x = rect.x.saturating_sub(output.x).saturating_add(4);
@@ -1310,7 +1438,7 @@ impl X11Platform {
                 )?;
             }
             for item in &context.menu {
-                if right_only {
+                if !draw_context {
                     break;
                 }
                 let x = item.rect.x.saturating_sub(output.x).saturating_add(8);
@@ -1342,7 +1470,7 @@ impl X11Platform {
                     color,
                 )?;
             }
-            if !right_only {
+            if draw_context {
                 if let Some(title) = &context.app_name {
                     let x = title.rect.x.saturating_sub(output.x) as i32;
                     self.text.draw_utf8(
@@ -1353,52 +1481,58 @@ impl X11Platform {
                     )?;
                 }
             }
-            if !context_only || right_only {
-                if let Some(network) = &context.network {
-                    let width = self.text.measure_status_icon_width(&network.text);
-                    let x = network.rect.x.saturating_sub(output.x) as i32
-                        + (network.rect.width.saturating_sub(width) / 2) as i32;
-                    let metrics = self.text.status_icon_metrics();
-                    let baseline =
-                        ((BAR_HEIGHT as i16 - metrics.descent + metrics.ascent) / 2).max(1) as i32;
-                    self.text.draw_status_icon_utf8(
-                        &network.text,
-                        x,
-                        baseline,
-                        BAR_STYLE.foreground,
-                    )?;
+            if draw_network || draw_audio || draw_bluetooth {
+                if draw_network {
+                    if let Some(network) = &context.network {
+                        let width = self.text.measure_status_icon_width(&network.text);
+                        let x = network.rect.x.saturating_sub(output.x) as i32
+                            + (network.rect.width.saturating_sub(width) / 2) as i32;
+                        let metrics = self.text.status_icon_metrics();
+                        let baseline = ((BAR_HEIGHT as i16 - metrics.descent + metrics.ascent) / 2)
+                            .max(1) as i32;
+                        self.text.draw_status_icon_utf8(
+                            &network.text,
+                            x,
+                            baseline,
+                            BAR_STYLE.foreground,
+                        )?;
+                    }
                 }
-                if let Some(audio) = &context.audio {
-                    let width = self.text.measure_status_icon_width(&audio.text);
-                    let x = audio.rect.x.saturating_sub(output.x) as i32
-                        + (audio.rect.width.saturating_sub(width) / 2) as i32;
-                    let metrics = self.text.status_icon_metrics();
-                    let baseline =
-                        ((BAR_HEIGHT as i16 - metrics.descent + metrics.ascent) / 2).max(1) as i32;
-                    self.text.draw_status_icon_utf8(
-                        &audio.text,
-                        x,
-                        baseline,
-                        BAR_STYLE.foreground,
-                    )?;
+                if draw_audio {
+                    if let Some(audio) = &context.audio {
+                        let width = self.text.measure_status_icon_width(&audio.text);
+                        let x = audio.rect.x.saturating_sub(output.x) as i32
+                            + (audio.rect.width.saturating_sub(width) / 2) as i32;
+                        let metrics = self.text.status_icon_metrics();
+                        let baseline = ((BAR_HEIGHT as i16 - metrics.descent + metrics.ascent) / 2)
+                            .max(1) as i32;
+                        self.text.draw_status_icon_utf8(
+                            &audio.text,
+                            x,
+                            baseline,
+                            BAR_STYLE.foreground,
+                        )?;
+                    }
                 }
-                if let Some(bluetooth) = &context.bluetooth {
-                    let width = self.text.measure_status_icon_width(&bluetooth.text);
-                    let x = bluetooth.rect.x.saturating_sub(output.x) as i32
-                        + (bluetooth.rect.width.saturating_sub(width) / 2) as i32;
-                    let metrics = self.text.status_icon_metrics();
-                    let baseline =
-                        ((BAR_HEIGHT as i16 - metrics.descent + metrics.ascent) / 2).max(1) as i32;
-                    self.text.draw_status_icon_utf8(
-                        &bluetooth.text,
-                        x,
-                        baseline,
-                        BAR_STYLE.foreground,
-                    )?;
+                if draw_bluetooth {
+                    if let Some(bluetooth) = &context.bluetooth {
+                        let width = self.text.measure_status_icon_width(&bluetooth.text);
+                        let x = bluetooth.rect.x.saturating_sub(output.x) as i32
+                            + (bluetooth.rect.width.saturating_sub(width) / 2) as i32;
+                        let metrics = self.text.status_icon_metrics();
+                        let baseline = ((BAR_HEIGHT as i16 - metrics.descent + metrics.ascent) / 2)
+                            .max(1) as i32;
+                        self.text.draw_status_icon_utf8(
+                            &bluetooth.text,
+                            x,
+                            baseline,
+                            BAR_STYLE.foreground,
+                        )?;
+                    }
                 }
             }
             for tray in &context.tray {
-                if context_only && !right_only {
+                if !draw_tray {
                     continue;
                 }
                 let crate::core::StatusNotifierIcon::Pixmap {
@@ -1442,7 +1576,7 @@ impl X11Platform {
                 }
             }
             for plugin in &context.plugins {
-                if !draw_plugins(context_only, right_only) {
+                if !draw_plugins {
                     continue;
                 }
                 let x = plugin.rect.x.saturating_sub(output.x) as i32 + 6;
@@ -1453,29 +1587,38 @@ impl X11Platform {
                     BAR_STYLE.foreground,
                 )?;
             }
-            if std::env::var_os("XBAR_TRACE").is_some() && !context_only && !right_only {
+            if trace && draw_plugins {
                 eprintln!(
                     "xbar trace: PLUGINZONE_DRAW items={}",
                     context.plugins.len()
                 );
             }
-            if std::env::var_os("XBAR_TRACE").is_some() && (right_only || !context_only) {
-                eprintln!("xbar trace: RIGHT_STATUS_DRAW");
+            if trace {
+                for (draw, name) in [
+                    (draw_tray, "TRAY"),
+                    (draw_network, "NETWORK"),
+                    (draw_bluetooth, "BLUETOOTH"),
+                    (draw_audio, "AUDIO"),
+                    (draw_datetime, "DATETIME"),
+                ] {
+                    if draw {
+                        eprintln!("xbar trace: RIGHT_STATUS_DRAW region={name}");
+                    }
+                }
             }
             if let Some(datetime) = &context.datetime {
-                if context_only {
-                    self.conn.free_gc(gc)?.check()?;
-                    continue;
+                if draw_datetime {
+                    let x = datetime.rect.x.saturating_sub(output.x).saturating_add(8);
+                    self.text.draw_utf8(
+                        &datetime.text,
+                        x as i32,
+                        self.text.baseline(BAR_HEIGHT) as i32,
+                        BAR_STYLE.foreground,
+                    )?;
                 }
-                let x = datetime.rect.x.saturating_sub(output.x).saturating_add(8);
-                self.text.draw_utf8(
-                    &datetime.text,
-                    x as i32,
-                    self.text.baseline(BAR_HEIGHT) as i32,
-                    BAR_STYLE.foreground,
-                )?;
             }
             self.conn.free_gc(gc)?.check()?;
+            self.previous_contexts.insert(bar.window, context);
         }
         Ok(())
     }
@@ -2831,10 +2974,6 @@ impl X11Platform {
     }
 }
 
-fn draw_plugins(context_only: bool, right_only: bool) -> bool {
-    !context_only && !right_only
-}
-
 fn tray_hit(items: &[view::TrayVisualItem], x: i16, y: i16) -> Option<StatusNotifierEndpoint> {
     items
         .iter()
@@ -2871,7 +3010,7 @@ fn is_xbar_owned_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{draw_plugins, is_xbar_owned_window, tray_hit, RenderTarget};
+    use super::{is_xbar_owned_window, tray_hit, RenderTarget};
     use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
     use crate::ui::{layout::MenuRect, view::TrayVisualItem};
 
@@ -2885,10 +3024,7 @@ mod tests {
             RenderTarget::Dock.merge(RenderTarget::Dock),
             RenderTarget::Dock
         );
-        assert_eq!(
-            RenderTarget::Dock.merge(RenderTarget::Popup),
-            RenderTarget::All
-        );
+        assert_eq!(RenderTarget::Dock.merge(RenderTarget::Popup).0, 511);
         assert_eq!(
             RenderTarget::DockRight.merge(RenderTarget::Popup),
             RenderTarget::DockRightPopup
@@ -2904,23 +3040,120 @@ mod tests {
     }
 
     #[test]
-    fn focus_change_does_not_draw_pluginzone() {
-        assert!(!draw_plugins(true, false));
+    fn focus_change_does_not_touch_pluginzone() {
+        assert!(!RenderTarget::DockContext.contains(RenderTarget::PLUGIN_ZONE));
     }
 
     #[test]
-    fn global_menu_change_does_not_draw_pluginzone() {
-        assert!(!draw_plugins(true, false));
+    fn focus_change_does_not_touch_right_status() {
+        for region in [
+            RenderTarget::TRAY,
+            RenderTarget::NETWORK,
+            RenderTarget::BLUETOOTH,
+            RenderTarget::AUDIO,
+            RenderTarget::DATETIME,
+        ] {
+            assert!(!RenderTarget::DockContext.contains(region));
+        }
     }
 
     #[test]
-    fn plugin_visual_change_draws_pluginzone() {
-        assert!(draw_plugins(false, false));
+    fn global_menu_change_draws_only_global_menu() {
+        assert_eq!(RenderTarget::DockContext.0, RenderTarget::CONTEXT);
+        assert!(!RenderTarget::DockContext.contains(RenderTarget::PLUGIN_ZONE));
+        assert!(!RenderTarget::DockContext.contains(RenderTarget::WORKSPACES));
+    }
+
+    #[test]
+    fn workspace_change_draws_only_workspaces() {
+        assert_eq!(RenderTarget::Workspaces.0, RenderTarget::WORKSPACES);
+        assert!(!RenderTarget::Workspaces.contains(RenderTarget::CONTEXT));
+        assert!(!RenderTarget::Workspaces.contains(RenderTarget::PLUGIN_ZONE));
+    }
+
+    #[test]
+    fn plugin_visual_change_draws_only_pluginzone() {
+        assert_eq!(RenderTarget::PluginZone.0, RenderTarget::PLUGIN_ZONE);
+    }
+
+    #[test]
+    fn plugin_metadata_only_change_draws_nothing() {
+        assert_eq!(RenderTarget(0).0, 0);
     }
 
     #[test]
     fn plugin_geometry_change_draws_pluginzone() {
-        assert!(draw_plugins(false, false));
+        assert_eq!(RenderTarget::PluginZone.0, RenderTarget::PLUGIN_ZONE);
+    }
+
+    #[test]
+    fn tray_change_draws_only_tray() {
+        assert_eq!(RenderTarget::Tray.0, RenderTarget::TRAY);
+    }
+
+    #[test]
+    fn network_change_draws_only_network() {
+        assert_eq!(RenderTarget::Network.0, RenderTarget::NETWORK);
+    }
+
+    #[test]
+    fn bluetooth_change_draws_only_bluetooth() {
+        assert_eq!(RenderTarget::Bluetooth.0, RenderTarget::BLUETOOTH);
+    }
+
+    #[test]
+    fn audio_change_draws_only_audio() {
+        assert_eq!(RenderTarget::Audio.0, RenderTarget::AUDIO);
+    }
+
+    #[test]
+    fn datetime_change_draws_only_datetime() {
+        assert_eq!(RenderTarget::DateTime.0, RenderTarget::DATETIME);
+    }
+
+    #[test]
+    fn unrelated_region_change_does_not_touch_pluginzone() {
+        for target in [
+            RenderTarget::Workspaces,
+            RenderTarget::DockContext,
+            RenderTarget::Tray,
+            RenderTarget::Network,
+            RenderTarget::Bluetooth,
+            RenderTarget::Audio,
+            RenderTarget::DateTime,
+        ] {
+            assert!(!target.contains(RenderTarget::PLUGIN_ZONE));
+        }
+    }
+
+    #[test]
+    fn structural_full_redraw_still_draws_all_required_regions() {
+        assert!(RenderTarget::Dock.is_full_dock());
+        for region in [
+            RenderTarget::WORKSPACES,
+            RenderTarget::CONTEXT,
+            RenderTarget::PLUGIN_ZONE,
+            RenderTarget::TRAY,
+            RenderTarget::NETWORK,
+            RenderTarget::BLUETOOTH,
+            RenderTarget::AUDIO,
+            RenderTarget::DATETIME,
+        ] {
+            assert!(RenderTarget::Dock.contains(region));
+        }
+    }
+
+    #[test]
+    fn right_cluster_geometry_change_invalidates_only_affected_old_new_rects() {
+        let target = RenderTarget::DockRight;
+        assert!(target.contains(RenderTarget::PLUGIN_ZONE));
+        assert!(target.contains(RenderTarget::TRAY));
+        assert!(target.contains(RenderTarget::NETWORK));
+        assert!(target.contains(RenderTarget::BLUETOOTH));
+        assert!(target.contains(RenderTarget::AUDIO));
+        assert!(target.contains(RenderTarget::DATETIME));
+        assert!(!target.contains(RenderTarget::WORKSPACES));
+        assert!(!target.contains(RenderTarget::CONTEXT));
     }
 
     #[test]
