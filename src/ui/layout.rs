@@ -17,6 +17,64 @@ pub struct MenuRect {
     pub height: u16,
 }
 
+pub const AUDIO_POPUP_BORDER: u16 = 1;
+const AUDIO_DEVICE_ROW_HEIGHT: u16 = 24;
+
+/// Audio device rows use root coordinates, including the popup's one-pixel border.
+/// Both drawing and pointer lookup consume these same rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioDeviceRow {
+    pub name: String,
+    pub display_name: String,
+    pub rect: MenuRect,
+    baseline_offset: i16,
+}
+
+impl AudioDeviceRow {
+    pub fn label_position(&self, popup: MenuRect) -> (i32, i32) {
+        (
+            i32::from(self.rect.x) - i32::from(popup.x) - i32::from(AUDIO_POPUP_BORDER) + 8,
+            i32::from(self.rect.y) - i32::from(popup.y) - i32::from(AUDIO_POPUP_BORDER)
+                + i32::from(self.baseline_offset),
+        )
+    }
+
+    pub fn contains(&self, root_x: i16, root_y: i16) -> bool {
+        let x = i32::from(root_x) - i32::from(self.rect.x);
+        let y = i32::from(root_y) - i32::from(self.rect.y);
+        x >= 0 && x < i32::from(self.rect.width) && y >= 0 && y < i32::from(self.rect.height)
+    }
+}
+
+pub fn audio_device_rows<M: TextMeasurer>(
+    popup: MenuRect,
+    devices: &[crate::core::AudioDevice],
+    first_baseline: i16,
+    measurer: &M,
+) -> Vec<AudioDeviceRow> {
+    let baseline_offset = measurer.baseline(AUDIO_DEVICE_ROW_HEIGHT);
+    devices
+        .iter()
+        .take(8)
+        .enumerate()
+        .map(|(index, device)| AudioDeviceRow {
+            name: device.name.clone(),
+            display_name: device.display_name.clone(),
+            rect: MenuRect {
+                x: popup.x + AUDIO_POPUP_BORDER as i16 + 14,
+                y: popup.y
+                    + AUDIO_POPUP_BORDER as i16
+                    + first_baseline
+                    + index as i16 * AUDIO_DEVICE_ROW_HEIGHT as i16
+                    - baseline_offset,
+                width: popup.width.saturating_sub(28),
+                height: AUDIO_DEVICE_ROW_HEIGHT,
+            },
+            baseline_offset,
+        })
+        .collect()
+}
+
 pub const LEFT_PADDING: i32 = 8;
 pub const RIGHT_PADDING: i32 = 8;
 
@@ -378,6 +436,169 @@ pub fn allocate(output: &OutputState, workspaces: &[WorkspaceState]) -> Vec<Work
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AudioMeasurer(crate::ui::style::FontMetrics);
+
+    impl TextMeasurer for AudioMeasurer {
+        fn measure_width(&self, text: &str) -> u16 {
+            text.chars().count() as u16 * 10
+        }
+
+        fn metrics(&self) -> crate::ui::style::FontMetrics {
+            self.0
+        }
+    }
+
+    fn audio_fixture() -> (MenuRect, Vec<crate::core::AudioDevice>, AudioMeasurer) {
+        (
+            MenuRect {
+                x: 1580,
+                y: 26,
+                width: 340,
+                height: 404,
+            },
+            vec![
+                crate::core::AudioDevice {
+                    name: "sink.z".into(),
+                    display_name: "Headphones".into(),
+                },
+                crate::core::AudioDevice {
+                    name: "sink.a".into(),
+                    display_name: "Speaker".into(),
+                },
+            ],
+            AudioMeasurer(crate::ui::style::FontMetrics {
+                ascent: 16,
+                descent: 5,
+            }),
+        )
+    }
+
+    #[test]
+    fn audio_two_rendered_output_labels_hit_their_own_rows() {
+        let (popup, devices, measurer) = audio_fixture();
+        let rows = audio_device_rows(popup, &devices, 254, &measurer);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.name, devices[index].name);
+            assert_eq!(row.display_name, devices[index].display_name);
+            assert_eq!(row.label_position(popup), (22, 254 + index as i32 * 24));
+            assert_eq!(
+                row.rect,
+                MenuRect {
+                    x: 1595,
+                    y: 264 + index as i16 * 24,
+                    width: 312,
+                    height: 24,
+                }
+            );
+            let (label_x, baseline) = row.label_position(popup);
+            let root_x = popup.x + AUDIO_POPUP_BORDER as i16 + label_x as i16;
+            let root_baseline = popup.y + AUDIO_POPUP_BORDER as i16 + baseline as i16;
+            // Every vertical pixel in the rendered font box selects that label's ID.
+            for y in root_baseline - measurer.metrics().ascent
+                ..root_baseline + measurer.metrics().descent
+            {
+                let hits = rows
+                    .iter()
+                    .filter(|r| r.contains(root_x, y))
+                    .collect::<Vec<_>>();
+                assert_eq!(hits.len(), 1, "rendered row {index}, root y={y}");
+                assert_eq!(hits[0].name, devices[index].name);
+            }
+        }
+    }
+
+    #[test]
+    fn audio_output_boundaries_have_no_dead_gap_or_double_hit() {
+        let (popup, devices, measurer) = audio_fixture();
+        let rows = audio_device_rows(popup, &devices, 254, &measurer);
+        // Includes the physical trace's 265..279, 280..303 and 304..327 ranges.
+        for y in 263..=327 {
+            let hits = rows
+                .iter()
+                .filter(|r| r.contains(1610, y))
+                .collect::<Vec<_>>();
+            match y {
+                264..=287 => assert_eq!(hits, vec![&rows[0]], "y={y}"),
+                288..=311 => assert_eq!(hits, vec![&rows[1]], "y={y}"),
+                _ => assert!(hits.is_empty(), "y={y}"),
+            }
+        }
+        for row in &rows {
+            assert!(row.contains(row.rect.x, row.rect.y));
+            assert!(row.contains(row.rect.x + 311, row.rect.y + 23));
+            assert!(!row.contains(row.rect.x - 1, row.rect.y));
+            assert!(!row.contains(row.rect.x + 312, row.rect.y));
+            assert!(!row.contains(row.rect.x, row.rect.y + 24));
+        }
+    }
+
+    #[test]
+    fn audio_rows_preserve_inventory_order_and_visible_limit() {
+        let (popup, mut devices, measurer) = audio_fixture();
+        devices.reverse();
+        devices.extend((0..8).map(|i| crate::core::AudioDevice {
+            name: format!("sink.{i}"),
+            display_name: format!("Device {i}"),
+        }));
+        let rows = audio_device_rows(popup, &devices, 254, &measurer);
+        assert_eq!(rows.len(), 8);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.name, devices[index].name);
+            assert_eq!(row.display_name, devices[index].display_name);
+            assert_eq!(row.label_position(popup).1, 254 + index as i32 * 24);
+        }
+    }
+
+    #[test]
+    fn audio_row_draw_and_hit_share_origin_border_and_font_metrics() {
+        let (mut popup, devices, _) = audio_fixture();
+        for (x, y) in [(0, 0), (-800, -100), (1580, 26)] {
+            popup.x = x;
+            popup.y = y;
+            for (ascent, descent) in [(16, 5), (12, 4), (18, 6)] {
+                let measurer = AudioMeasurer(crate::ui::style::FontMetrics { ascent, descent });
+                let rows = audio_device_rows(popup, &devices, 254, &measurer);
+                for (index, row) in rows.iter().enumerate() {
+                    let (local_x, local_baseline) = row.label_position(popup);
+                    assert_eq!((local_x, local_baseline), (22, 254 + index as i32 * 24));
+                    let root_baseline = popup.y + 1 + local_baseline as i16;
+                    assert_eq!(row.rect.y + measurer.baseline(24), root_baseline);
+                    for ink_y in root_baseline - ascent..root_baseline + descent {
+                        assert!(row.contains(popup.x + 1 + local_x as i16, ink_y));
+                    }
+                }
+                assert_eq!(rows[0].rect.y + 24, rows[1].rect.y);
+            }
+        }
+    }
+
+    #[test]
+    fn audio_input_rows_keep_draw_baselines_and_hit_their_own_labels() {
+        let (popup, devices, measurer) = audio_fixture();
+        let input_header_baseline = 254 + 2 * 24;
+        let rows = audio_device_rows(popup, &devices, input_header_baseline + 22, &measurer);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.label_position(popup), (22, 324 + index as i32 * 24));
+            assert_eq!(row.rect.y, 334 + index as i16 * 24);
+            let label_y = popup.y + 1 + 324 + index as i16 * 24 - 8;
+            assert_eq!(
+                rows.iter()
+                    .find(|r| r.contains(1610, label_y))
+                    .unwrap()
+                    .name,
+                devices[index].name
+            );
+        }
+        assert!(!rows[0].contains(1610, popup.y + 1 + input_header_baseline));
+    }
+
+    #[test]
+    fn audio_empty_inventory_has_no_draw_or_hit_rows() {
+        let (popup, _, measurer) = audio_fixture();
+        assert!(audio_device_rows(popup, &[], 254, &measurer).is_empty());
+    }
+
     fn output() -> OutputState {
         OutputState {
             id: crate::core::OutputId(1),

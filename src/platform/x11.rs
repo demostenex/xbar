@@ -132,8 +132,8 @@ struct AudioPopupWindow {
     mute: layout::MenuRect,
     input_track: layout::MenuRect,
     input_mute: layout::MenuRect,
-    output_devices: Vec<(String, layout::MenuRect)>,
-    input_devices: Vec<(String, layout::MenuRect)>,
+    output_devices: Vec<layout::AudioDeviceRow>,
+    input_devices: Vec<layout::AudioDeviceRow>,
 }
 struct BluetoothPopupWindow {
     window: u32,
@@ -1739,43 +1739,20 @@ impl X11Platform {
             width: 46,
             height: 48,
         };
-        let output_devices = state
-            .audio
-            .outputs
-            .iter()
-            .take(8)
-            .enumerate()
-            .map(|(index, device)| {
-                (
-                    device.name.clone(),
-                    layout::MenuRect {
-                        x: rect.x + 14,
-                        y: rect.y + 254 + index as i16 * 24,
-                        width: rect.width - 28,
-                        height: 24,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let input_start = 278 + output_count as i16 * 24;
-        let input_devices = state
-            .audio
-            .inputs
-            .iter()
-            .take(8)
-            .enumerate()
-            .map(|(index, device)| {
-                (
-                    device.name.clone(),
-                    layout::MenuRect {
-                        x: rect.x + 14,
-                        y: rect.y + input_start + index as i16 * 24,
-                        width: rect.width - 28,
-                        height: 24,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
+        let output_label_y = 232_i32;
+        let input_label_y = output_label_y + 22 + output_count as i32 * 24;
+        let output_devices = layout::audio_device_rows(
+            rect,
+            &state.audio.outputs,
+            (output_label_y + 22) as i16,
+            &PopupMeasurer(&self.text),
+        );
+        let input_devices = layout::audio_device_rows(
+            rect,
+            &state.audio.inputs,
+            (input_label_y + 22) as i16,
+            &PopupMeasurer(&self.text),
+        );
         if std::env::var_os("XBAR_TRACE").is_some() {
             eprintln!("xbar trace: audio device layout outputs={output_devices:?} inputs={input_devices:?}");
         }
@@ -1793,7 +1770,7 @@ impl X11Platform {
                     rect.y,
                     rect.width,
                     rect.height,
-                    1,
+                    layout::AUDIO_POPUP_BORDER,
                     WindowClass::INPUT_OUTPUT,
                     x11rb::COPY_FROM_PARENT,
                     &xproto::CreateWindowAux::new()
@@ -1893,35 +1870,35 @@ impl X11Platform {
             52,
             BAR_STYLE.popup_foreground,
         )?;
-        let output_label_y = 232_i32;
         self.text
             .draw_popup_utf8("Saída", 14, output_label_y, BAR_STYLE.popup_foreground)?;
-        for (index, device) in state.audio.outputs.iter().take(8).enumerate() {
+        for device in &output_devices {
             let marker = if state.audio.default_output.as_deref() == Some(device.name.as_str()) {
                 "✓"
             } else {
                 " "
             };
+            let (x, y) = device.label_position(rect);
             self.text.draw_popup_utf8(
                 &format!("{marker} {}", device.display_name),
-                22,
-                output_label_y + 22 + index as i32 * 24,
+                x,
+                y,
                 BAR_STYLE.popup_foreground,
             )?;
         }
-        let input_label_y = output_label_y + 22 + output_count as i32 * 24;
         self.text
             .draw_popup_utf8("Entrada", 14, input_label_y, BAR_STYLE.popup_foreground)?;
-        for (index, device) in state.audio.inputs.iter().take(8).enumerate() {
+        for device in &input_devices {
             let marker = if state.audio.default_input.as_deref() == Some(device.name.as_str()) {
                 "✓"
             } else {
                 " "
             };
+            let (x, y) = device.label_position(rect);
             self.text.draw_popup_utf8(
                 &format!("{marker} {}", device.display_name),
-                22,
-                input_label_y + 22 + index as i32 * 24,
+                x,
+                y,
                 BAR_STYLE.popup_foreground,
             )?;
         }
@@ -2881,21 +2858,29 @@ impl X11Platform {
                 {
                     return HitTarget::AudioInputMute;
                 }
-                if let Some((name, _)) = popup.output_devices.iter().find(|(_, rect)| {
-                    root_x >= rect.x
-                        && root_x < rect.x + rect.width as i16
-                        && root_y >= rect.y
-                        && root_y < rect.y + rect.height as i16
-                }) {
-                    return HitTarget::AudioOutputDevice(name.clone());
+                // Window-local coordinates start inside the X11 border. The device
+                // layout uses true root coordinates, as do events from the root grab.
+                let (device_x, device_y) = if root_coordinates {
+                    (root_x, root_y)
+                } else {
+                    (
+                        root_x + layout::AUDIO_POPUP_BORDER as i16,
+                        root_y + layout::AUDIO_POPUP_BORDER as i16,
+                    )
+                };
+                if let Some(row) = popup
+                    .output_devices
+                    .iter()
+                    .find(|row| row.contains(device_x, device_y))
+                {
+                    return HitTarget::AudioOutputDevice(row.name.clone());
                 }
-                if let Some((name, _)) = popup.input_devices.iter().find(|(_, rect)| {
-                    root_x >= rect.x
-                        && root_x < rect.x + rect.width as i16
-                        && root_y >= rect.y
-                        && root_y < rect.y + rect.height as i16
-                }) {
-                    return HitTarget::AudioInputDevice(name.clone());
+                if let Some(row) = popup
+                    .input_devices
+                    .iter()
+                    .find(|row| row.contains(device_x, device_y))
+                {
+                    return HitTarget::AudioInputDevice(row.name.clone());
                 }
                 return HitTarget::AudioInside;
             }
