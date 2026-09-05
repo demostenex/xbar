@@ -18,7 +18,7 @@ use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as WrapperExt;
 use x11rb::xcb_ffi::XCBConnection;
 
-use super::surface::{select_argb_visual, SurfaceVisual, VisualCandidate};
+use super::surface::{select_argb_visual, DirectPixelFormat, SurfaceVisual, VisualCandidate};
 use super::x11_text::X11Text;
 
 fn trace_x11_resource(event: &str, role: &str, xid: u32) {
@@ -356,14 +356,14 @@ fn workspace_as_menu(rect: layout::WorkspaceRect) -> layout::MenuRect {
     }
 }
 
-fn render_alpha_mask(
+fn render_direct_format(
     formats: Option<&render::QueryPictFormatsReply>,
     screen: usize,
     visual: u32,
     depth: u8,
-) -> u16 {
+) -> Option<DirectPixelFormat> {
     let Some(formats) = formats else {
-        return 0;
+        return None;
     };
     let Some(visual_format) = formats.screens.get(screen).and_then(|screen| {
         screen
@@ -377,7 +377,7 @@ fn render_alpha_mask(
                     .find(|candidate| candidate.visual == visual)
             })
     }) else {
-        return 0;
+        return None;
     };
     formats
         .formats
@@ -387,8 +387,16 @@ fn render_alpha_mask(
                 && format.type_ == render::PictType::DIRECT
                 && format.depth == depth
         })
-        .map(|format| format.direct.alpha_mask)
-        .unwrap_or(0)
+        .map(|format| DirectPixelFormat {
+            red_shift: format.direct.red_shift,
+            red_mask: format.direct.red_mask,
+            green_shift: format.direct.green_shift,
+            green_mask: format.direct.green_mask,
+            blue_shift: format.direct.blue_shift,
+            blue_mask: format.direct.blue_mask,
+            alpha_shift: format.direct.alpha_shift,
+            alpha_mask: format.direct.alpha_mask,
+        })
 }
 
 impl X11Platform {
@@ -401,7 +409,7 @@ impl X11Platform {
         width: u16,
         height: u16,
         border_width: u16,
-        background: u32,
+        background: style::Rgba,
         event_mask: EventMask,
     ) -> Result<(), Box<dyn Error>> {
         self.conn
@@ -418,7 +426,7 @@ impl X11Platform {
                 surface.visual,
                 &xproto::CreateWindowAux::new()
                     .colormap(surface.colormap)
-                    .background_pixel(surface.opaque_pixel(background))
+                    .background_pixel(surface.background_pixel(background))
                     .event_mask(event_mask),
             )?
             .check()?;
@@ -474,17 +482,19 @@ impl X11Platform {
             .filter(|depth| depth.depth == 32)
         {
             for visual in &depth.visuals {
-                candidates.push(VisualCandidate {
-                    visual: visual.visual_id,
-                    depth: depth.depth,
-                    true_color: visual.class == xproto::VisualClass::TRUE_COLOR,
-                    alpha_mask: render_alpha_mask(
-                        render_formats.as_ref(),
-                        screen,
-                        visual.visual_id,
-                        depth.depth,
-                    ),
-                });
+                if let Some(pixel_format) = render_direct_format(
+                    render_formats.as_ref(),
+                    screen,
+                    visual.visual_id,
+                    depth.depth,
+                ) {
+                    candidates.push(VisualCandidate {
+                        visual: visual.visual_id,
+                        depth: depth.depth,
+                        true_color: visual.class == xproto::VisualClass::TRUE_COLOR,
+                        pixel_format,
+                    });
+                }
             }
         }
         let dock_surface = select_argb_visual(&candidates)
@@ -502,18 +512,20 @@ impl X11Platform {
                 Some(SurfaceVisual::argb(
                     candidate.visual,
                     colormap,
-                    candidate.alpha_mask,
+                    candidate.pixel_format,
                 ))
             })
             .unwrap_or(default_surface);
         if std::env::var_os("XBAR_TRACE").is_some() {
             eprintln!(
-                "xbar trace: dock surface kind={:?} visual=0x{:x} depth={} colormap=0x{:x} alpha_mask=0x{:x}",
+                "xbar trace: dock surface kind={:?} visual=0x{:x} depth={} colormap=0x{:x} alpha_mask=0x{:x} pixel_format={:?} background_pixel=0x{:x}",
                 dock_surface.kind,
                 dock_surface.visual,
                 dock_surface.depth,
                 dock_surface.colormap,
                 dock_surface.alpha_mask,
+                dock_surface.pixel_format,
+                dock_surface.background_pixel(BAR_STYLE.background),
             );
         }
         conn.change_window_attributes(
@@ -1115,15 +1127,20 @@ impl X11Platform {
                     &[self.atoms.above],
                 )?
                 .check()?;
-            self.conn
-                .change_property32(
-                    xproto::PropMode::REPLACE,
-                    window,
-                    self.atoms.net_wm_window_opacity,
-                    AtomEnum::CARDINAL,
-                    &[style::opacity_cardinal(BAR_STYLE.opacity)],
-                )?
-                .check()?;
+            if let Some(opacity) = self
+                .dock_surface
+                .window_opacity(BAR_STYLE.fallback_window_opacity)
+            {
+                self.conn
+                    .change_property32(
+                        xproto::PropMode::REPLACE,
+                        window,
+                        self.atoms.net_wm_window_opacity,
+                        AtomEnum::CARDINAL,
+                        &[style::opacity_cardinal(opacity)],
+                    )?
+                    .check()?;
+            }
             let end = output
                 .x
                 .saturating_add(output.width as i16)
@@ -1419,7 +1436,7 @@ impl X11Platform {
                     gc,
                     bar.window,
                     &xproto::CreateGCAux::new()
-                        .foreground(self.dock_surface.opaque_pixel(BAR_STYLE.background)),
+                        .foreground(self.dock_surface.background_pixel(BAR_STYLE.background)),
                 )?
                 .check()?;
             let previous_context = self.previous_contexts.get(&bar.window).cloned();
@@ -1603,16 +1620,13 @@ impl X11Platform {
                 let x = rect.x.saturating_sub(output.x).saturating_add(4);
                 let width = rect.width.saturating_sub(8).max(1);
                 let color = if workspace.focused {
-                    BAR_STYLE.workspace_background
+                    self.dock_surface
+                        .opaque_pixel(BAR_STYLE.workspace_background)
                 } else {
-                    BAR_STYLE.background
+                    self.dock_surface.background_pixel(BAR_STYLE.background)
                 };
                 self.conn
-                    .change_gc(
-                        gc,
-                        &xproto::ChangeGCAux::new()
-                            .foreground(self.dock_surface.opaque_pixel(color)),
-                    )?
+                    .change_gc(gc, &xproto::ChangeGCAux::new().foreground(color))?
                     .check()?;
                 self.conn.poly_fill_rectangle(
                     bar.window,

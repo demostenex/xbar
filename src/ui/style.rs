@@ -91,7 +91,7 @@ pub const TYPOGRAPHY: Typography = Typography {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BarStyle {
-    pub background: u32,
+    pub background: Rgba,
     pub foreground: u32,
     pub workspace_background: u32,
     pub workspace_foreground: u32,
@@ -100,13 +100,15 @@ pub struct BarStyle {
     pub menu_disabled_foreground: u32,
     pub popup_background: u32,
     pub popup_foreground: u32,
-    pub opacity: f32,
+    /// Legacy whole-window opacity used only by the default depth-24 fallback.
+    /// ARGB dock surfaces use the per-pixel alpha in `background` instead.
+    pub fallback_window_opacity: f32,
     pub horizontal_padding: u16,
     pub item_spacing: u16,
 }
 
 pub const BAR_STYLE: BarStyle = BarStyle {
-    background: 0x20242b,
+    background: DOCK_BACKGROUND,
     foreground: 0xe6eaf0,
     workspace_background: 0x3a4352,
     workspace_foreground: 0xffffff,
@@ -115,10 +117,46 @@ pub const BAR_STYLE: BarStyle = BarStyle {
     menu_disabled_foreground: 0x7b8492,
     popup_background: 0x20242b,
     popup_foreground: 0xe6eaf0,
-    opacity: 0.90,
+    fallback_window_opacity: 0.90,
     horizontal_padding: 8,
     item_spacing: 4,
 };
+
+/// Fixed dark material for the ARGB capability rollout. Later material work may
+/// replace this token, but every dock-background restoration uses this value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rgba {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+impl Rgba {
+    pub const fn new(red: u8, green: u8, blue: u8, alpha: u8) -> Self {
+        Self {
+            red,
+            green,
+            blue,
+            alpha,
+        }
+    }
+
+    pub const fn opaque_rgb(rgb: u32) -> Self {
+        Self::new(
+            ((rgb >> 16) & 0xff) as u8,
+            ((rgb >> 8) & 0xff) as u8,
+            (rgb & 0xff) as u8,
+            u8::MAX,
+        )
+    }
+
+    pub const fn rgb(self) -> u32 {
+        ((self.red as u32) << 16) | ((self.green as u32) << 8) | self.blue as u32
+    }
+}
+
+pub const DOCK_BACKGROUND: Rgba = Rgba::new(0x20, 0x24, 0x2b, 0xb8);
 
 pub const STATUS_ITEM_GAP: i16 = 6;
 
@@ -164,7 +202,17 @@ mod tests {
     fn opacity_uses_ewmh_cardinal_range() {
         assert_eq!(opacity_cardinal(1.0), u32::MAX);
         assert_eq!(opacity_cardinal(0.0), 0);
-        assert_eq!(opacity_cardinal(BAR_STYLE.opacity), 3_865_470_464);
+        assert_eq!(
+            opacity_cardinal(BAR_STYLE.fallback_window_opacity),
+            3_865_470_464
+        );
+    }
+
+    #[test]
+    fn dock_background_is_the_canonical_fractional_dark_material() {
+        assert_eq!(DOCK_BACKGROUND, Rgba::new(0x20, 0x24, 0x2b, 0xb8));
+        assert_eq!(BAR_STYLE.background, DOCK_BACKGROUND);
+        assert_eq!(BAR_STYLE.background.rgb(), 0x20_242b);
     }
 
     #[test]
