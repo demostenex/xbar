@@ -75,10 +75,12 @@ pub enum X11Event {
     Close,
 }
 pub struct X11Platform {
+    // X11Text must drop before the XCB connection: its XftDraw resources
+    // reference drawables owned by this connection.
+    text: X11Text,
     conn: XCBConnection,
     root: u32,
     atoms: Atoms,
-    text: X11Text,
     instance_window: Option<u32>,
     windows: Vec<BarWindow>,
     popups: Vec<PopupWindow>,
