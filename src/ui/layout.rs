@@ -739,6 +739,39 @@ mod tests {
         }
     }
 
+    struct WidthMeasurer(u16);
+
+    impl TextMeasurer for WidthMeasurer {
+        fn measure_width(&self, text: &str) -> u16 {
+            text.chars().count() as u16 * self.0
+        }
+
+        fn metrics(&self) -> crate::ui::style::FontMetrics {
+            crate::ui::style::FontMetrics {
+                ascent: 16,
+                descent: 5,
+            }
+        }
+    }
+
+    #[test]
+    fn popup_layout_tracks_changed_resolved_text_widths() {
+        let mut parent = popup_parent();
+        parent.children[0].label = Some("A deliberately wider popup label".into());
+        let anchor = MenuRect {
+            x: 120,
+            y: 20,
+            width: 80,
+            height: 26,
+        };
+        let narrow =
+            popup_layout_with_measurer(&output(), &parent, anchor, false, &WidthMeasurer(4));
+        let wide =
+            popup_layout_with_measurer(&output(), &parent, anchor, false, &WidthMeasurer(12));
+        assert!(wide.rect.width > narrow.rect.width);
+        assert!(wide.rect.width <= output().width);
+    }
+
     #[test]
     fn popup_is_below_anchor_and_hides_hidden_items() {
         let p = popup_layout(

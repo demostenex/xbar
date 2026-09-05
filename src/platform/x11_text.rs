@@ -6,10 +6,17 @@ use std::os::fd::RawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ui::style::{FontMetrics, TextMeasurer};
+use crate::ui::style::{FontMetrics, FontSpec, TextMeasurer, TypographyRole, TYPOGRAPHY};
 use x11::{xft, xlib, xrender};
 
 static XFT_DRAW_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn xft_font_name(spec: FontSpec) -> Result<CString, Box<dyn Error>> {
+    Ok(CString::new(format!(
+        "{}:style={}:size={}",
+        spec.family, spec.style, spec.size
+    ))?)
+}
 
 fn xft_trace_enabled() -> bool {
     std::env::var_os("XBAR_TRACE_XFT").is_some()
@@ -39,6 +46,7 @@ pub struct X11Text {
     status_icon_font: *mut xft::XftFont,
     draw: Option<DrawResource>,
     font_name: CString,
+    popup_font_name: CString,
     metrics: FontMetrics,
     popup_metrics: FontMetrics,
     status_icon_metrics: FontMetrics,
@@ -51,9 +59,9 @@ impl X11Text {
         if display.is_null() {
             return Err("XOpenDisplay failed".into());
         }
-        let font_name = CString::new("MesloLGS Nerd Font Mono:style=Bold:size=9")?;
-        let popup_font_name = CString::new("MesloLGS Nerd Font Mono:size=12")?;
-        let status_icon_font_name = CString::new("MesloLGS Nerd Font Mono:size=13")?;
+        let font_name = xft_font_name(TYPOGRAPHY.role(TypographyRole::BarText))?;
+        let popup_font_name = xft_font_name(TYPOGRAPHY.role(TypographyRole::PopupText))?;
+        let status_icon_font_name = xft_font_name(TYPOGRAPHY.role(TypographyRole::StatusIcon))?;
         let screen = unsafe { xlib::XDefaultScreen(display) };
         let bar_font = unsafe { xft::XftFontOpenName(display, screen, font_name.as_ptr()) };
         let popup_font = unsafe { xft::XftFontOpenName(display, screen, popup_font_name.as_ptr()) };
@@ -61,7 +69,7 @@ impl X11Text {
             unsafe { xft::XftFontOpenName(display, screen, status_icon_font_name.as_ptr()) };
         if bar_font.is_null() || popup_font.is_null() || status_icon_font.is_null() {
             unsafe { xlib::XCloseDisplay(display) };
-            return Err("XftFontOpenName failed for MesloLGS Nerd Font Mono".into());
+            return Err("XftFontOpenName failed for configured typography".into());
         }
         Ok(Self {
             display,
@@ -70,6 +78,7 @@ impl X11Text {
             status_icon_font,
             draw: None,
             font_name,
+            popup_font_name,
             metrics: FontMetrics {
                 ascent: unsafe { (*bar_font).ascent as i16 },
                 descent: unsafe { (*bar_font).descent as i16 },
@@ -95,7 +104,7 @@ impl X11Text {
     }
 
     pub fn popup_font_name(&self) -> &str {
-        "MesloLGS Nerd Font Mono:size=12"
+        self.popup_font_name.to_str().unwrap_or("unknown")
     }
 
     pub fn popup_metrics(&self) -> FontMetrics {
@@ -104,9 +113,6 @@ impl X11Text {
 
     pub fn status_icon_font_name(&self) -> &str {
         self.status_icon_font_name.to_str().unwrap_or("unknown")
-    }
-    pub fn status_icon_metrics(&self) -> FontMetrics {
-        self.status_icon_metrics
     }
     pub fn draw_status_icon_utf8(
         &self,
@@ -119,7 +125,11 @@ impl X11Text {
     }
 
     pub fn popup_baseline(&self, height: u16) -> i16 {
-        ((height as i16 - self.popup_metrics.descent + self.popup_metrics.ascent) / 2).max(1)
+        self.popup_metrics.centered_baseline(height)
+    }
+
+    pub fn status_icon_baseline(&self, height: u16) -> i16 {
+        self.status_icon_metrics.centered_baseline(height)
     }
 
     pub fn prepare_drawable(

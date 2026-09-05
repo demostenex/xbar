@@ -1561,9 +1561,7 @@ impl X11Platform {
                         let width = self.text.measure_status_icon_width(&network.text);
                         let x = network.rect.x.saturating_sub(output.x) as i32
                             + (network.rect.width.saturating_sub(width) / 2) as i32;
-                        let metrics = self.text.status_icon_metrics();
-                        let baseline = ((BAR_HEIGHT as i16 - metrics.descent + metrics.ascent) / 2)
-                            .max(1) as i32;
+                        let baseline = self.text.status_icon_baseline(BAR_HEIGHT) as i32;
                         self.text.draw_status_icon_utf8(
                             &network.text,
                             x,
@@ -1577,9 +1575,7 @@ impl X11Platform {
                         let width = self.text.measure_status_icon_width(&audio.text);
                         let x = audio.rect.x.saturating_sub(output.x) as i32
                             + (audio.rect.width.saturating_sub(width) / 2) as i32;
-                        let metrics = self.text.status_icon_metrics();
-                        let baseline = ((BAR_HEIGHT as i16 - metrics.descent + metrics.ascent) / 2)
-                            .max(1) as i32;
+                        let baseline = self.text.status_icon_baseline(BAR_HEIGHT) as i32;
                         self.text.draw_status_icon_utf8(
                             &audio.text,
                             x,
@@ -1593,9 +1589,7 @@ impl X11Platform {
                         let width = self.text.measure_status_icon_width(&bluetooth.text);
                         let x = bluetooth.rect.x.saturating_sub(output.x) as i32
                             + (bluetooth.rect.width.saturating_sub(width) / 2) as i32;
-                        let metrics = self.text.status_icon_metrics();
-                        let baseline = ((BAR_HEIGHT as i16 - metrics.descent + metrics.ascent) / 2)
-                            .max(1) as i32;
+                        let baseline = self.text.status_icon_baseline(BAR_HEIGHT) as i32;
                         self.text.draw_status_icon_utf8(
                             &bluetooth.text,
                             x,
