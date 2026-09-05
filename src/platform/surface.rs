@@ -31,7 +31,7 @@ pub(crate) struct DirectPixelFormat {
 
 impl DirectPixelFormat {
     fn pack_channel(value: u8, mask: u16, shift: u16) -> u32 {
-        (((value as u32 * mask as u32 + 127) / 255) << shift) as u32
+        ((value as u32 * mask as u32 + 127) / 255) << shift
     }
 
     pub(crate) fn pack(self, color: Rgba) -> u32 {
@@ -106,6 +106,7 @@ pub(crate) fn select_argb_visual(candidates: &[VisualCandidate]) -> Option<Visua
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::style::{GlassMaterial, GLASS_MATERIAL};
 
     const ARGB_8888: DirectPixelFormat = DirectPixelFormat {
         red_shift: 16,
@@ -186,14 +187,26 @@ mod tests {
     }
 
     #[test]
-    fn background_restoration_paths_share_one_canonical_native_pixel() {
+    fn dock_and_popup_background_restoration_share_one_canonical_native_pixel() {
         let surface = SurfaceVisual::argb(0x22, 0x33, ARGB_8888);
-        let initial_map = surface.background_pixel(Rgba::new(0x20, 0x24, 0x2b, 0xb8));
-        let full_redraw = surface.background_pixel(Rgba::new(0x20, 0x24, 0x2b, 0xb8));
-        let regional_redraw = surface.background_pixel(Rgba::new(0x20, 0x24, 0x2b, 0xb8));
+        let initial_map = surface.background_pixel(GLASS_MATERIAL.background);
+        let dock_regional_redraw = surface.background_pixel(GLASS_MATERIAL.background);
+        let popup_initial_map = surface.background_pixel(GLASS_MATERIAL.background);
+        let popup_repaint = surface.background_pixel(GLASS_MATERIAL.background);
 
-        assert_eq!(initial_map, full_redraw);
-        assert_eq!(full_redraw, regional_redraw);
+        assert_eq!(initial_map, dock_regional_redraw);
+        assert_eq!(dock_regional_redraw, popup_initial_map);
+        assert_eq!(popup_initial_map, popup_repaint);
+    }
+
+    #[test]
+    fn glass_popup_foreground_is_opaque_while_background_remains_fractional() {
+        let surface = SurfaceVisual::argb(0x22, 0x33, ARGB_8888);
+        let material: GlassMaterial = GLASS_MATERIAL;
+
+        assert_eq!(surface.background_pixel(material.background), 0xb820_242b,);
+        assert_eq!(surface.opaque_pixel(material.foreground), 0xffe6_eaf0,);
+        assert_eq!(surface.window_opacity(0.90), None);
     }
 
     #[test]
@@ -216,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn default_surface_leaves_existing_rgb_pixels_unchanged() {
+    fn default_popup_fallback_is_opaque_and_usable() {
         let surface = SurfaceVisual::default(0x21, 24, 0x31);
         assert_eq!(
             surface.background_pixel(Rgba::new(0x20, 0x24, 0x2b, 0xb8)),

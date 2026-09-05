@@ -83,7 +83,10 @@ pub struct X11Platform {
     conn: XCBConnection,
     root: u32,
     default_surface: SurfaceVisual,
-    dock_surface: SurfaceVisual,
+    // One platform-owned colormap is intentionally shared by every xbar-owned
+    // glass window using this visual. It is released only after all such
+    // windows and their Xft drawables are gone.
+    glass_surface: SurfaceVisual,
     atoms: Atoms,
     instance_window: Option<u32>,
     windows: Vec<BarWindow>,
@@ -362,10 +365,8 @@ fn render_direct_format(
     visual: u32,
     depth: u8,
 ) -> Option<DirectPixelFormat> {
-    let Some(formats) = formats else {
-        return None;
-    };
-    let Some(visual_format) = formats.screens.get(screen).and_then(|screen| {
+    let formats = formats?;
+    let visual_format = formats.screens.get(screen).and_then(|screen| {
         screen
             .depths
             .iter()
@@ -376,9 +377,7 @@ fn render_direct_format(
                     .iter()
                     .find(|candidate| candidate.visual == visual)
             })
-    }) else {
-        return None;
-    };
+    })?;
     formats
         .formats
         .iter()
@@ -399,37 +398,94 @@ fn render_direct_format(
         })
 }
 
+#[derive(Clone, Copy)]
+struct SurfaceWindowGeometry {
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    border_width: u16,
+}
+
 impl X11Platform {
     fn create_surface_window(
         &self,
         surface: SurfaceVisual,
         window: u32,
-        x: i16,
-        y: i16,
-        width: u16,
-        height: u16,
-        border_width: u16,
+        geometry: SurfaceWindowGeometry,
         background: style::Rgba,
-        event_mask: EventMask,
+        attributes: xproto::CreateWindowAux,
     ) -> Result<(), Box<dyn Error>> {
         self.conn
             .create_window(
                 surface.depth,
                 window,
                 self.root,
-                x,
-                y,
-                width,
-                height,
-                border_width,
+                geometry.x,
+                geometry.y,
+                geometry.width,
+                geometry.height,
+                geometry.border_width,
                 WindowClass::INPUT_OUTPUT,
                 surface.visual,
-                &xproto::CreateWindowAux::new()
+                &attributes
                     .colormap(surface.colormap)
-                    .background_pixel(surface.background_pixel(background))
-                    .event_mask(event_mask),
+                    .background_pixel(surface.background_pixel(background)),
             )?
             .check()?;
+        Ok(())
+    }
+
+    fn create_glass_popup_window(
+        &self,
+        window: u32,
+        rect: layout::MenuRect,
+        border_width: u16,
+        event_mask: EventMask,
+    ) -> Result<(), Box<dyn Error>> {
+        self.create_surface_window(
+            self.glass_surface,
+            window,
+            SurfaceWindowGeometry {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                border_width,
+            },
+            BAR_STYLE.material.background,
+            xproto::CreateWindowAux::new()
+                .override_redirect(1)
+                .event_mask(event_mask),
+        )
+    }
+
+    fn fill_glass_background(
+        &self,
+        window: u32,
+        gc: u32,
+        width: u16,
+        height: u16,
+    ) -> Result<(), Box<dyn Error>> {
+        self.conn
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new().foreground(
+                    self.glass_surface
+                        .background_pixel(BAR_STYLE.material.background),
+                ),
+            )?
+            .check()?;
+        self.conn.poly_fill_rectangle(
+            window,
+            gc,
+            &[xproto::Rectangle {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }],
+        )?;
         Ok(())
     }
 
@@ -497,7 +553,7 @@ impl X11Platform {
                 }
             }
         }
-        let dock_surface = select_argb_visual(&candidates)
+        let glass_surface = select_argb_visual(&candidates)
             .and_then(|candidate| {
                 let colormap = conn.generate_id().ok()?;
                 conn.create_colormap(
@@ -518,14 +574,14 @@ impl X11Platform {
             .unwrap_or(default_surface);
         if std::env::var_os("XBAR_TRACE").is_some() {
             eprintln!(
-                "xbar trace: dock surface kind={:?} visual=0x{:x} depth={} colormap=0x{:x} alpha_mask=0x{:x} pixel_format={:?} background_pixel=0x{:x}",
-                dock_surface.kind,
-                dock_surface.visual,
-                dock_surface.depth,
-                dock_surface.colormap,
-                dock_surface.alpha_mask,
-                dock_surface.pixel_format,
-                dock_surface.background_pixel(BAR_STYLE.background),
+                "xbar trace: glass surface kind={:?} visual=0x{:x} depth={} colormap=0x{:x} alpha_mask=0x{:x} pixel_format={:?} background_pixel=0x{:x}",
+                glass_surface.kind,
+                glass_surface.visual,
+                glass_surface.depth,
+                glass_surface.colormap,
+                glass_surface.alpha_mask,
+                glass_surface.pixel_format,
+                glass_surface.background_pixel(BAR_STYLE.material.background),
             );
         }
         conn.change_window_attributes(
@@ -545,7 +601,7 @@ impl X11Platform {
             conn,
             root,
             default_surface,
-            dock_surface,
+            glass_surface,
             atoms,
             text,
             instance_window: None,
@@ -1095,19 +1151,23 @@ impl X11Platform {
             let window = self.conn.generate_id()?;
             trace_x11_resource("WINDOW_CREATE", "bar", window);
             self.create_surface_window(
-                self.dock_surface,
+                self.glass_surface,
                 window,
-                output.x,
-                output.y,
-                output.width,
-                BAR_HEIGHT,
-                0,
-                BAR_STYLE.background,
-                EventMask::EXPOSURE
-                    | EventMask::BUTTON_PRESS
-                    | EventMask::POINTER_MOTION
-                    | EventMask::ENTER_WINDOW
-                    | EventMask::LEAVE_WINDOW,
+                SurfaceWindowGeometry {
+                    x: output.x,
+                    y: output.y,
+                    width: output.width,
+                    height: BAR_HEIGHT,
+                    border_width: 0,
+                },
+                BAR_STYLE.material.background,
+                xproto::CreateWindowAux::new().event_mask(
+                    EventMask::EXPOSURE
+                        | EventMask::BUTTON_PRESS
+                        | EventMask::POINTER_MOTION
+                        | EventMask::ENTER_WINDOW
+                        | EventMask::LEAVE_WINDOW,
+                ),
             )?;
             self.conn
                 .change_property32(
@@ -1128,7 +1188,7 @@ impl X11Platform {
                 )?
                 .check()?;
             if let Some(opacity) = self
-                .dock_surface
+                .glass_surface
                 .window_opacity(BAR_STYLE.fallback_window_opacity)
             {
                 self.conn
@@ -1318,7 +1378,7 @@ impl X11Platform {
                     WindowClass::INPUT_OUTPUT,
                     x11rb::COPY_FROM_PARENT,
                     &xproto::CreateWindowAux::new()
-                        .background_pixel(BAR_STYLE.popup_background)
+                        .background_pixel(BAR_STYLE.material.background.rgb())
                         .override_redirect(1)
                         .event_mask(EventMask::EXPOSURE),
                 )?
@@ -1363,7 +1423,7 @@ impl X11Platform {
             .create_gc(
                 gc,
                 window,
-                &xproto::CreateGCAux::new().foreground(BAR_STYLE.popup_background),
+                &xproto::CreateGCAux::new().foreground(BAR_STYLE.material.background.rgb()),
             )?
             .check()?;
         self.conn.poly_fill_rectangle(
@@ -1387,10 +1447,10 @@ impl X11Platform {
             }],
         )?;
         self.text
-            .draw_popup_utf8(&summary, 12, 25, BAR_STYLE.popup_foreground)?;
+            .draw_popup_utf8(&summary, 12, 25, BAR_STYLE.material.foreground)?;
         if !body.is_empty() {
             self.text
-                .draw_popup_utf8(&body, 12, 52, BAR_STYLE.popup_foreground)?;
+                .draw_popup_utf8(&body, 12, 52, BAR_STYLE.material.foreground)?;
         }
         self.conn.free_gc(gc)?.check()?;
         Ok(())
@@ -1429,14 +1489,16 @@ impl X11Platform {
                 continue;
             };
             self.text
-                .prepare_drawable("bar", bar.window, self.dock_surface)?;
+                .prepare_drawable("bar", bar.window, self.glass_surface)?;
             let gc = self.conn.generate_id()?;
             self.conn
                 .create_gc(
                     gc,
                     bar.window,
-                    &xproto::CreateGCAux::new()
-                        .foreground(self.dock_surface.background_pixel(BAR_STYLE.background)),
+                    &xproto::CreateGCAux::new().foreground(
+                        self.glass_surface
+                            .background_pixel(BAR_STYLE.material.background),
+                    ),
                 )?
                 .check()?;
             let previous_context = self.previous_contexts.get(&bar.window).cloned();
@@ -1620,10 +1682,11 @@ impl X11Platform {
                 let x = rect.x.saturating_sub(output.x).saturating_add(4);
                 let width = rect.width.saturating_sub(8).max(1);
                 let color = if workspace.focused {
-                    self.dock_surface
+                    self.glass_surface
                         .opaque_pixel(BAR_STYLE.workspace_background)
                 } else {
-                    self.dock_surface.background_pixel(BAR_STYLE.background)
+                    self.glass_surface
+                        .background_pixel(BAR_STYLE.material.background)
                 };
                 self.conn
                     .change_gc(gc, &xproto::ChangeGCAux::new().foreground(color))?
@@ -1642,7 +1705,7 @@ impl X11Platform {
                     .change_gc(
                         gc,
                         &xproto::ChangeGCAux::new().foreground(
-                            self.dock_surface
+                            self.glass_surface
                                 .opaque_pixel(BAR_STYLE.workspace_foreground),
                         ),
                     )?
@@ -1662,11 +1725,11 @@ impl X11Platform {
                 self.conn
                     .change_gc(
                         gc,
-                        &xproto::ChangeGCAux::new().foreground(self.dock_surface.opaque_pixel(
+                        &xproto::ChangeGCAux::new().foreground(self.glass_surface.opaque_pixel(
                             if state.menu_interaction.hovered_path.last() == Some(&item.id) {
                                 BAR_STYLE.menu_hover_foreground
                             } else if item.enabled {
-                                BAR_STYLE.foreground
+                                BAR_STYLE.material.foreground
                             } else {
                                 BAR_STYLE.menu_disabled_foreground
                             },
@@ -1676,7 +1739,7 @@ impl X11Platform {
                 let color = if state.menu_interaction.hovered_path.last() == Some(&item.id) {
                     BAR_STYLE.menu_hover_foreground
                 } else if item.enabled {
-                    BAR_STYLE.foreground
+                    BAR_STYLE.material.foreground
                 } else {
                     BAR_STYLE.menu_disabled_foreground
                 };
@@ -1694,7 +1757,7 @@ impl X11Platform {
                         &title.text,
                         x,
                         self.text.baseline(BAR_HEIGHT) as i32,
-                        BAR_STYLE.foreground,
+                        BAR_STYLE.material.foreground,
                     )?;
                 }
             }
@@ -1709,7 +1772,7 @@ impl X11Platform {
                             &network.text,
                             x,
                             baseline,
-                            BAR_STYLE.foreground,
+                            BAR_STYLE.material.foreground,
                         )?;
                     }
                 }
@@ -1723,7 +1786,7 @@ impl X11Platform {
                             &audio.text,
                             x,
                             baseline,
-                            BAR_STYLE.foreground,
+                            BAR_STYLE.material.foreground,
                         )?;
                     }
                 }
@@ -1737,7 +1800,7 @@ impl X11Platform {
                             &bluetooth.text,
                             x,
                             baseline,
-                            BAR_STYLE.foreground,
+                            BAR_STYLE.material.foreground,
                         )?;
                     }
                 }
@@ -1771,7 +1834,7 @@ impl X11Platform {
                             .change_gc(
                                 gc,
                                 &xproto::ChangeGCAux::new().foreground(
-                                    self.dock_surface.opaque_pixel(pixel & 0x00ff_ffff),
+                                    self.glass_surface.opaque_pixel(pixel & 0x00ff_ffff),
                                 ),
                             )?
                             .check()?;
@@ -1797,7 +1860,7 @@ impl X11Platform {
                     &plugin.text,
                     x,
                     self.text.baseline(BAR_HEIGHT) as i32,
-                    BAR_STYLE.foreground,
+                    BAR_STYLE.material.foreground,
                 )?;
             }
             if trace && draw_plugins {
@@ -1826,7 +1889,7 @@ impl X11Platform {
                         &datetime.text,
                         x as i32,
                         self.text.baseline(BAR_HEIGHT) as i32,
-                        BAR_STYLE.foreground,
+                        BAR_STYLE.material.foreground,
                     )?;
                 }
             }
@@ -1955,29 +2018,15 @@ impl X11Platform {
         } else {
             let window = self.conn.generate_id()?;
             trace_x11_resource("WINDOW_CREATE", "audio-popup", window);
-            self.conn
-                .create_window(
-                    x11rb::COPY_FROM_PARENT as u8,
-                    window,
-                    self.root,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    layout::AUDIO_POPUP_BORDER,
-                    WindowClass::INPUT_OUTPUT,
-                    x11rb::COPY_FROM_PARENT,
-                    &xproto::CreateWindowAux::new()
-                        .background_pixel(BAR_STYLE.popup_background)
-                        .override_redirect(1)
-                        .event_mask(
-                            EventMask::EXPOSURE
-                                | EventMask::BUTTON_PRESS
-                                | EventMask::BUTTON_RELEASE
-                                | EventMask::POINTER_MOTION,
-                        ),
-                )?
-                .check()?;
+            self.create_glass_popup_window(
+                window,
+                rect,
+                layout::AUDIO_POPUP_BORDER,
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE
+                    | EventMask::POINTER_MOTION,
+            )?;
             self.conn.map_window(window)?.check()?;
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!(
@@ -2021,25 +2070,28 @@ impl X11Platform {
                 .check()?;
         }
         self.text
-            .prepare_drawable("audio-popup", window, self.default_surface)?;
+            .prepare_drawable("audio-popup", window, self.glass_surface)?;
         let gc = self.conn.generate_id()?;
         self.conn
             .create_gc(
                 gc,
                 window,
-                &xproto::CreateGCAux::new().foreground(BAR_STYLE.popup_background),
+                &xproto::CreateGCAux::new().foreground(
+                    self.glass_surface
+                        .background_pixel(BAR_STYLE.material.background),
+                ),
             )?
             .check()?;
-        self.conn.poly_fill_rectangle(
-            window,
-            gc,
-            &[xproto::Rectangle {
-                x: 0,
-                y: 0,
-                width: rect.width,
-                height: rect.height,
-            }],
-        )?;
+        self.fill_glass_background(window, gc, rect.width, rect.height)?;
+        self.conn
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new().foreground(
+                    self.glass_surface
+                        .opaque_pixel(BAR_STYLE.material.foreground),
+                ),
+            )?
+            .check()?;
         self.conn.poly_rectangle(
             window,
             gc,
@@ -2051,7 +2103,7 @@ impl X11Platform {
             }],
         )?;
         self.text
-            .draw_popup_utf8("Som", 14, 26, BAR_STYLE.popup_foreground)?;
+            .draw_popup_utf8("Som", 14, 26, BAR_STYLE.material.foreground)?;
         self.text.draw_popup_utf8(
             &format!(
                 "{}   {}%",
@@ -2060,10 +2112,10 @@ impl X11Platform {
             ),
             14,
             52,
-            BAR_STYLE.popup_foreground,
+            BAR_STYLE.material.foreground,
         )?;
         self.text
-            .draw_popup_utf8("Saída", 14, output_label_y, BAR_STYLE.popup_foreground)?;
+            .draw_popup_utf8("Saída", 14, output_label_y, BAR_STYLE.material.foreground)?;
         for device in &output_devices {
             let marker = if state.audio.default_output.as_deref() == Some(device.name.as_str()) {
                 "✓"
@@ -2075,11 +2127,11 @@ impl X11Platform {
                 &format!("{marker} {}", device.display_name),
                 x,
                 y,
-                BAR_STYLE.popup_foreground,
+                BAR_STYLE.material.foreground,
             )?;
         }
         self.text
-            .draw_popup_utf8("Entrada", 14, input_label_y, BAR_STYLE.popup_foreground)?;
+            .draw_popup_utf8("Entrada", 14, input_label_y, BAR_STYLE.material.foreground)?;
         for device in &input_devices {
             let marker = if state.audio.default_input.as_deref() == Some(device.name.as_str()) {
                 "✓"
@@ -2091,14 +2143,14 @@ impl X11Platform {
                 &format!("{marker} {}", device.display_name),
                 x,
                 y,
-                BAR_STYLE.popup_foreground,
+                BAR_STYLE.material.foreground,
             )?;
         }
         self.draw_audio_slider(window, gc, track, state.audio.volume_percent)?;
         self.text
-            .draw_popup_utf8("Mudo", 14, 94, BAR_STYLE.popup_foreground)?;
+            .draw_popup_utf8("Mudo", 14, 94, BAR_STYLE.material.foreground)?;
         self.text
-            .draw_popup_utf8("Microfone", 14, 122, BAR_STYLE.popup_foreground)?;
+            .draw_popup_utf8("Microfone", 14, 122, BAR_STYLE.material.foreground)?;
         self.text.draw_popup_utf8(
             &format!(
                 "{}   {}%",
@@ -2107,11 +2159,11 @@ impl X11Platform {
             ),
             14,
             148,
-            BAR_STYLE.popup_foreground,
+            BAR_STYLE.material.foreground,
         )?;
         self.draw_audio_slider(window, gc, input_track, state.audio.input_volume_percent)?;
         self.text
-            .draw_popup_utf8("Mudo", 14, 204, BAR_STYLE.popup_foreground)?;
+            .draw_popup_utf8("Mudo", 14, 204, BAR_STYLE.material.foreground)?;
         self.conn.free_gc(gc)?.check()?;
         if !self.pointer_grabbed {
             let grab = self
@@ -2187,28 +2239,12 @@ impl X11Platform {
         } else {
             let w = self.conn.generate_id()?;
             trace_x11_resource("WINDOW_CREATE", "bluetooth-popup", w);
-            self.conn
-                .create_window(
-                    x11rb::COPY_FROM_PARENT as u8,
-                    w,
-                    self.root,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    1,
-                    WindowClass::INPUT_OUTPUT,
-                    x11rb::COPY_FROM_PARENT,
-                    &xproto::CreateWindowAux::new()
-                        .background_pixel(BAR_STYLE.popup_background)
-                        .override_redirect(1)
-                        .event_mask(
-                            EventMask::EXPOSURE
-                                | EventMask::BUTTON_PRESS
-                                | EventMask::POINTER_MOTION,
-                        ),
-                )?
-                .check()?;
+            self.create_glass_popup_window(
+                w,
+                rect,
+                1,
+                EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION,
+            )?;
             self.conn.map_window(w)?.check()?;
             w
         };
@@ -2235,13 +2271,26 @@ impl X11Platform {
                 .check()?;
         }
         self.text
-            .prepare_drawable("bluetooth-popup", window, self.default_surface)?;
+            .prepare_drawable("bluetooth-popup", window, self.glass_surface)?;
         let gc = self.conn.generate_id()?;
         self.conn
             .create_gc(
                 gc,
                 window,
-                &xproto::CreateGCAux::new().foreground(BAR_STYLE.popup_foreground),
+                &xproto::CreateGCAux::new().foreground(
+                    self.glass_surface
+                        .background_pixel(BAR_STYLE.material.background),
+                ),
+            )?
+            .check()?;
+        self.fill_glass_background(window, gc, rect.width, rect.height)?;
+        self.conn
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new().foreground(
+                    self.glass_surface
+                        .opaque_pixel(BAR_STYLE.material.foreground),
+                ),
             )?
             .check()?;
         self.conn
@@ -2272,10 +2321,10 @@ impl X11Platform {
             &format!("Bluetooth                 {power_label}"),
             12,
             25,
-            BAR_STYLE.popup_foreground,
+            BAR_STYLE.material.foreground,
         )?;
         self.text
-            .draw_popup_utf8("Dispositivos", 12, 50, BAR_STYLE.popup_foreground)?;
+            .draw_popup_utf8("Dispositivos", 12, 50, BAR_STYLE.material.foreground)?;
         for (i, d) in devices.iter().enumerate() {
             let name = if !d.alias.is_empty() {
                 &d.alias
@@ -2304,7 +2353,7 @@ impl X11Platform {
                 &format!("{marker} {name:<20} {status}"),
                 14,
                 78 + i as i32 * 30,
-                BAR_STYLE.popup_foreground,
+                BAR_STYLE.material.foreground,
             )?;
         }
         self.conn.free_gc(gc)?.check()?;
@@ -2394,28 +2443,12 @@ impl X11Platform {
         } else {
             let window = self.conn.generate_id()?;
             trace_x11_resource("WINDOW_CREATE", "network-popup", window);
-            self.conn
-                .create_window(
-                    x11rb::COPY_FROM_PARENT as u8,
-                    window,
-                    self.root,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    1,
-                    WindowClass::INPUT_OUTPUT,
-                    x11rb::COPY_FROM_PARENT,
-                    &xproto::CreateWindowAux::new()
-                        .background_pixel(BAR_STYLE.popup_background)
-                        .override_redirect(1)
-                        .event_mask(
-                            EventMask::EXPOSURE
-                                | EventMask::BUTTON_PRESS
-                                | EventMask::POINTER_MOTION,
-                        ),
-                )?
-                .check()?;
+            self.create_glass_popup_window(
+                window,
+                rect,
+                1,
+                EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION,
+            )?;
             self.conn.map_window(window)?.check()?;
             window
         };
@@ -2442,13 +2475,26 @@ impl X11Platform {
                 .check()?;
         }
         self.text
-            .prepare_drawable("network-popup", window, self.default_surface)?;
+            .prepare_drawable("network-popup", window, self.glass_surface)?;
         let gc = self.conn.generate_id()?;
         self.conn
             .create_gc(
                 gc,
                 window,
-                &xproto::CreateGCAux::new().foreground(BAR_STYLE.popup_foreground),
+                &xproto::CreateGCAux::new().foreground(
+                    self.glass_surface
+                        .background_pixel(BAR_STYLE.material.background),
+                ),
+            )?
+            .check()?;
+        self.fill_glass_background(window, gc, rect.width, rect.height)?;
+        self.conn
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new().foreground(
+                    self.glass_surface
+                        .opaque_pixel(BAR_STYLE.material.foreground),
+                ),
             )?
             .check()?;
         self.conn
@@ -2485,7 +2531,7 @@ impl X11Platform {
             &format!("Wi-Fi                         {wireless_label}"),
             12,
             25,
-            BAR_STYLE.popup_foreground,
+            BAR_STYLE.material.foreground,
         )?;
         self.text.draw_popup_utf8(
             &if state.network.link_kind == crate::core::NetworkLinkKind::Ethernet {
@@ -2500,10 +2546,10 @@ impl X11Platform {
             },
             12,
             50,
-            BAR_STYLE.popup_foreground,
+            BAR_STYLE.material.foreground,
         )?;
         self.text
-            .draw_popup_utf8("Redes disponíveis", 12, 74, BAR_STYLE.popup_foreground)?;
+            .draw_popup_utf8("Redes disponíveis", 12, 74, BAR_STYLE.material.foreground)?;
         for (interface, driver, device_state, active, index) in headers {
             self.text.draw_popup_utf8(
                 &format!(
@@ -2515,7 +2561,7 @@ impl X11Platform {
                 ),
                 14,
                 98 + index as i32 * 24,
-                BAR_STYLE.popup_foreground,
+                BAR_STYLE.material.foreground,
             )?;
             self.text.draw_popup_utf8(
                 &format!(
@@ -2527,7 +2573,7 @@ impl X11Platform {
                 ),
                 14,
                 98 + (index as i32 + 1) * 24,
-                BAR_STYLE.popup_foreground,
+                BAR_STYLE.material.foreground,
             )?;
         }
         for (target, row) in &rows {
@@ -2555,7 +2601,7 @@ impl X11Platform {
                 ),
                 14,
                 (row.y - rect.y + 16) as i32,
-                BAR_STYLE.popup_foreground,
+                BAR_STYLE.material.foreground,
             )?;
         }
         self.conn.free_gc(gc)?.check()?;
@@ -2589,7 +2635,10 @@ impl X11Platform {
         let y = hit.y - self.audio_popup.as_ref().map_or(hit.y, |p| p.rect.y) + 9;
         let width = hit.width as i16;
         self.conn
-            .change_gc(gc, &xproto::ChangeGCAux::new().foreground(0x596273))?
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new().foreground(self.glass_surface.opaque_pixel(0x596273)),
+            )?
             .check()?;
         self.conn.poly_fill_rectangle(
             window,
@@ -2604,7 +2653,10 @@ impl X11Platform {
         self.conn
             .change_gc(
                 gc,
-                &xproto::ChangeGCAux::new().foreground(BAR_STYLE.menu_hover_foreground),
+                &xproto::ChangeGCAux::new().foreground(
+                    self.glass_surface
+                        .opaque_pixel(BAR_STYLE.menu_hover_foreground),
+                ),
             )?
             .check()?;
         let fill = (width as u32 * percent.min(100) / 100) as u16;
@@ -2747,40 +2799,44 @@ impl X11Platform {
                         .check()?;
                 }
             } else {
-                self.conn
-                    .create_window(
-                        x11rb::COPY_FROM_PARENT as u8,
-                        window,
-                        self.root,
-                        popup_layout.rect.x,
-                        popup_layout.rect.y,
-                        popup_layout.rect.width,
-                        popup_layout.rect.height,
-                        1,
-                        WindowClass::INPUT_OUTPUT,
-                        x11rb::COPY_FROM_PARENT,
-                        &xproto::CreateWindowAux::new()
-                            .background_pixel(BAR_STYLE.popup_background)
-                            .override_redirect(1)
-                            .event_mask(
-                                EventMask::EXPOSURE
-                                    | EventMask::BUTTON_PRESS
-                                    | EventMask::POINTER_MOTION
-                                    | EventMask::ENTER_WINDOW
-                                    | EventMask::LEAVE_WINDOW,
-                            ),
-                    )?
-                    .check()?;
+                self.create_glass_popup_window(
+                    window,
+                    popup_layout.rect,
+                    1,
+                    EventMask::EXPOSURE
+                        | EventMask::BUTTON_PRESS
+                        | EventMask::POINTER_MOTION
+                        | EventMask::ENTER_WINDOW
+                        | EventMask::LEAVE_WINDOW,
+                )?;
                 self.conn.map_window(window)?.check()?;
             }
             self.text
-                .prepare_drawable("menu-popup", window, self.default_surface)?;
+                .prepare_drawable("menu-popup", window, self.glass_surface)?;
             let gc = self.conn.generate_id()?;
             self.conn
                 .create_gc(
                     gc,
                     window,
-                    &xproto::CreateGCAux::new().foreground(BAR_STYLE.popup_foreground),
+                    &xproto::CreateGCAux::new().foreground(
+                        self.glass_surface
+                            .background_pixel(BAR_STYLE.material.background),
+                    ),
+                )?
+                .check()?;
+            self.fill_glass_background(
+                window,
+                gc,
+                popup_layout.rect.width,
+                popup_layout.rect.height,
+            )?;
+            self.conn
+                .change_gc(
+                    gc,
+                    &xproto::ChangeGCAux::new().foreground(
+                        self.glass_surface
+                            .opaque_pixel(BAR_STYLE.material.foreground),
+                    ),
                 )?
                 .check()?;
             self.conn
@@ -2814,7 +2870,10 @@ impl X11Platform {
                     self.conn
                         .change_gc(
                             gc,
-                            &xproto::ChangeGCAux::new().foreground(BAR_STYLE.menu_hover_background),
+                            &xproto::ChangeGCAux::new().foreground(
+                                self.glass_surface
+                                    .opaque_pixel(BAR_STYLE.menu_hover_background),
+                            ),
                         )?
                         .check()?;
                     self.conn.poly_fill_rectangle(
@@ -2830,17 +2889,24 @@ impl X11Platform {
                     self.conn
                         .change_gc(
                             gc,
-                            &xproto::ChangeGCAux::new().foreground(BAR_STYLE.menu_hover_foreground),
+                            &xproto::ChangeGCAux::new().foreground(
+                                self.glass_surface
+                                    .opaque_pixel(BAR_STYLE.menu_hover_foreground),
+                            ),
                         )?
                         .check()?;
                 }
                 let color = if item.enabled {
-                    BAR_STYLE.popup_foreground
+                    BAR_STYLE.material.foreground
                 } else {
                     BAR_STYLE.menu_disabled_foreground
                 };
                 self.conn
-                    .change_gc(gc, &xproto::ChangeGCAux::new().foreground(color))?
+                    .change_gc(
+                        gc,
+                        &xproto::ChangeGCAux::new()
+                            .foreground(self.glass_surface.opaque_pixel(color)),
+                    )?
                     .check()?;
                 self.text.draw_popup_utf8(
                     &item.label,
@@ -3197,7 +3263,7 @@ impl Drop for X11Platform {
         for bar in self.windows.drain(..) {
             let _ = self.conn.destroy_window(bar.window);
         }
-        if let Some(colormap) = self.dock_surface.owned_colormap {
+        if let Some(colormap) = self.glass_surface.owned_colormap {
             let _ = self.conn.free_colormap(colormap);
         }
         let _ = self.conn.flush();

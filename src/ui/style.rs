@@ -91,15 +91,12 @@ pub const TYPOGRAPHY: Typography = Typography {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BarStyle {
-    pub background: Rgba,
-    pub foreground: u32,
+    pub material: GlassMaterial,
     pub workspace_background: u32,
     pub workspace_foreground: u32,
     pub menu_hover_background: u32,
     pub menu_hover_foreground: u32,
     pub menu_disabled_foreground: u32,
-    pub popup_background: u32,
-    pub popup_foreground: u32,
     /// Legacy whole-window opacity used only by the default depth-24 fallback.
     /// ARGB dock surfaces use the per-pixel alpha in `background` instead.
     pub fallback_window_opacity: f32,
@@ -108,15 +105,12 @@ pub struct BarStyle {
 }
 
 pub const BAR_STYLE: BarStyle = BarStyle {
-    background: DOCK_BACKGROUND,
-    foreground: 0xe6eaf0,
+    material: GLASS_MATERIAL,
     workspace_background: 0x3a4352,
     workspace_foreground: 0xffffff,
     menu_hover_background: 0x4b5568,
     menu_hover_foreground: 0xffffff,
     menu_disabled_foreground: 0x7b8492,
-    popup_background: 0x20242b,
-    popup_foreground: 0xe6eaf0,
     fallback_window_opacity: 0.90,
     horizontal_padding: 8,
     item_spacing: 4,
@@ -157,6 +151,19 @@ impl Rgba {
 }
 
 pub const DOCK_BACKGROUND: Rgba = Rgba::new(0x20, 0x24, 0x2b, 0xb8);
+
+/// Shared visual material for normal xbar glass surfaces. The alpha is
+/// provisional while blur and future material tuning remain pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlassMaterial {
+    pub background: Rgba,
+    pub foreground: u32,
+}
+
+pub const GLASS_MATERIAL: GlassMaterial = GlassMaterial {
+    background: DOCK_BACKGROUND,
+    foreground: 0xe6eaf0,
+};
 
 pub const STATUS_ITEM_GAP: i16 = 6;
 
@@ -211,8 +218,15 @@ mod tests {
     #[test]
     fn dock_background_is_the_canonical_fractional_dark_material() {
         assert_eq!(DOCK_BACKGROUND, Rgba::new(0x20, 0x24, 0x2b, 0xb8));
-        assert_eq!(BAR_STYLE.background, DOCK_BACKGROUND);
-        assert_eq!(BAR_STYLE.background.rgb(), 0x20_242b);
+        assert_eq!(GLASS_MATERIAL.background, DOCK_BACKGROUND);
+        assert_eq!(BAR_STYLE.material, GLASS_MATERIAL);
+        assert_eq!(BAR_STYLE.material.background.rgb(), 0x20_242b);
+    }
+
+    #[test]
+    fn bar_and_popups_resolve_the_same_glass_material() {
+        assert_eq!(BAR_STYLE.material.background, GLASS_MATERIAL.background);
+        assert_eq!(BAR_STYLE.material.foreground, GLASS_MATERIAL.foreground);
     }
 
     #[test]
