@@ -5,7 +5,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::discovery::{AgentInstance, AgentKind, DiscoveryEvent, ProcessIdentity, ProviderKind};
+use crate::discovery::{
+    agent_descriptor, AgentInstance, AgentKind, DiscoveryEvent, ProcessIdentity, ProviderKind,
+};
 use crate::{AccountIdentity, ProviderUsage, Timestamp, UsageMeter, UsageStatus, UsageSummary};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,7 +77,7 @@ impl CollectorModel {
         for instance in self.active_instances.values() {
             let key = GroupKey {
                 provider_id: provider_id(instance.provider).to_owned(),
-                agent_id: agent_id(instance.agent).to_owned(),
+                agent_id: canonical_agent_id(instance.agent).to_owned(),
                 account_id: instance.account_scope.clone(),
             };
             groups.entry(key).or_default().insert(instance.process);
@@ -161,22 +163,33 @@ fn provider_id(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::OpenAi => "openai",
         ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Google => "google",
+        ProviderKind::Xai => "xai",
     }
 }
 
-fn agent_id(agent: AgentKind) -> &'static str {
+fn canonical_agent_id(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Codex => "codex",
         AgentKind::ClaudeCode => "claude-code",
+        AgentKind::Antigravity => "antigravity",
+        AgentKind::Grok => "grok",
     }
 }
 
 fn display_name(agent_id: &str) -> &'static str {
-    match agent_id {
-        "codex" => "Codex",
-        "claude-code" => "Claude",
-        _ => unreachable!("agent_id is produced by agent_id"),
-    }
+    [
+        AgentKind::Codex,
+        AgentKind::ClaudeCode,
+        AgentKind::Antigravity,
+        AgentKind::Grok,
+    ]
+    .into_iter()
+    .find_map(|agent| {
+        let descriptor = agent_descriptor(agent);
+        (agent_id == canonical_agent_id(agent)).then_some(descriptor.display_name)
+    })
+    .expect("agent_id is produced by agent_id")
 }
 
 fn empty_summary() -> UsageSummary {
@@ -203,6 +216,14 @@ mod tests {
             provider: match kind {
                 AgentKind::Codex => ProviderKind::OpenAi,
                 AgentKind::ClaudeCode => ProviderKind::Anthropic,
+                AgentKind::Antigravity => ProviderKind::Google,
+                AgentKind::Grok => ProviderKind::Xai,
+            },
+            usage_source: match kind {
+                AgentKind::Codex => Some(crate::discovery::UsageSourceId::OpenAi),
+                AgentKind::ClaudeCode => Some(crate::discovery::UsageSourceId::Anthropic),
+                AgentKind::Antigravity => Some(crate::discovery::UsageSourceId::Antigravity),
+                AgentKind::Grok => None,
             },
             account_scope: account,
             account_scope_resolution:
@@ -588,5 +609,27 @@ mod tests {
         }
         right.replace_provider_usage(quotas.into_iter().rev());
         assert_eq!(left.active_usage(), right.active_usage());
+    }
+
+    #[test]
+    fn all_four_agents_remain_independent_and_unresolved_grok_is_visible() {
+        let mut model = CollectorModel::new();
+        for (pid, kind) in [
+            (1, AgentKind::Codex),
+            (2, AgentKind::ClaudeCode),
+            (3, AgentKind::Antigravity),
+            (4, AgentKind::Grok),
+        ] {
+            start(
+                &mut model,
+                agent(pid, pid as u64, kind, AccountIdentity::Default),
+            );
+        }
+        let usage = model.active_usage();
+        assert_eq!(usage.len(), 4);
+        let grok = usage.iter().find(|entry| entry.agent_id == "grok").unwrap();
+        assert_eq!(grok.provider_id, "xai");
+        assert_eq!(grok.status, UsageStatus::Unavailable);
+        assert_eq!(grok.summary.remaining_pct, None);
     }
 }

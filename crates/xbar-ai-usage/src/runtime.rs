@@ -14,12 +14,12 @@ use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 
-use crate::discovery::{AccountScopeResolution, CnProcError, DiscoveryEvent};
+use crate::discovery::{AccountScopeResolution, CnProcError, DiscoveryEvent, UsageSourceId};
 use crate::publisher::{Publisher, PublisherError};
 use crate::wire::encode_active_usage;
 use crate::{
-    fetch_anthropic, fetch_openai, AccountIdentity, ActiveAgentUsage, CollectorModel, Discovery,
-    DiscoveryError, ProviderKind, ProviderUsage,
+    fetch_anthropic, fetch_antigravity, fetch_openai, AccountIdentity, ActiveAgentUsage,
+    CollectorModel, Discovery, DiscoveryError, ProviderKind, ProviderUsage,
 };
 
 pub const DEFAULT_USAGE_REFRESH: Duration = Duration::from_secs(300);
@@ -34,6 +34,7 @@ pub struct RuntimeConfig {
     pub openai_cache_path: PathBuf,
     pub anthropic_credentials_path: PathBuf,
     pub anthropic_cache_path: PathBuf,
+    pub antigravity_cache_path: PathBuf,
     pub usage_refresh: Duration,
     pub debug: bool,
 }
@@ -48,6 +49,7 @@ impl RuntimeConfig {
             openai_cache_path: home.join(".cache/xbar-ai-usage/openai"),
             anthropic_credentials_path: home.join(".claude/.credentials.json"),
             anthropic_cache_path: home.join(".cache/xbar-ai-usage/anthropic"),
+            antigravity_cache_path: home.join(".cache/xbar-ai-usage/antigravity"),
             usage_refresh: DEFAULT_USAGE_REFRESH,
             debug,
         })
@@ -82,6 +84,7 @@ impl std::error::Error for RuntimeError {}
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct RefreshKey {
     provider: ProviderKind,
+    source: UsageSourceId,
     account: AccountIdentity,
 }
 
@@ -381,8 +384,8 @@ fn spawn_refresh(
     tokio::spawn(async move {
         debug_refresh(&config, "REFRESH_DEMAND", &key, reason);
         debug_refresh(&config, "REFRESH_STARTED", &key, reason);
-        let usage = match key.provider {
-            ProviderKind::OpenAi => {
+        let usage = match key.source {
+            UsageSourceId::OpenAi => {
                 fetch_openai(
                     &config.openai_credentials_path,
                     &config.openai_cache_path,
@@ -390,13 +393,19 @@ fn spawn_refresh(
                 )
                 .await
             }
-            ProviderKind::Anthropic => {
+            UsageSourceId::Anthropic => {
                 fetch_anthropic(
                     &config.anthropic_credentials_path,
                     &config.anthropic_cache_path,
                     key.account.clone(),
                 )
                 .await
+            }
+            UsageSourceId::Antigravity => {
+                fetch_antigravity(&config.antigravity_cache_path, key.account.clone()).await
+            }
+            UsageSourceId::Grok => {
+                ProviderUsage::unavailable("xai", key.account.clone(), crate::FetchIssue::Other)
             }
         };
         debug_refresh(&config, "REFRESH_FINISHED", &key, reason);
@@ -411,13 +420,15 @@ fn refresh_scopes(usage: &[ActiveAgentUsage]) -> BTreeSet<RefreshKey> {
             if entry.account_id != AccountIdentity::Default {
                 return None;
             }
-            let provider = match entry.provider_id.as_str() {
-                "openai" => ProviderKind::OpenAi,
-                "anthropic" => ProviderKind::Anthropic,
+            let (provider, source) = match (entry.provider_id.as_str(), entry.agent_id.as_str()) {
+                ("openai", "codex") => (ProviderKind::OpenAi, UsageSourceId::OpenAi),
+                ("anthropic", "claude-code") => (ProviderKind::Anthropic, UsageSourceId::Anthropic),
+                ("google", "antigravity") => (ProviderKind::Google, UsageSourceId::Antigravity),
                 _ => return None,
             };
             Some(RefreshKey {
                 provider,
+                source,
                 account: AccountIdentity::Default,
             })
         })
@@ -504,6 +515,8 @@ fn provider_id(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::OpenAi => "openai",
         ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Google => "google",
+        ProviderKind::Xai => "xai",
     }
 }
 
@@ -528,8 +541,15 @@ mod tests {
     };
 
     fn key(provider: ProviderKind) -> RefreshKey {
+        let source = match provider {
+            ProviderKind::OpenAi => UsageSourceId::OpenAi,
+            ProviderKind::Anthropic => UsageSourceId::Anthropic,
+            ProviderKind::Google => UsageSourceId::Antigravity,
+            ProviderKind::Xai => UsageSourceId::Grok,
+        };
         RefreshKey {
             provider,
+            source,
             account: AccountIdentity::Default,
         }
     }
@@ -539,6 +559,7 @@ mod tests {
             process: ProcessIdentity { pid, starttime: 42 },
             agent: AgentKind::Codex,
             provider: ProviderKind::OpenAi,
+            usage_source: Some(crate::discovery::UsageSourceId::OpenAi),
             account_scope: AccountIdentity::Default,
             account_scope_resolution: AccountScopeResolution::DefaultVariableAbsent,
             executable: "/usr/bin/codex".into(),

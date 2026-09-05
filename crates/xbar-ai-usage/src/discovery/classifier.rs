@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use super::{AgentInstance, AgentKind, ProcessRecord, ProviderKind};
+#[cfg(test)]
+use super::AgentKind;
+use super::{agent_registry, AccountScopeRule, AgentInstance, ProcessMatch, ProcessRecord};
 use crate::AccountIdentity;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -15,44 +17,106 @@ pub(crate) enum AccountScopeResolution {
 
 pub fn classify(record: ProcessRecord) -> Option<AgentInstance> {
     let executable = std::fs::canonicalize(&record.executable).unwrap_or(record.executable);
-    let agent = classify_executable(&executable, &record.comm)?;
-    let (provider, variable) = match agent {
-        AgentKind::Codex => (ProviderKind::OpenAi, "CODEX_HOME"),
-        AgentKind::ClaudeCode => (ProviderKind::Anthropic, "CLAUDE_CONFIG_DIR"),
+    let descriptor = classify_descriptor(&executable, &record.comm)?;
+    let (account_scope, account_scope_resolution) = match descriptor.account_scope_rule {
+        AccountScopeRule::Environment(variable) => {
+            account_scope_resolution(record.environment.as_deref(), variable)
+        }
+        AccountScopeRule::Default => (
+            AccountIdentity::Default,
+            AccountScopeResolution::DefaultVariableAbsent,
+        ),
     };
-    let (account_scope, account_scope_resolution) =
-        account_scope_resolution(record.environment.as_deref(), variable);
     Some(AgentInstance {
         process: record.process,
-        agent,
-        provider,
+        agent: descriptor.agent,
+        provider: descriptor.provider,
+        usage_source: descriptor.usage_source,
         account_scope,
         account_scope_resolution,
         executable,
     })
 }
 
+fn classify_descriptor(path: &Path, comm: &str) -> Option<&'static super::AgentDescriptor> {
+    agent_registry()
+        .iter()
+        .find(|descriptor| matches_process(descriptor.process_match, path, comm))
+}
+
+#[cfg(test)]
 fn classify_executable(path: &Path, comm: &str) -> Option<AgentKind> {
+    classify_descriptor(path, comm).map(|descriptor| descriptor.agent)
+}
+
+fn matches_process(process_match: ProcessMatch, path: &Path, comm: &str) -> bool {
+    match process_match {
+        ProcessMatch::Codex => is_codex_path(path, comm),
+        ProcessMatch::ClaudeCode => comm == "claude" && is_versioned_claude_path(path),
+        ProcessMatch::Antigravity => comm == "agy" && is_antigravity_path(path),
+        ProcessMatch::Grok => comm == "grok" && is_grok_path(path),
+    }
+}
+
+fn is_codex_path(path: &Path, comm: &str) -> bool {
     let components: Vec<_> = path
         .components()
         .filter_map(|c| c.as_os_str().to_str())
         .collect();
-    if path.file_name().and_then(|n| n.to_str()) == Some("codex")
+    path.file_name().and_then(|n| n.to_str()) == Some("codex")
         && comm == "codex"
         && components.windows(2).any(|w| w == ["bin", "codex"])
         && components.contains(&"vendor")
         && components.windows(2).any(|w| w == ["@openai", "codex"])
         && !components.contains(&"codex-linux-sandbox")
-    {
-        return Some(AgentKind::Codex);
-    }
-    if comm == "claude" && is_versioned_claude_path(&components) {
-        return Some(AgentKind::ClaudeCode);
-    }
-    None
 }
 
-fn is_versioned_claude_path(components: &[&str]) -> bool {
+fn is_antigravity_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+    let in_local_bin = components
+        .windows(2)
+        .any(|window| window == [".local", "bin"]);
+    let atomic_update = name
+        .strip_prefix("agy.")
+        .and_then(|value| value.strip_suffix(".old"))
+        .is_some_and(|value| !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()));
+    in_local_bin && (name == "agy" || atomic_update)
+}
+
+fn is_grok_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+    let in_downloads = components
+        .windows(2)
+        .any(|window| window == [".grok", "downloads"]);
+    let versioned_binary = name
+        .strip_prefix("grok-")
+        .and_then(|value| value.strip_suffix("-linux-x86_64"))
+        .is_some_and(|value| {
+            !value.is_empty()
+                && value.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+                && value.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+                && value.chars().last().is_some_and(|ch| ch.is_ascii_digit())
+        });
+    in_downloads && versioned_binary
+}
+
+fn is_versioned_claude_path(path: &Path) -> bool {
+    let components: Vec<_> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
     let Some(index) = components
         .windows(2)
         .position(|w| w == ["claude", "versions"])
@@ -254,6 +318,95 @@ mod tests {
             classify_executable(Path::new("/usr/bin/claude"), "claude"),
             None
         );
+    }
+
+    #[test]
+    fn antigravity_registry_topology_is_structural() {
+        assert_eq!(
+            classify_executable(Path::new("/home/u/.local/bin/agy"), "agy"),
+            Some(AgentKind::Antigravity)
+        );
+        assert_eq!(
+            classify_executable(
+                Path::new("/home/u/.local/bin/agy.1788570018439200905.old"),
+                "agy"
+            ),
+            Some(AgentKind::Antigravity)
+        );
+        assert_eq!(
+            classify_executable(Path::new("/home/u/.local/bin/agy.42.old"), "agy"),
+            Some(AgentKind::Antigravity)
+        );
+    }
+
+    #[test]
+    fn antigravity_near_misses_are_rejected() {
+        for (path, comm) in [
+            ("/home/u/.local/bin/agy.foo.old", "agy"),
+            ("/home/u/.local/bin/agy-helper", "agy-helper"),
+            ("/usr/bin/agy", "agy"),
+            ("/home/u/.local/bin/agy.42.old", "other"),
+        ] {
+            assert_eq!(
+                classify_executable(Path::new(path), comm),
+                None,
+                "{path} {comm}"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_versioned_topology_is_structural() {
+        assert_eq!(
+            classify_executable(
+                Path::new("/home/u/.grok/downloads/grok-1.0.13-linux-x86_64"),
+                "grok"
+            ),
+            Some(AgentKind::Grok)
+        );
+        assert_eq!(
+            classify_executable(
+                Path::new("/home/u/.grok/downloads/grok-9.4-linux-x86_64"),
+                "grok"
+            ),
+            Some(AgentKind::Grok)
+        );
+    }
+
+    #[test]
+    fn grok_near_misses_are_rejected() {
+        for (path, comm) in [
+            ("/home/u/.grok/downloads/grok-1.0.13-linux-aarch64", "grok"),
+            ("/home/u/.grok/bin/grok-1.0.13-linux-x86_64", "grok"),
+            (
+                "/home/u/.grok/downloads/grok-helper-1.0-linux-x86_64",
+                "grok",
+            ),
+            ("/home/u/.grok/downloads/grok-1.0-linux-x86_64", "other"),
+        ] {
+            assert_eq!(
+                classify_executable(Path::new(path), comm),
+                None,
+                "{path} {comm}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_has_unique_agents_and_allows_unresolved_usage_source() {
+        let registry = super::super::agent_registry();
+        let ids: std::collections::BTreeSet<_> = registry.iter().map(|entry| entry.agent).collect();
+        assert_eq!(ids.len(), 4);
+        assert!(registry
+            .iter()
+            .find(|entry| entry.agent == AgentKind::Grok)
+            .is_some_and(|entry| entry.usage_source.is_none()));
+        assert!(registry
+            .iter()
+            .find(|entry| entry.agent == AgentKind::Antigravity)
+            .is_some_and(
+                |entry| entry.usage_source == Some(super::super::UsageSourceId::Antigravity)
+            ));
     }
     #[test]
     fn account_defaults() {

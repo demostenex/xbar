@@ -47,22 +47,25 @@ pub(crate) fn inspect(pid: u32) -> Option<ProcessRecord> {
         environment: None,
     };
     let environment = if let Some(agent) = classify(candidate.clone()) {
-        let variable = match agent.agent {
-            super::AgentKind::Codex => "CODEX_HOME",
-            super::AgentKind::ClaudeCode => "CLAUDE_CONFIG_DIR",
-        };
-        Some(
-            read_environment(&root.join("environ"), variable).unwrap_or_else(|error| {
-                let detail = match error {
-                    AccountScopeResolution::EnvironmentUnreadable { errno } => {
-                        format!("errno:{}", errno.unwrap_or_default())
-                    }
-                    AccountScopeResolution::EnvironmentMalformed => "malformed".into(),
-                    _ => "malformed".into(),
-                };
-                vec![("__XBAR_DISCOVERY_ENV_UNREADABLE".into(), detail)]
-            }),
-        )
+        match super::agent_registry()
+            .iter()
+            .find(|descriptor| descriptor.agent == agent.agent)
+            .map(|descriptor| descriptor.account_scope_rule)
+        {
+            Some(super::AccountScopeRule::Environment(variable)) => Some(
+                read_environment(&root.join("environ"), variable).unwrap_or_else(|error| {
+                    let detail = match error {
+                        AccountScopeResolution::EnvironmentUnreadable { errno } => {
+                            format!("errno:{}", errno.unwrap_or_default())
+                        }
+                        AccountScopeResolution::EnvironmentMalformed => "malformed".into(),
+                        _ => "malformed".into(),
+                    };
+                    vec![("__XBAR_DISCOVERY_ENV_UNREADABLE".into(), detail)]
+                }),
+            ),
+            Some(super::AccountScopeRule::Default) | None => Some(Vec::new()),
+        }
     } else {
         None
     };

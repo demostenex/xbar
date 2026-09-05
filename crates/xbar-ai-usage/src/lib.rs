@@ -2,7 +2,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use ai_usagebar::cache::{Cache, DEFAULT_TTL};
-use ai_usagebar::usage::{AnthropicSnapshot, ExtraUsage, OpenAiSnapshot, UsageWindow};
+use ai_usagebar::usage::{
+    AnthropicSnapshot, AntigravitySnapshot, ExtraUsage, OpenAiSnapshot, UsageWindow,
+};
 
 pub mod composition;
 pub mod discovery;
@@ -18,6 +20,7 @@ pub use discovery::{
 
 const PROVIDER_OPENAI: &str = "openai";
 const PROVIDER_ANTHROPIC: &str = "anthropic";
+const PROVIDER_GOOGLE: &str = "google";
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AccountIdentity {
@@ -329,6 +332,62 @@ fn adapt_anthropic_snapshot(
     }
 }
 
+fn adapt_antigravity_snapshot(
+    snapshot: AntigravitySnapshot,
+    account_id: AccountIdentity,
+    stale: bool,
+    cache_age: Option<Duration>,
+) -> ProviderUsage {
+    let (status, cache_age_secs) = outcome_metadata(stale, cache_age);
+    let mut meters = vec![
+        percentage_meter("gemini-session", "Gemini 5h", &snapshot.session),
+        percentage_meter("gemini-weekly", "Gemini weekly", &snapshot.weekly),
+    ];
+    if let Some(window) = snapshot.third_party_session.as_ref() {
+        meters.push(percentage_meter(
+            "third-party-session",
+            "Third-party 5h",
+            window,
+        ));
+    }
+    if let Some(window) = snapshot.third_party_weekly.as_ref() {
+        meters.push(percentage_meter(
+            "third-party-weekly",
+            "Third-party weekly",
+            window,
+        ));
+    }
+    meters.sort_by(|left, right| left.id.cmp(&right.id));
+    let primary_meter_id = [
+        "gemini-session",
+        "gemini-weekly",
+        "third-party-session",
+        "third-party-weekly",
+    ]
+    .into_iter()
+    .find(|id| meters.iter().any(|meter| meter.id == *id));
+    let remaining_pct = primary_meter_id.and_then(|id| {
+        meters
+            .iter()
+            .find(|meter| meter.id == id)
+            .and_then(|meter| meter.remaining_pct)
+    });
+    ProviderUsage {
+        provider_id: PROVIDER_GOOGLE.into(),
+        display_name: snapshot.plan,
+        account_id,
+        meters,
+        summary: UsageSummary {
+            primary_meter_id: primary_meter_id.map(str::to_owned),
+            remaining_pct,
+        },
+        status,
+        fetched_at: None,
+        cache_age_secs,
+        issue: None,
+    }
+}
+
 /// Fetches Codex usage through the pinned upstream Rust API and returns only
 /// local owned DTOs. Upstream errors are reduced to a non-sensitive category.
 pub async fn fetch_openai(
@@ -385,6 +444,25 @@ pub async fn fetch_anthropic(
     }
 }
 
+/// Fetches Antigravity usage through the pinned upstream Rust API and returns
+/// only local owned DTOs. The upstream local-language-server protocol remains
+/// entirely inside ai-usagebar.
+pub async fn fetch_antigravity(cache_path: &Path, account_id: AccountIdentity) -> ProviderUsage {
+    let client = reqwest::Client::new();
+    let cache = Cache::at(cache_path.to_path_buf());
+    let outcome =
+        ai_usagebar::antigravity::fetch::fetch_snapshot(&client, &cache, DEFAULT_TTL).await;
+    match outcome {
+        Ok(outcome) => adapt_antigravity_snapshot(
+            outcome.snapshot,
+            account_id,
+            outcome.stale,
+            outcome.cache_age,
+        ),
+        Err(error) => ProviderUsage::unavailable(PROVIDER_GOOGLE, account_id, map_issue(&error)),
+    }
+}
+
 pub fn normalize_unix_seconds(value: Option<i64>) -> Option<Timestamp> {
     value.map(Timestamp)
 }
@@ -398,7 +476,9 @@ pub fn normalize_rfc3339(value: Option<&str>) -> Option<Timestamp> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_usagebar::usage::{AnthropicSnapshot, OpenAiCredits, OpenAiSource, ScopedWindow};
+    use ai_usagebar::usage::{
+        AnthropicSnapshot, AntigravitySnapshot, OpenAiCredits, OpenAiSource, ScopedWindow,
+    };
     use chrono::{Duration, TimeZone, Utc};
 
     fn window(used: i32, reset_at: Option<i64>) -> UsageWindow {
@@ -478,6 +558,48 @@ mod tests {
                 .unwrap()
                 .remaining_pct,
             Some(66)
+        );
+    }
+
+    #[test]
+    fn antigravity_windows_normalize_without_collapsing_meaningful_meters() {
+        let usage = adapt_antigravity_snapshot(
+            AntigravitySnapshot {
+                plan: "Google AI Pro".into(),
+                account: "opaque-account-fingerprint".into(),
+                session: window(12, None),
+                weekly: window(34, Some(1_700_000_000)),
+                third_party_session: Some(window(56, None)),
+                third_party_weekly: None,
+            },
+            AccountIdentity::Default,
+            false,
+            None,
+        );
+        assert_eq!(usage.provider_id, "google");
+        assert_eq!(
+            usage.summary.primary_meter_id.as_deref(),
+            Some("gemini-session")
+        );
+        assert_eq!(usage.summary.remaining_pct, Some(88));
+        assert_eq!(usage.meters.len(), 3);
+        assert_eq!(
+            usage
+                .meters
+                .iter()
+                .find(|meter| meter.id == "gemini-weekly")
+                .unwrap()
+                .reset_at,
+            Some(Timestamp(1_700_000_000))
+        );
+        assert_eq!(
+            usage
+                .meters
+                .iter()
+                .find(|meter| meter.id == "third-party-session")
+                .unwrap()
+                .reset_at,
+            None
         );
     }
 

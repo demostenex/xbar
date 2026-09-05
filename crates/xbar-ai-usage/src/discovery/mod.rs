@@ -24,12 +24,94 @@ pub use procfs::{startup_snapshot, ProcFsError};
 pub enum AgentKind {
     Codex,
     ClaudeCode,
+    Antigravity,
+    Grok,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ProviderKind {
     OpenAi,
     Anthropic,
+    Google,
+    Xai,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum UsageSourceId {
+    OpenAi,
+    Anthropic,
+    Antigravity,
+    Grok,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountScopeRule {
+    Environment(&'static str),
+    Default,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessMatch {
+    Codex,
+    ClaudeCode,
+    Antigravity,
+    Grok,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentDescriptor {
+    pub agent: AgentKind,
+    pub provider: ProviderKind,
+    pub display_name: &'static str,
+    pub process_match: ProcessMatch,
+    pub usage_source: Option<UsageSourceId>,
+    pub account_scope_rule: AccountScopeRule,
+}
+
+pub const AGENT_REGISTRY: &[AgentDescriptor] = &[
+    AgentDescriptor {
+        agent: AgentKind::Codex,
+        provider: ProviderKind::OpenAi,
+        display_name: "Codex",
+        process_match: ProcessMatch::Codex,
+        usage_source: Some(UsageSourceId::OpenAi),
+        account_scope_rule: AccountScopeRule::Environment("CODEX_HOME"),
+    },
+    AgentDescriptor {
+        agent: AgentKind::ClaudeCode,
+        provider: ProviderKind::Anthropic,
+        display_name: "Claude",
+        process_match: ProcessMatch::ClaudeCode,
+        usage_source: Some(UsageSourceId::Anthropic),
+        account_scope_rule: AccountScopeRule::Environment("CLAUDE_CONFIG_DIR"),
+    },
+    AgentDescriptor {
+        agent: AgentKind::Antigravity,
+        provider: ProviderKind::Google,
+        display_name: "Antigravity",
+        process_match: ProcessMatch::Antigravity,
+        usage_source: Some(UsageSourceId::Antigravity),
+        account_scope_rule: AccountScopeRule::Default,
+    },
+    AgentDescriptor {
+        agent: AgentKind::Grok,
+        provider: ProviderKind::Xai,
+        display_name: "Grok",
+        process_match: ProcessMatch::Grok,
+        usage_source: None,
+        account_scope_rule: AccountScopeRule::Default,
+    },
+];
+
+pub fn agent_registry() -> &'static [AgentDescriptor] {
+    AGENT_REGISTRY
+}
+
+pub fn agent_descriptor(agent: AgentKind) -> &'static AgentDescriptor {
+    AGENT_REGISTRY
+        .iter()
+        .find(|descriptor| descriptor.agent == agent)
+        .expect("every AgentKind has a registry descriptor")
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -43,6 +125,7 @@ pub struct AgentInstance {
     pub process: ProcessIdentity,
     pub agent: AgentKind,
     pub provider: ProviderKind,
+    pub usage_source: Option<UsageSourceId>,
     pub account_scope: AccountIdentity,
     pub(crate) account_scope_resolution: classifier::AccountScopeResolution,
     pub executable: PathBuf,
@@ -246,6 +329,7 @@ mod tests {
                 },
                 agent: AgentKind::ClaudeCode,
                 provider: ProviderKind::Anthropic,
+                usage_source: Some(UsageSourceId::Anthropic),
                 account_scope: AccountIdentity::Default,
                 account_scope_resolution: AccountScopeResolution::DefaultVariableAbsent,
                 executable: CLAUDE.into()
