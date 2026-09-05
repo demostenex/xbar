@@ -1228,11 +1228,40 @@ async fn run(
     let dbus = zbus::fdo::DBusProxy::new(&connection).await?;
     let mut owner_changes = dbus.receive_name_owner_changed().await?;
     let mut ai_usage = ai_usage::AiUsageSubscription::default();
+    let mut ai_activation = ai_usage::ActivationGate::default();
     ai_usage::subscribe_signal_watcher(&connection, &request_sender).await?;
     if let Ok(owner) = dbus.get_name_owner(ai_usage::BUS_NAME.try_into()?).await {
         let owner = owner.to_string();
         ai_usage.owner_appeared(owner.clone());
         ai_usage::spawn_get_state(&connection, &request_sender, owner);
+    } else if ai_activation.request_once() {
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!(
+                "xbar trace: AI_ACTIVATION_REQUESTED name={}",
+                ai_usage::BUS_NAME
+            );
+        }
+        match dbus
+            .start_service_by_name(ai_usage::BUS_NAME.try_into()?, 0)
+            .await
+        {
+            Ok(reply) => {
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!(
+                        "xbar trace: AI_ACTIVATION_RESULT name={} reply={reply}",
+                        ai_usage::BUS_NAME
+                    );
+                }
+            }
+            Err(error) => {
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!(
+                        "xbar trace: AI_ACTIVATION_FAILED name={} error={error}",
+                        ai_usage::BUS_NAME
+                    );
+                }
+            }
+        }
     }
     setup_status_notifier(&connection, &events, &wake, watcher_exists).await?;
     if std::env::var_os("XBAR_TRACE").is_some() {

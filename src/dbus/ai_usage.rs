@@ -13,6 +13,22 @@ pub const BUS_NAME: &str = "org.xbar.AiUsage1";
 pub const OBJECT_PATH: &str = "/org/xbar/AiUsage1";
 pub const INTERFACE: &str = "org.xbar.AiUsage1";
 
+#[derive(Debug, Default)]
+pub(crate) struct ActivationGate {
+    requested: bool,
+}
+
+impl ActivationGate {
+    pub(crate) fn request_once(&mut self) -> bool {
+        if self.requested {
+            false
+        } else {
+            self.requested = true;
+            true
+        }
+    }
+}
+
 pub(crate) async fn subscribe_signal_watcher(
     connection: &zbus::Connection,
     requests: &Sender<super::Request>,
@@ -270,6 +286,19 @@ mod tests {
         PROTOCOL_VERSION,
     };
 
+    #[test]
+    fn activation_is_requested_at_most_once() {
+        let mut gate = ActivationGate::default();
+        assert!(gate.request_once());
+        assert!(!gate.request_once());
+    }
+
+    #[test]
+    fn activation_reply_is_not_state() {
+        let mut gate = ActivationGate::default();
+        assert!(gate.request_once());
+        assert!(!gate.request_once());
+    }
     fn payload(revision: u64, account: AccountIdentityWire) -> Vec<u8> {
         xbar_ai_protocol::encode_snapshot(&AiUsageSnapshotWire {
             protocol_version: PROTOCOL_VERSION,
