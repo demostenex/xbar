@@ -56,6 +56,42 @@ enum AudioCommand {
     SetDefaultInput(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MigrationAction {
+    ResolveOutputTarget(String),
+    ResolveInputTarget(String),
+    EnumerateOutputStreams {
+        target_name: String,
+        target_index: u32,
+    },
+    EnumerateInputStreams {
+        target_name: String,
+        target_index: u32,
+    },
+    MoveOutputStream {
+        index: u32,
+        target_name: String,
+    },
+    MoveInputStream {
+        index: u32,
+        target_name: String,
+    },
+}
+
+fn movable_client_stream(client: Option<u32>) -> bool {
+    client.is_some()
+}
+
+fn should_move_stream(current_index: u32, target_index: u32, client: Option<u32>) -> bool {
+    current_index != target_index && movable_client_stream(client)
+}
+
+fn trace_migration_result(kind: &str, index: u32, target: &str, success: bool) {
+    if std::env::var_os("XBAR_TRACE").is_some() {
+        eprintln!("xbar trace: audio {kind} stream={index} target={target} success={success}");
+    }
+}
+
 fn refresh_detail_for(operation: Option<Operation>) -> bool {
     operation != Some(Operation::Removed)
 }
@@ -220,6 +256,7 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
     flags.inventory_sources_done.store(true, Ordering::Release);
     let pending_commands = Arc::new(Mutex::new(VecDeque::<AudioCommand>::new()));
     let command_queue = Arc::clone(&pending_commands);
+    let migration_actions = Arc::new(Mutex::new(VecDeque::<MigrationAction>::new()));
     let _command_io = mainloop.new_io_event(
         command_reader.as_raw_fd(),
         IoFlagSet::INPUT,
@@ -312,12 +349,17 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
                         callback_flags.source.store(true, Ordering::Release);
                     }
                 }
+                Some(Facility::SinkInput) | Some(Facility::SourceOutput) => {}
                 _ => {}
             }
         },
     )));
     let _subscription = context.subscribe(
-        InterestMaskSet::SINK | InterestMaskSet::SOURCE | InterestMaskSet::SERVER,
+        InterestMaskSet::SINK
+            | InterestMaskSet::SOURCE
+            | InterestMaskSet::SERVER
+            | InterestMaskSet::SINK_INPUT
+            | InterestMaskSet::SOURCE_OUTPUT,
         |_| {},
     );
 
@@ -644,6 +686,122 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
                     });
             }
         }
+        for action in migration_actions
+            .lock()
+            .expect("audio migration queue poisoned")
+            .drain(..)
+        {
+            match action {
+                MigrationAction::ResolveOutputTarget(target_name) => {
+                    let actions = Arc::clone(&migration_actions);
+                    let target_name_for_callback = target_name.clone();
+                    let _ =
+                        context
+                            .introspect()
+                            .get_sink_info_by_name(&target_name, move |result| {
+                                if let ListResult::Item(info) = result {
+                                    actions
+                                        .lock()
+                                        .expect("audio migration queue poisoned")
+                                        .push_back(MigrationAction::EnumerateOutputStreams {
+                                            target_name: target_name_for_callback.clone(),
+                                            target_index: info.index,
+                                        });
+                                }
+                            });
+                }
+                MigrationAction::ResolveInputTarget(target_name) => {
+                    let actions = Arc::clone(&migration_actions);
+                    let target_name_for_callback = target_name.clone();
+                    let _ =
+                        context
+                            .introspect()
+                            .get_source_info_by_name(&target_name, move |result| {
+                                if let ListResult::Item(info) = result {
+                                    actions
+                                        .lock()
+                                        .expect("audio migration queue poisoned")
+                                        .push_back(MigrationAction::EnumerateInputStreams {
+                                            target_name: target_name_for_callback.clone(),
+                                            target_index: info.index,
+                                        });
+                                }
+                            });
+                }
+                MigrationAction::EnumerateOutputStreams {
+                    target_name,
+                    target_index,
+                } => {
+                    let actions = Arc::clone(&migration_actions);
+                    let _ = context
+                        .introspect()
+                        .get_sink_input_info_list(move |result| {
+                            if let ListResult::Item(info) = result {
+                                if should_move_stream(info.sink, target_index, info.client) {
+                                    actions
+                                        .lock()
+                                        .expect("audio migration queue poisoned")
+                                        .push_back(MigrationAction::MoveOutputStream {
+                                            index: info.index,
+                                            target_name: target_name.clone(),
+                                        });
+                                }
+                            }
+                        });
+                }
+                MigrationAction::EnumerateInputStreams {
+                    target_name,
+                    target_index,
+                } => {
+                    let actions = Arc::clone(&migration_actions);
+                    let _ = context
+                        .introspect()
+                        .get_source_output_info_list(move |result| {
+                            if let ListResult::Item(info) = result {
+                                if should_move_stream(info.source, target_index, info.client) {
+                                    actions
+                                        .lock()
+                                        .expect("audio migration queue poisoned")
+                                        .push_back(MigrationAction::MoveInputStream {
+                                            index: info.index,
+                                            target_name: target_name.clone(),
+                                        });
+                                }
+                            }
+                        });
+                }
+                MigrationAction::MoveOutputStream { index, target_name } => {
+                    let target_for_callback = target_name.clone();
+                    let _ = context.introspect().move_sink_input_by_name(
+                        index,
+                        &target_name,
+                        Some(Box::new(move |success| {
+                            trace_migration_result(
+                                "move-output",
+                                index,
+                                &target_for_callback,
+                                success,
+                            );
+                        })),
+                    );
+                }
+                MigrationAction::MoveInputStream { index, target_name } => {
+                    let target_for_callback = target_name.clone();
+                    let _ = context.introspect().move_source_output_by_name(
+                        index,
+                        &target_name,
+                        Some(Box::new(move |success| {
+                            trace_migration_result(
+                                "move-input",
+                                index,
+                                &target_for_callback,
+                                success,
+                            );
+                        })),
+                    );
+                }
+            }
+        }
         for command in pending_commands
             .lock()
             .expect("audio command queue poisoned")
@@ -712,9 +870,17 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
                 }
                 AudioCommand::SetDefaultOutput(name) => {
                     let _ = context.set_default_sink(&name, |_| {});
+                    migration_actions
+                        .lock()
+                        .expect("audio migration queue poisoned")
+                        .push_back(MigrationAction::ResolveOutputTarget(name));
                 }
                 AudioCommand::SetDefaultInput(name) => {
                     let _ = context.set_default_source(&name, |_| {});
+                    migration_actions
+                        .lock()
+                        .expect("audio migration queue poisoned")
+                        .push_back(MigrationAction::ResolveInputTarget(name));
                 }
             }
         }
@@ -723,7 +889,9 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
 
 #[cfg(test)]
 mod tests {
-    use super::{refresh_detail_for, Operation};
+    use super::{
+        movable_client_stream, refresh_detail_for, should_move_stream, MigrationAction, Operation,
+    };
 
     #[test]
     fn removed_audio_object_never_requests_detail_refresh() {
@@ -731,5 +899,37 @@ mod tests {
         assert!(refresh_detail_for(Some(Operation::New)));
         assert!(refresh_detail_for(Some(Operation::Changed)));
         assert!(refresh_detail_for(None));
+    }
+
+    #[test]
+    fn only_client_owned_streams_are_movable() {
+        assert!(movable_client_stream(Some(12)));
+        assert!(!movable_client_stream(None));
+    }
+
+    #[test]
+    fn stream_already_on_target_is_not_scheduled_for_migration() {
+        let target_index = 42;
+        assert!(!should_move_stream(target_index, target_index, Some(9)));
+        assert!(!should_move_stream(7, target_index, None));
+        assert!(should_move_stream(7, target_index, Some(9)));
+    }
+
+    #[test]
+    fn migration_actions_keep_output_and_input_routes_distinct() {
+        assert_ne!(
+            MigrationAction::ResolveOutputTarget("sink".into()),
+            MigrationAction::ResolveInputTarget("source".into())
+        );
+        assert_eq!(
+            MigrationAction::EnumerateInputStreams {
+                target_name: "source".into(),
+                target_index: 4,
+            },
+            MigrationAction::EnumerateInputStreams {
+                target_name: "source".into(),
+                target_index: 4,
+            }
+        );
     }
 }
