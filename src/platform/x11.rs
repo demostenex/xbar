@@ -6,6 +6,7 @@ use crate::ui::style::{self, TextMeasurer, BAR_STYLE};
 use crate::ui::{layout, view};
 use std::collections::HashMap;
 use std::error::Error;
+use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::{self, ConnectionExt as RandrExt};
@@ -17,6 +18,15 @@ use x11rb::wrapper::ConnectionExt as WrapperExt;
 use x11rb::xcb_ffi::XCBConnection;
 
 use super::x11_text::X11Text;
+
+fn trace_x11_resource(event: &str, role: &str, xid: u32) {
+    if std::env::var_os("XBAR_TRACE_XFT").is_some() {
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        let _ = writeln!(stderr, "xbar xft: {event} role={role} xid=0x{xid:x}");
+        let _ = stderr.flush();
+    }
+}
 
 struct PopupMeasurer<'a>(&'a X11Text);
 impl TextMeasurer for PopupMeasurer<'_> {
@@ -472,6 +482,7 @@ impl X11Platform {
     }
     pub fn acquire_instance(&mut self) -> Result<bool, Box<dyn Error>> {
         let window = self.conn.generate_id()?;
+        trace_x11_resource("WINDOW_CREATE", "instance-candidate", window);
         self.conn
             .create_window(
                 0,
@@ -494,6 +505,7 @@ impl X11Platform {
             .reply()?
             .owner;
         if owner != x11rb::NONE {
+            trace_x11_resource("WINDOW_DESTROY", "instance-candidate", window);
             self.conn.destroy_window(window)?.check()?;
             return Ok(false);
         }
@@ -511,6 +523,7 @@ impl X11Platform {
             self.instance_window = Some(window);
             self.conn.flush()?;
         } else {
+            trace_x11_resource("WINDOW_DESTROY", "instance-candidate", window);
             self.conn.destroy_window(window)?.check()?;
         }
         Ok(acquired)
@@ -873,10 +886,12 @@ impl X11Platform {
         self.previous_contexts.clear();
         for old in self.windows.drain(..) {
             self.text.release_drawable(old.window);
+            trace_x11_resource("WINDOW_DESTROY", "bar", old.window);
             self.conn.destroy_window(old.window)?.check()?;
         }
         for output in outputs {
             let window = self.conn.generate_id()?;
+            trace_x11_resource("WINDOW_CREATE", "bar", window);
             self.conn
                 .create_window(
                     x11rb::COPY_FROM_PARENT as u8,
@@ -1073,6 +1088,7 @@ impl X11Platform {
         let Some(notification) = state.notifications.last() else {
             if let Some(notification) = self.notification.take() {
                 self.text.release_drawable(notification.window);
+                trace_x11_resource("WINDOW_DESTROY", "notification", notification.window);
                 self.conn.destroy_window(notification.window)?.check()?;
             }
             return Ok(());
@@ -1089,6 +1105,7 @@ impl X11Platform {
             window.window
         } else {
             let window = self.conn.generate_id()?;
+            trace_x11_resource("WINDOW_CREATE", "notification", window);
             self.conn
                 .create_window(
                     x11rb::COPY_FROM_PARENT as u8,
@@ -1143,7 +1160,7 @@ impl X11Platform {
         let geometry = self.conn.get_geometry(window)?.reply()?;
         let attrs = self.conn.get_window_attributes(window)?.reply()?;
         self.text
-            .prepare_drawable(window, attrs.visual, geometry.depth)?;
+            .prepare_drawable("notification", window, attrs.visual, geometry.depth)?;
         let gc = self.conn.generate_id()?;
         self.conn
             .create_gc(
@@ -1217,7 +1234,7 @@ impl X11Platform {
             let geometry = self.conn.get_geometry(bar.window)?.reply()?;
             let attributes = self.conn.get_window_attributes(bar.window)?.reply()?;
             self.text
-                .prepare_drawable(bar.window, attributes.visual, geometry.depth)?;
+                .prepare_drawable("bar", bar.window, attributes.visual, geometry.depth)?;
             let gc = self.conn.generate_id()?;
             self.conn
                 .create_gc(
@@ -1627,6 +1644,7 @@ impl X11Platform {
         self.destroy_popup_suffix(0)?;
         if let Some(popup) = self.audio_popup.take() {
             self.text.release_drawable(popup.window);
+            trace_x11_resource("WINDOW_DESTROY", "audio-popup", popup.window);
             self.conn.destroy_window(popup.window)?.check()?;
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!("xbar trace: audio popup destroyed xid={}", popup.window);
@@ -1634,6 +1652,7 @@ impl X11Platform {
         }
         if let Some(popup) = self.bluetooth_popup.take() {
             self.text.release_drawable(popup.window);
+            trace_x11_resource("WINDOW_DESTROY", "bluetooth-popup", popup.window);
             self.conn.destroy_window(popup.window)?.check()?;
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!("xbar trace: UNMAP popup=Bluetooth xid={}", popup.window);
@@ -1641,6 +1660,7 @@ impl X11Platform {
         }
         if let Some(popup) = self.network_popup.take() {
             self.text.release_drawable(popup.window);
+            trace_x11_resource("WINDOW_DESTROY", "network-popup", popup.window);
             self.conn.destroy_window(popup.window)?.check()?;
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!("xbar trace: UNMAP popup=Network xid={}", popup.window);
@@ -1761,6 +1781,7 @@ impl X11Platform {
             popup.window
         } else {
             let window = self.conn.generate_id()?;
+            trace_x11_resource("WINDOW_CREATE", "audio-popup", window);
             self.conn
                 .create_window(
                     x11rb::COPY_FROM_PARENT as u8,
@@ -1829,7 +1850,7 @@ impl X11Platform {
         let geometry = self.conn.get_geometry(window)?.reply()?;
         let attributes = self.conn.get_window_attributes(window)?.reply()?;
         self.text
-            .prepare_drawable(window, attributes.visual, geometry.depth)?;
+            .prepare_drawable("audio-popup", window, attributes.visual, geometry.depth)?;
         let gc = self.conn.generate_id()?;
         self.conn
             .create_gc(
@@ -1994,6 +2015,7 @@ impl X11Platform {
             p.window
         } else {
             let w = self.conn.generate_id()?;
+            trace_x11_resource("WINDOW_CREATE", "bluetooth-popup", w);
             self.conn
                 .create_window(
                     x11rb::COPY_FROM_PARENT as u8,
@@ -2044,7 +2066,7 @@ impl X11Platform {
         let geometry = self.conn.get_geometry(window)?.reply()?;
         let attrs = self.conn.get_window_attributes(window)?.reply()?;
         self.text
-            .prepare_drawable(window, attrs.visual, geometry.depth)?;
+            .prepare_drawable("bluetooth-popup", window, attrs.visual, geometry.depth)?;
         let gc = self.conn.generate_id()?;
         self.conn
             .create_gc(
@@ -2202,6 +2224,7 @@ impl X11Platform {
             popup.window
         } else {
             let window = self.conn.generate_id()?;
+            trace_x11_resource("WINDOW_CREATE", "network-popup", window);
             self.conn
                 .create_window(
                     x11rb::COPY_FROM_PARENT as u8,
@@ -2252,7 +2275,7 @@ impl X11Platform {
         let geometry = self.conn.get_geometry(window)?.reply()?;
         let attrs = self.conn.get_window_attributes(window)?.reply()?;
         self.text
-            .prepare_drawable(window, attrs.visual, geometry.depth)?;
+            .prepare_drawable("network-popup", window, attrs.visual, geometry.depth)?;
         let gc = self.conn.generate_id()?;
         self.conn
             .create_gc(
@@ -2449,6 +2472,7 @@ impl X11Platform {
             if trace {
                 eprintln!("xbar trace: popup destroyed xid={}", popup.window);
             }
+            trace_x11_resource("WINDOW_DESTROY", "menu-popup", popup.window);
             self.conn.destroy_window(popup.window)?.check()?;
         }
         Ok(())
@@ -2538,7 +2562,9 @@ impl X11Platform {
             let window = if reuse {
                 self.popups[level].window
             } else {
-                self.conn.generate_id()?
+                let window = self.conn.generate_id()?;
+                trace_x11_resource("WINDOW_CREATE", "menu-popup", window);
+                window
             };
             if reuse {
                 if self.popups[level].layout.rect != popup_layout.rect {
@@ -2583,7 +2609,7 @@ impl X11Platform {
             let geometry = self.conn.get_geometry(window)?.reply()?;
             let attributes = self.conn.get_window_attributes(window)?.reply()?;
             self.text
-                .prepare_drawable(window, attributes.visual, geometry.depth)?;
+                .prepare_drawable("menu-popup", window, attributes.visual, geometry.depth)?;
             let gc = self.conn.generate_id()?;
             self.conn
                 .create_gc(

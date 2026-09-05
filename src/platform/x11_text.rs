@@ -1,17 +1,43 @@
 use std::error::Error;
 use std::ffi::{c_int, CString};
+use std::fmt::Arguments;
+use std::io::Write;
 use std::os::fd::RawFd;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ui::style::{FontMetrics, TextMeasurer};
 use x11::{xft, xlib, xrender};
+
+static XFT_DRAW_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn xft_trace_enabled() -> bool {
+    std::env::var_os("XBAR_TRACE_XFT").is_some()
+}
+
+fn trace_xft(args: Arguments<'_>) {
+    if xft_trace_enabled() {
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        let _ = writeln!(stderr, "xbar xft: {args}");
+        let _ = stderr.flush();
+    }
+}
+
+struct DrawResource {
+    sequence: u64,
+    role: &'static str,
+    drawable: u32,
+    draw: *mut xft::XftDraw,
+    picture: u64,
+}
 
 pub struct X11Text {
     display: *mut xlib::Display,
     bar_font: *mut xft::XftFont,
     popup_font: *mut xft::XftFont,
     status_icon_font: *mut xft::XftFont,
-    draw: Option<(u32, *mut xft::XftDraw)>,
+    draw: Option<DrawResource>,
     font_name: CString,
     metrics: FontMetrics,
     popup_metrics: FontMetrics,
@@ -98,6 +124,7 @@ impl X11Text {
 
     pub fn prepare_drawable(
         &mut self,
+        role: &'static str,
         drawable: u32,
         drawable_visual: u32,
         drawable_depth: u8,
@@ -105,7 +132,7 @@ impl X11Text {
         if self
             .draw
             .as_ref()
-            .is_some_and(|(current, _)| *current == drawable)
+            .is_some_and(|resource| resource.drawable == drawable)
         {
             return Ok(());
         }
@@ -130,9 +157,38 @@ impl X11Text {
         if draw.is_null() {
             return Err("XftDrawCreate failed".into());
         }
-        if let Some((_, old)) = self.draw.replace((drawable, draw)) {
+        let tracing = xft_trace_enabled();
+        let sequence = if tracing {
+            XFT_DRAW_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
+        let picture = if tracing {
+            unsafe { xft::XftDrawPicture(draw) as u64 }
+        } else {
+            0
+        };
+        trace_xft(format_args!(
+            "XFT_DRAW_CREATE seq={sequence} role={role} draw_ptr={draw:p} drawable=0x{drawable:x} picture=0x{picture:x}"
+        ));
+        let replacement = DrawResource {
+            sequence,
+            role,
+            drawable,
+            draw,
+            picture,
+        };
+        if let Some(old) = self.draw.replace(replacement) {
+            trace_xft(format_args!(
+                "XFT_DRAW_REBIND old_seq={} new_seq={sequence} old_role={} old_draw_ptr={:p} old_drawable=0x{:x} old_picture=0x{:x} new_role={role} new_draw_ptr={:p} new_drawable=0x{drawable:x} new_picture=0x{picture:x}",
+                old.sequence, old.role, old.draw, old.drawable, old.picture, draw
+            ));
+            trace_xft(format_args!(
+                "XFT_DRAW_DESTROY seq={} role={} draw_ptr={:p} drawable=0x{:x} picture=0x{:x} reason=replace",
+                old.sequence, old.role, old.draw, old.drawable, old.picture
+            ));
             unsafe {
-                xft::XftDrawDestroy(old);
+                xft::XftDrawDestroy(old.draw);
                 xlib::XSync(self.display, 0);
             }
         }
@@ -143,11 +199,15 @@ impl X11Text {
         if self
             .draw
             .as_ref()
-            .is_some_and(|(current, _)| *current == drawable)
+            .is_some_and(|resource| resource.drawable == drawable)
         {
-            if let Some((_, draw)) = self.draw.take() {
+            if let Some(resource) = self.draw.take() {
+                trace_xft(format_args!(
+                    "XFT_DRAW_DESTROY seq={} role={} draw_ptr={:p} drawable=0x{:x} picture=0x{:x} reason=release",
+                    resource.sequence, resource.role, resource.draw, resource.drawable, resource.picture
+                ));
                 unsafe {
-                    xft::XftDrawDestroy(draw);
+                    xft::XftDrawDestroy(resource.draw);
                     xlib::XSync(self.display, 0);
                 }
             }
@@ -176,9 +236,10 @@ impl X11Text {
         y: i32,
         color: u32,
     ) -> Result<(), Box<dyn Error>> {
-        let Some((_, draw)) = self.draw else {
+        let Some(resource) = self.draw.as_ref() else {
             return Err("Xft drawable is not initialized".into());
         };
+        let draw = resource.draw;
         let text = CString::new(text)?;
         let mut xft_color = unsafe { std::mem::zeroed::<xft::XftColor>() };
         let value = xrender::XRenderColor {
@@ -249,8 +310,12 @@ impl X11Text {
 impl Drop for X11Text {
     fn drop(&mut self) {
         unsafe {
-            if let Some((_, draw)) = self.draw.take() {
-                xft::XftDrawDestroy(draw);
+            if let Some(resource) = self.draw.take() {
+                trace_xft(format_args!(
+                    "XFT_DRAW_DESTROY seq={} role={} draw_ptr={:p} drawable=0x{:x} picture=0x{:x} reason=drop",
+                    resource.sequence, resource.role, resource.draw, resource.drawable, resource.picture
+                ));
+                xft::XftDrawDestroy(resource.draw);
             }
             xft::XftFontClose(self.display, self.popup_font);
             xft::XftFontClose(self.display, self.status_icon_font);
