@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::{c_int, CString};
 use std::fmt::Arguments;
@@ -8,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ui::style::{FontMetrics, FontSpec, TextMeasurer, TypographyRole, TYPOGRAPHY};
 use x11::{xft, xlib, xrender};
+
+use super::surface::SurfaceVisual;
 
 static XFT_DRAW_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -35,6 +38,10 @@ struct DrawResource {
     sequence: u64,
     role: &'static str,
     drawable: u32,
+    visual_id: u32,
+    depth: u8,
+    visual: *mut xlib::Visual,
+    colormap: u32,
     draw: *mut xft::XftDraw,
     picture: u64,
 }
@@ -51,6 +58,7 @@ pub struct X11Text {
     popup_metrics: FontMetrics,
     status_icon_metrics: FontMetrics,
     status_icon_font_name: CString,
+    resolved_visuals: HashMap<u32, *mut xlib::XVisualInfo>,
 }
 
 impl X11Text {
@@ -92,6 +100,7 @@ impl X11Text {
                 descent: unsafe { (*status_icon_font).descent as i16 },
             },
             status_icon_font_name,
+            resolved_visuals: HashMap::new(),
         })
     }
 
@@ -132,36 +141,55 @@ impl X11Text {
         self.status_icon_metrics.centered_baseline(height)
     }
 
+    fn resolve_visual(&mut self, visual_id: u32) -> Result<*mut xlib::Visual, Box<dyn Error>> {
+        if let Some(info) = self.resolved_visuals.get(&visual_id) {
+            return Ok(unsafe { (**info).visual });
+        }
+        let screen = unsafe { xlib::XDefaultScreen(self.display) };
+        let mut template = unsafe { std::mem::zeroed::<xlib::XVisualInfo>() };
+        template.visualid = visual_id as _;
+        template.screen = screen;
+        let mut count = 0;
+        let info = unsafe {
+            xlib::XGetVisualInfo(
+                self.display,
+                xlib::VisualIDMask | xlib::VisualScreenMask,
+                &mut template,
+                &mut count,
+            )
+        };
+        if info.is_null() || count == 0 || unsafe { (*info).visual.is_null() } {
+            if !info.is_null() {
+                unsafe { xlib::XFree(info.cast()) };
+            }
+            return Err(format!("XGetVisualInfo failed for visual=0x{visual_id:x}").into());
+        }
+        let visual = unsafe { (*info).visual };
+        self.resolved_visuals.insert(visual_id, info);
+        Ok(visual)
+    }
+
     pub fn prepare_drawable(
         &mut self,
         role: &'static str,
         drawable: u32,
-        drawable_visual: u32,
-        drawable_depth: u8,
+        surface: SurfaceVisual,
     ) -> Result<(), Box<dyn Error>> {
-        if self
-            .draw
-            .as_ref()
-            .is_some_and(|resource| resource.drawable == drawable)
-        {
+        if self.draw.as_ref().is_some_and(|resource| {
+            resource.drawable == drawable
+                && resource.visual_id == surface.visual
+                && resource.depth == surface.depth
+                && resource.colormap == surface.colormap
+        }) {
             return Ok(());
         }
-        let screen = unsafe { xlib::XDefaultScreen(self.display) };
-        let visual = unsafe { xlib::XDefaultVisual(self.display, screen) };
-        let default_visual = unsafe { xlib::XVisualIDFromVisual(visual) };
-        let default_depth = unsafe { xlib::XDefaultDepth(self.display, screen) };
-        if drawable_visual as u64 != default_visual || drawable_depth as c_int != default_depth {
-            return Err(format!(
-                "Xft visual mismatch: drawable visual=0x{drawable_visual:x} depth={drawable_depth}, default visual=0x{default_visual:x} depth={default_depth}"
-            )
-            .into());
-        }
+        let visual = self.resolve_visual(surface.visual)?;
         let draw = unsafe {
             xft::XftDrawCreate(
                 self.display,
                 drawable as u64,
                 visual,
-                xlib::XDefaultColormap(self.display, screen),
+                surface.colormap as u64,
             )
         };
         if draw.is_null() {
@@ -185,6 +213,10 @@ impl X11Text {
             sequence,
             role,
             drawable,
+            visual_id: surface.visual,
+            depth: surface.depth,
+            visual,
+            colormap: surface.colormap,
             draw,
             picture,
         };
@@ -224,6 +256,12 @@ impl X11Text {
         }
     }
 
+    pub fn release_active_drawable(&mut self) {
+        if let Some(drawable) = self.draw.as_ref().map(|resource| resource.drawable) {
+            self.release_drawable(drawable);
+        }
+    }
+
     pub fn draw_utf8(&self, text: &str, x: i32, y: i32, color: u32) -> Result<(), Box<dyn Error>> {
         self.draw_with_font(self.bar_font, text, x, y, color)
     }
@@ -258,11 +296,14 @@ impl X11Text {
             blue: ((color & 0xff) as u16) * 257,
             alpha: u16::MAX,
         };
-        let screen = unsafe { xlib::XDefaultScreen(self.display) };
-        let visual = unsafe { xlib::XDefaultVisual(self.display, screen) };
-        let colormap = unsafe { xlib::XDefaultColormap(self.display, screen) };
         if unsafe {
-            xft::XftColorAllocValue(self.display, visual, colormap, &value, &mut xft_color)
+            xft::XftColorAllocValue(
+                self.display,
+                resource.visual,
+                resource.colormap as u64,
+                &value,
+                &mut xft_color,
+            )
         } == 0
         {
             return Err("XftColorAllocValue failed".into());
@@ -277,7 +318,12 @@ impl X11Text {
                 text.as_ptr() as *const u8,
                 text.as_bytes().len() as c_int,
             );
-            xft::XftColorFree(self.display, visual, colormap, &mut xft_color);
+            xft::XftColorFree(
+                self.display,
+                resource.visual,
+                resource.colormap as u64,
+                &mut xft_color,
+            );
         }
         Ok(())
     }
@@ -330,6 +376,9 @@ impl Drop for X11Text {
             xft::XftFontClose(self.display, self.popup_font);
             xft::XftFontClose(self.display, self.status_icon_font);
             xft::XftFontClose(self.display, self.bar_font);
+            for info in self.resolved_visuals.drain().map(|(_, info)| info) {
+                xlib::XFree(info.cast());
+            }
             xlib::XCloseDisplay(self.display);
         }
     }

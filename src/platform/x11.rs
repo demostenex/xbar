@@ -10,6 +10,7 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::{self, ConnectionExt as RandrExt};
+use x11rb::protocol::render::{self, ConnectionExt as RenderExt};
 use x11rb::protocol::xproto::{
     self, Atom, AtomEnum, ConnectionExt as XprotoExt, EventMask, WindowClass,
 };
@@ -17,6 +18,7 @@ use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as WrapperExt;
 use x11rb::xcb_ffi::XCBConnection;
 
+use super::surface::{select_argb_visual, SurfaceVisual, VisualCandidate};
 use super::x11_text::X11Text;
 
 fn trace_x11_resource(event: &str, role: &str, xid: u32) {
@@ -80,6 +82,8 @@ pub struct X11Platform {
     text: X11Text,
     conn: XCBConnection,
     root: u32,
+    default_surface: SurfaceVisual,
+    dock_surface: SurfaceVisual,
     atoms: Atoms,
     instance_window: Option<u32>,
     windows: Vec<BarWindow>,
@@ -352,10 +356,84 @@ fn workspace_as_menu(rect: layout::WorkspaceRect) -> layout::MenuRect {
     }
 }
 
+fn render_alpha_mask(
+    formats: Option<&render::QueryPictFormatsReply>,
+    screen: usize,
+    visual: u32,
+    depth: u8,
+) -> u16 {
+    let Some(formats) = formats else {
+        return 0;
+    };
+    let Some(visual_format) = formats.screens.get(screen).and_then(|screen| {
+        screen
+            .depths
+            .iter()
+            .find(|candidate| candidate.depth == depth)
+            .and_then(|depth| {
+                depth
+                    .visuals
+                    .iter()
+                    .find(|candidate| candidate.visual == visual)
+            })
+    }) else {
+        return 0;
+    };
+    formats
+        .formats
+        .iter()
+        .find(|format| {
+            format.id == visual_format.format
+                && format.type_ == render::PictType::DIRECT
+                && format.depth == depth
+        })
+        .map(|format| format.direct.alpha_mask)
+        .unwrap_or(0)
+}
+
 impl X11Platform {
+    fn create_surface_window(
+        &self,
+        surface: SurfaceVisual,
+        window: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        border_width: u16,
+        background: u32,
+        event_mask: EventMask,
+    ) -> Result<(), Box<dyn Error>> {
+        self.conn
+            .create_window(
+                surface.depth,
+                window,
+                self.root,
+                x,
+                y,
+                width,
+                height,
+                border_width,
+                WindowClass::INPUT_OUTPUT,
+                surface.visual,
+                &xproto::CreateWindowAux::new()
+                    .colormap(surface.colormap)
+                    .background_pixel(surface.opaque_pixel(background))
+                    .event_mask(event_mask),
+            )?
+            .check()?;
+        Ok(())
+    }
+
     pub fn connect() -> Result<Self, Box<dyn Error>> {
         let (conn, screen) = XCBConnection::connect(None)?;
-        let root = conn.setup().roots[screen].root;
+        let root_screen = &conn.setup().roots[screen];
+        let root = root_screen.root;
+        let default_surface = SurfaceVisual::default(
+            root_screen.root_visual,
+            root_screen.root_depth,
+            root_screen.default_colormap,
+        );
         let intern = |n: &[u8]| -> Result<Atom, Box<dyn Error>> {
             Ok(conn.intern_atom(false, n)?.reply()?.atom)
         };
@@ -384,7 +462,60 @@ impl X11Platform {
             net_client_list: intern(b"_NET_CLIENT_LIST")?,
             net_wm_window_opacity: intern(b"_NET_WM_WINDOW_OPACITY")?,
         };
+        let render_formats = conn
+            .render_query_pict_formats()
+            .ok()
+            .and_then(|reply| reply.reply().ok());
         let text = X11Text::open()?;
+        let mut candidates = Vec::new();
+        for depth in root_screen
+            .allowed_depths
+            .iter()
+            .filter(|depth| depth.depth == 32)
+        {
+            for visual in &depth.visuals {
+                candidates.push(VisualCandidate {
+                    visual: visual.visual_id,
+                    depth: depth.depth,
+                    true_color: visual.class == xproto::VisualClass::TRUE_COLOR,
+                    alpha_mask: render_alpha_mask(
+                        render_formats.as_ref(),
+                        screen,
+                        visual.visual_id,
+                        depth.depth,
+                    ),
+                });
+            }
+        }
+        let dock_surface = select_argb_visual(&candidates)
+            .and_then(|candidate| {
+                let colormap = conn.generate_id().ok()?;
+                conn.create_colormap(
+                    xproto::ColormapAlloc::NONE,
+                    colormap,
+                    root,
+                    candidate.visual,
+                )
+                .ok()?
+                .check()
+                .ok()?;
+                Some(SurfaceVisual::argb(
+                    candidate.visual,
+                    colormap,
+                    candidate.alpha_mask,
+                ))
+            })
+            .unwrap_or(default_surface);
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!(
+                "xbar trace: dock surface kind={:?} visual=0x{:x} depth={} colormap=0x{:x} alpha_mask=0x{:x}",
+                dock_surface.kind,
+                dock_surface.visual,
+                dock_surface.depth,
+                dock_surface.colormap,
+                dock_surface.alpha_mask,
+            );
+        }
         conn.change_window_attributes(
             root,
             &xproto::ChangeWindowAttributesAux::new()
@@ -401,6 +532,8 @@ impl X11Platform {
         Ok(Self {
             conn,
             root,
+            default_surface,
+            dock_surface,
             atoms,
             text,
             instance_window: None,
@@ -949,29 +1082,21 @@ impl X11Platform {
         for output in outputs {
             let window = self.conn.generate_id()?;
             trace_x11_resource("WINDOW_CREATE", "bar", window);
-            self.conn
-                .create_window(
-                    x11rb::COPY_FROM_PARENT as u8,
-                    window,
-                    self.root,
-                    output.x,
-                    output.y,
-                    output.width,
-                    BAR_HEIGHT,
-                    0_u16,
-                    WindowClass::INPUT_OUTPUT,
-                    x11rb::COPY_FROM_PARENT,
-                    &xproto::CreateWindowAux::new()
-                        .background_pixel(BAR_STYLE.background)
-                        .event_mask(
-                            EventMask::EXPOSURE
-                                | EventMask::BUTTON_PRESS
-                                | EventMask::POINTER_MOTION
-                                | EventMask::ENTER_WINDOW
-                                | EventMask::LEAVE_WINDOW,
-                        ),
-                )?
-                .check()?;
+            self.create_surface_window(
+                self.dock_surface,
+                window,
+                output.x,
+                output.y,
+                output.width,
+                BAR_HEIGHT,
+                0,
+                BAR_STYLE.background,
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::POINTER_MOTION
+                    | EventMask::ENTER_WINDOW
+                    | EventMask::LEAVE_WINDOW,
+            )?;
             self.conn
                 .change_property32(
                     xproto::PropMode::REPLACE,
@@ -1214,10 +1339,8 @@ impl X11Platform {
             width,
             height,
         });
-        let geometry = self.conn.get_geometry(window)?.reply()?;
-        let attrs = self.conn.get_window_attributes(window)?.reply()?;
         self.text
-            .prepare_drawable("notification", window, attrs.visual, geometry.depth)?;
+            .prepare_drawable("notification", window, self.default_surface)?;
         let gc = self.conn.generate_id()?;
         self.conn
             .create_gc(
@@ -1288,16 +1411,15 @@ impl X11Platform {
             let Some(output) = state.outputs.iter().find(|output| output.id == bar.output) else {
                 continue;
             };
-            let geometry = self.conn.get_geometry(bar.window)?.reply()?;
-            let attributes = self.conn.get_window_attributes(bar.window)?.reply()?;
             self.text
-                .prepare_drawable("bar", bar.window, attributes.visual, geometry.depth)?;
+                .prepare_drawable("bar", bar.window, self.dock_surface)?;
             let gc = self.conn.generate_id()?;
             self.conn
                 .create_gc(
                     gc,
                     bar.window,
-                    &xproto::CreateGCAux::new().foreground(BAR_STYLE.background),
+                    &xproto::CreateGCAux::new()
+                        .foreground(self.dock_surface.opaque_pixel(BAR_STYLE.background)),
                 )?
                 .check()?;
             let previous_context = self.previous_contexts.get(&bar.window).cloned();
@@ -1486,7 +1608,11 @@ impl X11Platform {
                     BAR_STYLE.background
                 };
                 self.conn
-                    .change_gc(gc, &xproto::ChangeGCAux::new().foreground(color))?
+                    .change_gc(
+                        gc,
+                        &xproto::ChangeGCAux::new()
+                            .foreground(self.dock_surface.opaque_pixel(color)),
+                    )?
                     .check()?;
                 self.conn.poly_fill_rectangle(
                     bar.window,
@@ -1501,7 +1627,10 @@ impl X11Platform {
                 self.conn
                     .change_gc(
                         gc,
-                        &xproto::ChangeGCAux::new().foreground(BAR_STYLE.workspace_foreground),
+                        &xproto::ChangeGCAux::new().foreground(
+                            self.dock_surface
+                                .opaque_pixel(BAR_STYLE.workspace_foreground),
+                        ),
                     )?
                     .check()?;
                 self.text.draw_utf8(
@@ -1519,7 +1648,7 @@ impl X11Platform {
                 self.conn
                     .change_gc(
                         gc,
-                        &xproto::ChangeGCAux::new().foreground(
+                        &xproto::ChangeGCAux::new().foreground(self.dock_surface.opaque_pixel(
                             if state.menu_interaction.hovered_path.last() == Some(&item.id) {
                                 BAR_STYLE.menu_hover_foreground
                             } else if item.enabled {
@@ -1527,7 +1656,7 @@ impl X11Platform {
                             } else {
                                 BAR_STYLE.menu_disabled_foreground
                             },
-                        ),
+                        )),
                     )?
                     .check()?;
                 let color = if state.menu_interaction.hovered_path.last() == Some(&item.id) {
@@ -1627,7 +1756,9 @@ impl X11Platform {
                         self.conn
                             .change_gc(
                                 gc,
-                                &xproto::ChangeGCAux::new().foreground(pixel & 0x00ff_ffff),
+                                &xproto::ChangeGCAux::new().foreground(
+                                    self.dock_surface.opaque_pixel(pixel & 0x00ff_ffff),
+                                ),
                             )?
                             .check()?;
                         self.conn.poly_fill_rectangle(
@@ -1875,10 +2006,8 @@ impl X11Platform {
                 )?
                 .check()?;
         }
-        let geometry = self.conn.get_geometry(window)?.reply()?;
-        let attributes = self.conn.get_window_attributes(window)?.reply()?;
         self.text
-            .prepare_drawable("audio-popup", window, attributes.visual, geometry.depth)?;
+            .prepare_drawable("audio-popup", window, self.default_surface)?;
         let gc = self.conn.generate_id()?;
         self.conn
             .create_gc(
@@ -2091,10 +2220,8 @@ impl X11Platform {
                 )?
                 .check()?;
         }
-        let geometry = self.conn.get_geometry(window)?.reply()?;
-        let attrs = self.conn.get_window_attributes(window)?.reply()?;
         self.text
-            .prepare_drawable("bluetooth-popup", window, attrs.visual, geometry.depth)?;
+            .prepare_drawable("bluetooth-popup", window, self.default_surface)?;
         let gc = self.conn.generate_id()?;
         self.conn
             .create_gc(
@@ -2300,10 +2427,8 @@ impl X11Platform {
                 )?
                 .check()?;
         }
-        let geometry = self.conn.get_geometry(window)?.reply()?;
-        let attrs = self.conn.get_window_attributes(window)?.reply()?;
         self.text
-            .prepare_drawable("network-popup", window, attrs.visual, geometry.depth)?;
+            .prepare_drawable("network-popup", window, self.default_surface)?;
         let gc = self.conn.generate_id()?;
         self.conn
             .create_gc(
@@ -2634,10 +2759,8 @@ impl X11Platform {
                     .check()?;
                 self.conn.map_window(window)?.check()?;
             }
-            let geometry = self.conn.get_geometry(window)?.reply()?;
-            let attributes = self.conn.get_window_attributes(window)?.reply()?;
             self.text
-                .prepare_drawable("menu-popup", window, attributes.visual, geometry.depth)?;
+                .prepare_drawable("menu-popup", window, self.default_surface)?;
             let gc = self.conn.generate_id()?;
             self.conn
                 .create_gc(
@@ -3033,6 +3156,37 @@ impl X11Platform {
             }
         }
         HitTarget::Outside
+    }
+}
+
+impl Drop for X11Platform {
+    fn drop(&mut self) {
+        self.text.release_active_drawable();
+
+        for popup in self.popups.drain(..) {
+            let _ = self.conn.destroy_window(popup.window);
+        }
+        for window in [
+            self.audio_popup.take().map(|popup| popup.window),
+            self.bluetooth_popup.take().map(|popup| popup.window),
+            self.network_popup.take().map(|popup| popup.window),
+            self.notification
+                .take()
+                .map(|notification| notification.window),
+            self.instance_window.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = self.conn.destroy_window(window);
+        }
+        for bar in self.windows.drain(..) {
+            let _ = self.conn.destroy_window(bar.window);
+        }
+        if let Some(colormap) = self.dock_surface.owned_colormap {
+            let _ = self.conn.free_colormap(colormap);
+        }
+        let _ = self.conn.flush();
     }
 }
 
