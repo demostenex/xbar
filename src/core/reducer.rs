@@ -80,6 +80,16 @@ fn normalize_interaction(state: &mut State) {
     }
 }
 
+/// Interactive popup ownership is separate from the focused application's
+/// loaded menu model. Opening a different popup dismisses only the menu
+/// presentation; focus/endpoint lifecycle events remain responsible for
+/// invalidating the model itself.
+fn dismiss_menu_presentation(state: &mut State) -> bool {
+    let changed = state.menu_interaction != MenuInteractionState::default();
+    state.menu_interaction = Default::default();
+    changed
+}
+
 fn patch_item(node: &mut super::MenuItem, update: &super::MenuItemPropertiesUpdate) -> bool {
     if node.id == update.item_id {
         let mut changed = false;
@@ -558,7 +568,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             let changed = state.audio_popup_open
                 || state.audio_dragging
                 || state.bluetooth_popup_open
-                || state.network_popup_open;
+                || state.network_popup_open
+                || dismiss_menu_presentation(state);
             state.audio_popup_open = false;
             state.bluetooth_popup_open = false;
             state.network_popup_open = false;
@@ -762,8 +773,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.audio_dragging = false;
                 state.audio_drag_input = false;
                 state.bluetooth_popup_open = false;
-                state.menu = MenuState::NoMenu;
-                state.menu_interaction = Default::default();
+                dismiss_menu_presentation(state);
                 true
             }
         }
@@ -860,8 +870,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.audio_popup_open = false;
                 state.audio_dragging = false;
                 state.audio_drag_input = false;
-                state.menu = MenuState::NoMenu;
-                state.menu_interaction = Default::default();
+                dismiss_menu_presentation(state);
                 state.network_popup_open = false;
             }
             true
@@ -909,8 +918,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             if state.audio_popup_open {
                 state.bluetooth_popup_open = false;
                 state.network_popup_open = false;
-                state.menu = MenuState::NoMenu;
-                state.menu_interaction = Default::default();
+                dismiss_menu_presentation(state);
             }
             true
         }
@@ -2592,6 +2600,113 @@ mod tests {
                 }],
             },
         }
+    }
+
+    fn loaded_menu_with_open_presentation() -> (State, MenuRegistry) {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        registry.register(WindowId(7), ep().service.clone(), ep().object_path.clone());
+        state.focused_window = Some(WindowId(7));
+        state.menu = MenuState::Loaded {
+            window_id: WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+            model: interactive_model(),
+        };
+        state.menu_interaction = MenuInteractionState {
+            open_root: Some(MenuItemId(1)),
+            open_path: vec![MenuItemId(1), MenuItemId(2)],
+            hovered_path: vec![MenuItemId(1), MenuItemId(2)],
+            ..Default::default()
+        };
+        (state, registry)
+    }
+
+    #[test]
+    fn non_menu_popup_opening_preserves_loaded_model_and_dismisses_menu_presentation() {
+        let cases = [
+            ("network", Event::NetworkPopupOpenRequested),
+            ("audio", Event::AudioPopupToggled),
+            ("bluetooth", Event::BluetoothPopupToggled),
+        ];
+
+        for (name, event) in cases {
+            let (mut state, mut registry) = loaded_menu_with_open_presentation();
+            state.network_status_authoritative = true;
+
+            assert!(reduce(&mut state, event, &mut registry), "{name}");
+            assert!(matches!(state.menu, MenuState::Loaded { .. }), "{name}");
+            assert_eq!(
+                state.menu_interaction,
+                MenuInteractionState::default(),
+                "{name}"
+            );
+            match name {
+                "network" => assert!(state.network_popup_open),
+                "audio" => assert!(state.audio_popup_open),
+                "bluetooth" => assert!(state.bluetooth_popup_open),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn tray_menu_open_dismisses_global_menu_presentation_without_discarding_model() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        let global_model = match &state.menu {
+            MenuState::Loaded {
+                window_id,
+                endpoint,
+                model,
+            } => (*window_id, endpoint.clone(), model.clone()),
+            _ => unreachable!(),
+        };
+        state.global_menu_model = Some(global_model.clone());
+
+        assert!(reduce(
+            &mut state,
+            Event::TrayMenuOpenRequested { endpoint: ep() },
+            &mut registry,
+        ));
+        assert!(matches!(state.menu, MenuState::Loaded { .. }));
+        assert_eq!(state.menu_interaction, MenuInteractionState::default());
+        assert_eq!(state.global_menu_model, Some(global_model.clone()));
+
+        let tray = MenuEndpoint {
+            service: ":1.10".into(),
+            object_path: "/tray-menu".into(),
+        };
+        assert!(reduce(
+            &mut state,
+            Event::MenuLoadRequested {
+                window_id: WindowId(u32::MAX),
+                endpoint: MenuSource::Tray(tray),
+                request_id: 9,
+            },
+            &mut registry,
+        ));
+        assert!(matches!(state.menu, MenuState::TrayLoading { .. }));
+        assert_eq!(state.global_menu_model, Some(global_model));
+    }
+
+    #[test]
+    fn focus_and_menu_owner_lifecycle_still_discard_loaded_model() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        assert!(reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry,
+        ));
+        assert!(matches!(state.menu, MenuState::NoMenu));
+
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        assert!(reduce(
+            &mut state,
+            Event::MenuUnregistered {
+                window_id: WindowId(7),
+            },
+            &mut registry,
+        ));
+        assert!(matches!(state.menu, MenuState::NoMenu));
     }
 
     #[test]
