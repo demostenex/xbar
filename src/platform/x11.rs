@@ -117,6 +117,34 @@ struct Atoms {
     net_client_list: Atom,
     net_wm_window_opacity: Atom,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttentionPropertyRead<T> {
+    Value(T),
+    WindowGone,
+}
+
+fn classify_attention_property_reply<T>(
+    window: u32,
+    reply: Result<T, x11rb::errors::ReplyError>,
+) -> Result<AttentionPropertyRead<T>, x11rb::errors::ReplyError> {
+    match reply {
+        Ok(value) => Ok(AttentionPropertyRead::Value(value)),
+        Err(x11rb::errors::ReplyError::X11Error(error))
+            if error.error_kind == x11rb::protocol::ErrorKind::Window
+                && error.bad_value == window =>
+        {
+            Ok(AttentionPropertyRead::WindowGone)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AttentionProperty {
+    NetWmState,
+    WmHints,
+}
 struct BarWindow {
     output: OutputId,
     window: u32,
@@ -596,7 +624,14 @@ impl X11Platform {
             Some(Event::PropertyNotify(event))
                 if event.atom == self.atoms.net_wm_state || event.atom == self.atoms.wm_hints =>
             {
-                self.attention_event(event.window)?
+                if self.is_xbar_owned_window(event.window) {
+                    None
+                } else {
+                    match self.attention_event(event.window)? {
+                        AttentionPropertyRead::Value(event) => Some(event),
+                        AttentionPropertyRead::WindowGone => None,
+                    }
+                }
             }
             Some(Event::PropertyNotify(event)) if self.is_gtk_atom(event.atom) => {
                 Some(X11Event::GtkWindowChanged(WindowId(event.window)))
@@ -612,36 +647,55 @@ impl X11Platform {
         })
     }
 
-    fn attention_event(&self, window: u32) -> Result<Option<X11Event>, Box<dyn Error>> {
-        if self.is_xbar_owned_window(window) {
-            return Ok(None);
-        }
-        let states = self
-            .conn
-            .get_property(
-                false,
-                window,
-                self.atoms.net_wm_state,
-                AtomEnum::ATOM,
-                0,
-                u32::MAX,
-            )?
-            .reply()?
+    fn attention_event(
+        &self,
+        window: u32,
+    ) -> Result<AttentionPropertyRead<X11Event>, Box<dyn Error>> {
+        let AttentionPropertyRead::Value(states) =
+            self.read_attention_property(window, AttentionProperty::NetWmState)?
+        else {
+            return Ok(AttentionPropertyRead::WindowGone);
+        };
+        let states = states
             .value32()
             .map(|values| values.collect::<Vec<_>>())
             .unwrap_or_default();
-        let urgency = self
-            .conn
-            .get_property(false, window, self.atoms.wm_hints, AtomEnum::ANY, 0, 9)?
-            .reply()?
+        let AttentionPropertyRead::Value(hints) =
+            self.read_attention_property(window, AttentionProperty::WmHints)?
+        else {
+            return Ok(AttentionPropertyRead::WindowGone);
+        };
+        let urgency = hints
             .value32()
             .and_then(|mut values| values.next())
             .is_some_and(|flags| flags & (1 << 8) != 0);
-        Ok(Some(X11Event::WindowAttentionChanged {
-            window: WindowId(window),
-            app_name: self.window_name(window),
-            attention: states.contains(&self.atoms.demands_attention) || urgency,
-        }))
+        Ok(AttentionPropertyRead::Value(
+            X11Event::WindowAttentionChanged {
+                window: WindowId(window),
+                app_name: self.window_name(window),
+                attention: states.contains(&self.atoms.demands_attention) || urgency,
+            },
+        ))
+    }
+
+    fn read_attention_property(
+        &self,
+        window: u32,
+        property: AttentionProperty,
+    ) -> Result<AttentionPropertyRead<xproto::GetPropertyReply>, Box<dyn Error>> {
+        let (atom, type_, long_length) = match property {
+            AttentionProperty::NetWmState => (self.atoms.net_wm_state, AtomEnum::ATOM, u32::MAX),
+            AttentionProperty::WmHints => (self.atoms.wm_hints, AtomEnum::ANY, 9),
+        };
+        let reply = self
+            .conn
+            .get_property(false, window, atom, type_, 0, long_length)?
+            .reply();
+        match classify_attention_property_reply(window, reply) {
+            Ok(AttentionPropertyRead::WindowGone) => Ok(AttentionPropertyRead::WindowGone),
+            Ok(AttentionPropertyRead::Value(reply)) => Ok(AttentionPropertyRead::Value(reply)),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn window_name(&self, window: u32) -> String {
@@ -790,8 +844,9 @@ impl X11Platform {
                 continue;
             }
             if self.select_property_events(window, "attention-startup")? {
-                if let Some(event) = self.attention_event(window)? {
-                    events.push(event);
+                match self.attention_event(window)? {
+                    AttentionPropertyRead::Value(event) => events.push(event),
+                    AttentionPropertyRead::WindowGone => {}
                 }
             }
         }
@@ -3023,9 +3078,125 @@ fn is_xbar_owned_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_xbar_owned_window, tray_hit, RenderTarget};
+    use super::{
+        classify_attention_property_reply, is_xbar_owned_window, tray_hit, AttentionPropertyRead,
+        RenderTarget,
+    };
     use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
     use crate::ui::{layout::MenuRect, view::TrayVisualItem};
+    use x11rb::errors::ReplyError;
+    use x11rb::protocol::ErrorKind;
+    use x11rb::x11_utils::X11Error;
+
+    fn x11_error(kind: ErrorKind, bad_value: u32) -> ReplyError {
+        ReplyError::X11Error(X11Error {
+            error_kind: kind,
+            error_code: 3,
+            sequence: 1,
+            bad_value,
+            minor_opcode: 0,
+            major_opcode: 20,
+            extension_name: None,
+            request_name: Some("GetProperty"),
+        })
+    }
+
+    #[test]
+    fn attention_net_wm_state_bad_window_is_window_gone() {
+        assert!(matches!(
+            classify_attention_property_reply::<()>(
+                0x03a0_0006,
+                Err(x11_error(ErrorKind::Window, 0x03a0_0006)),
+            ),
+            Ok(AttentionPropertyRead::WindowGone),
+        ));
+    }
+
+    #[test]
+    fn attention_wm_hints_bad_window_is_window_gone() {
+        assert!(matches!(
+            classify_attention_property_reply::<()>(
+                0x03a0_0006,
+                Err(x11_error(ErrorKind::Window, 0x03a0_0006)),
+            ),
+            Ok(AttentionPropertyRead::WindowGone),
+        ));
+    }
+
+    #[test]
+    fn attention_wm_hints_disappearance_after_state_success_discards_snapshot() {
+        assert!(matches!(
+            classify_attention_property_reply(0x03a0_0006, Ok(())),
+            Ok(AttentionPropertyRead::Value(())),
+        ));
+        assert!(matches!(
+            classify_attention_property_reply::<()>(
+                0x03a0_0006,
+                Err(x11_error(ErrorKind::Window, 0x03a0_0006)),
+            ),
+            Ok(AttentionPropertyRead::WindowGone),
+        ));
+    }
+
+    #[test]
+    fn attention_unrelated_x11_error_is_propagated() {
+        assert!(classify_attention_property_reply::<()>(
+            0x03a0_0006,
+            Err(x11_error(ErrorKind::Match, 0x03a0_0006)),
+        )
+        .is_err());
+        assert!(classify_attention_property_reply::<()>(
+            0x03a0_0006,
+            Err(x11_error(ErrorKind::Window, 0x03a0_0007)),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn property_notify_stale_attention_window_produces_no_attention_value() {
+        let result = classify_attention_property_reply::<bool>(
+            0x03a0_0006,
+            Err(x11_error(ErrorKind::Window, 0x03a0_0006)),
+        )
+        .expect("a stale attention window is non-fatal");
+        assert!(matches!(result, AttentionPropertyRead::WindowGone));
+    }
+
+    #[test]
+    fn attention_discovery_skips_a_stale_window_and_keeps_later_clients() {
+        let reads = [
+            classify_attention_property_reply::<u32>(
+                0x03a0_0006,
+                Err(x11_error(ErrorKind::Window, 0x03a0_0006)),
+            )
+            .expect("stale client is non-fatal"),
+            classify_attention_property_reply(0x03a0_0007, Ok(7_u32))
+                .expect("live client remains readable"),
+        ];
+        let values = reads
+            .into_iter()
+            .filter_map(|read| match read {
+                AttentionPropertyRead::Value(value) => Some(value),
+                AttentionPropertyRead::WindowGone => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![7]);
+    }
+
+    #[test]
+    fn attention_window_gone_does_not_blacklist_a_reused_xid() {
+        assert!(matches!(
+            classify_attention_property_reply::<()>(
+                0x03a0_0006,
+                Err(x11_error(ErrorKind::Window, 0x03a0_0006)),
+            ),
+            Ok(AttentionPropertyRead::WindowGone),
+        ));
+        assert!(matches!(
+            classify_attention_property_reply(0x03a0_0006, Ok(42_u32)),
+            Ok(AttentionPropertyRead::Value(42)),
+        ));
+    }
 
     #[test]
     fn render_targets_merge_without_losing_required_scope() {
