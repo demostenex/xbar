@@ -6,6 +6,24 @@ pub(crate) enum SurfaceKind {
     Argb,
 }
 
+/// Xbar-owned window categories. Effects are derived from this semantic role
+/// and the resolved surface capability, never from an opacity heuristic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SurfaceRole {
+    Dock,
+    GlobalMenuPopup,
+    TrayPopup,
+    NetworkPopup,
+    BluetoothPopup,
+    AudioPopup,
+    Notification,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SurfaceEffect {
+    BlurBehind,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SurfaceVisual {
     pub(crate) kind: SurfaceKind,
@@ -85,6 +103,17 @@ impl SurfaceVisual {
         match self.kind {
             SurfaceKind::Argb => None,
             SurfaceKind::Default => Some(fallback),
+        }
+    }
+}
+
+impl SurfaceRole {
+    /// Blur is an opt-in compositor request for current ARGB glass surfaces.
+    /// Notifications retain their independently scoped default surface.
+    pub(crate) const fn effect(self, surface: SurfaceVisual) -> Option<SurfaceEffect> {
+        match (self, surface.kind) {
+            (Self::Notification, _) | (_, SurfaceKind::Default) => None,
+            _ => Some(SurfaceEffect::BlurBehind),
         }
     }
 }
@@ -238,5 +267,37 @@ mod tests {
         assert_eq!(surface.opaque_pixel(0x20_242b), 0x20_242b);
         assert_eq!(surface.owned_colormap, None);
         assert_eq!(surface.window_opacity(0.90), Some(0.90));
+    }
+
+    #[test]
+    fn all_interactive_argb_glass_roles_request_blur_behind() {
+        let surface = SurfaceVisual::argb(0x22, 0x33, ARGB_8888);
+        for role in [
+            SurfaceRole::Dock,
+            SurfaceRole::GlobalMenuPopup,
+            SurfaceRole::TrayPopup,
+            SurfaceRole::NetworkPopup,
+            SurfaceRole::BluetoothPopup,
+            SurfaceRole::AudioPopup,
+        ] {
+            assert_eq!(role.effect(surface), Some(SurfaceEffect::BlurBehind));
+        }
+        assert_eq!(SurfaceRole::Notification.effect(surface), None);
+    }
+
+    #[test]
+    fn default_surface_never_advertises_a_blur_effect() {
+        let surface = SurfaceVisual::default(0x21, 24, 0x31);
+        for role in [
+            SurfaceRole::Dock,
+            SurfaceRole::GlobalMenuPopup,
+            SurfaceRole::TrayPopup,
+            SurfaceRole::NetworkPopup,
+            SurfaceRole::BluetoothPopup,
+            SurfaceRole::AudioPopup,
+            SurfaceRole::Notification,
+        ] {
+            assert_eq!(role.effect(surface), None);
+        }
     }
 }

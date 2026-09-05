@@ -18,7 +18,10 @@ use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as WrapperExt;
 use x11rb::xcb_ffi::XCBConnection;
 
-use super::surface::{select_argb_visual, DirectPixelFormat, SurfaceVisual, VisualCandidate};
+use super::surface::{
+    select_argb_visual, DirectPixelFormat, SurfaceEffect, SurfaceRole, SurfaceVisual,
+    VisualCandidate,
+};
 use super::x11_text::X11Text;
 
 fn trace_x11_resource(event: &str, role: &str, xid: u32) {
@@ -123,6 +126,7 @@ struct Atoms {
     unity_object_path: Atom,
     net_client_list: Atom,
     net_wm_window_opacity: Atom,
+    blur_behind_region: Atom,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -407,10 +411,15 @@ struct SurfaceWindowGeometry {
     border_width: u16,
 }
 
+const fn blur_behind_rect(geometry: SurfaceWindowGeometry) -> [u32; 4] {
+    [0, 0, geometry.width as u32, geometry.height as u32]
+}
+
 impl X11Platform {
     fn create_surface_window(
         &self,
         surface: SurfaceVisual,
+        role: SurfaceRole,
         window: u32,
         geometry: SurfaceWindowGeometry,
         background: style::Rgba,
@@ -433,11 +442,37 @@ impl X11Platform {
                     .background_pixel(surface.background_pixel(background)),
             )?
             .check()?;
+        self.apply_surface_effect(surface, role, window, geometry)?;
+        Ok(())
+    }
+
+    fn apply_surface_effect(
+        &self,
+        surface: SurfaceVisual,
+        role: SurfaceRole,
+        window: u32,
+        geometry: SurfaceWindowGeometry,
+    ) -> Result<(), Box<dyn Error>> {
+        if matches!(role.effect(surface), Some(SurfaceEffect::BlurBehind)) {
+            // The compositor's positive control requests its local surface
+            // rectangle explicitly; keep the property synchronized with the
+            // real client geometry rather than emitting a degenerate rect.
+            self.conn
+                .change_property32(
+                    xproto::PropMode::REPLACE,
+                    window,
+                    self.atoms.blur_behind_region,
+                    AtomEnum::CARDINAL,
+                    &blur_behind_rect(geometry),
+                )?
+                .check()?;
+        }
         Ok(())
     }
 
     fn create_glass_popup_window(
         &self,
+        role: SurfaceRole,
         window: u32,
         rect: layout::MenuRect,
         border_width: u16,
@@ -445,6 +480,7 @@ impl X11Platform {
     ) -> Result<(), Box<dyn Error>> {
         self.create_surface_window(
             self.glass_surface,
+            role,
             window,
             SurfaceWindowGeometry {
                 x: rect.x,
@@ -525,6 +561,7 @@ impl X11Platform {
             unity_object_path: intern(b"_UNITY_OBJECT_PATH")?,
             net_client_list: intern(b"_NET_CLIENT_LIST")?,
             net_wm_window_opacity: intern(b"_NET_WM_WINDOW_OPACITY")?,
+            blur_behind_region: intern(b"_KDE_NET_WM_BLUR_BEHIND_REGION")?,
         };
         let render_formats = conn
             .render_query_pict_formats()
@@ -1152,6 +1189,7 @@ impl X11Platform {
             trace_x11_resource("WINDOW_CREATE", "bar", window);
             self.create_surface_window(
                 self.glass_surface,
+                SurfaceRole::Dock,
                 window,
                 SurfaceWindowGeometry {
                     x: output.x,
@@ -1365,24 +1403,22 @@ impl X11Platform {
         } else {
             let window = self.conn.generate_id()?;
             trace_x11_resource("WINDOW_CREATE", "notification", window);
-            self.conn
-                .create_window(
-                    x11rb::COPY_FROM_PARENT as u8,
-                    window,
-                    self.root,
+            self.create_surface_window(
+                self.default_surface,
+                SurfaceRole::Notification,
+                window,
+                SurfaceWindowGeometry {
                     x,
                     y,
                     width,
                     height,
-                    1,
-                    WindowClass::INPUT_OUTPUT,
-                    x11rb::COPY_FROM_PARENT,
-                    &xproto::CreateWindowAux::new()
-                        .background_pixel(BAR_STYLE.material.background.rgb())
-                        .override_redirect(1)
-                        .event_mask(EventMask::EXPOSURE),
-                )?
-                .check()?;
+                    border_width: 1,
+                },
+                BAR_STYLE.material.background,
+                xproto::CreateWindowAux::new()
+                    .override_redirect(1)
+                    .event_mask(EventMask::EXPOSURE),
+            )?;
             self.conn
                 .change_property32(
                     xproto::PropMode::REPLACE,
@@ -2019,6 +2055,7 @@ impl X11Platform {
             let window = self.conn.generate_id()?;
             trace_x11_resource("WINDOW_CREATE", "audio-popup", window);
             self.create_glass_popup_window(
+                SurfaceRole::AudioPopup,
                 window,
                 rect,
                 layout::AUDIO_POPUP_BORDER,
@@ -2068,6 +2105,18 @@ impl X11Platform {
                         .height(rect.height as u32),
                 )?
                 .check()?;
+            self.apply_surface_effect(
+                self.glass_surface,
+                SurfaceRole::AudioPopup,
+                window,
+                SurfaceWindowGeometry {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    border_width: layout::AUDIO_POPUP_BORDER,
+                },
+            )?;
         }
         self.text
             .prepare_drawable("audio-popup", window, self.glass_surface)?;
@@ -2240,6 +2289,7 @@ impl X11Platform {
             let w = self.conn.generate_id()?;
             trace_x11_resource("WINDOW_CREATE", "bluetooth-popup", w);
             self.create_glass_popup_window(
+                SurfaceRole::BluetoothPopup,
                 w,
                 rect,
                 1,
@@ -2269,6 +2319,18 @@ impl X11Platform {
                         .height(rect.height as u32),
                 )?
                 .check()?;
+            self.apply_surface_effect(
+                self.glass_surface,
+                SurfaceRole::BluetoothPopup,
+                window,
+                SurfaceWindowGeometry {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    border_width: 1,
+                },
+            )?;
         }
         self.text
             .prepare_drawable("bluetooth-popup", window, self.glass_surface)?;
@@ -2444,6 +2506,7 @@ impl X11Platform {
             let window = self.conn.generate_id()?;
             trace_x11_resource("WINDOW_CREATE", "network-popup", window);
             self.create_glass_popup_window(
+                SurfaceRole::NetworkPopup,
                 window,
                 rect,
                 1,
@@ -2473,6 +2536,18 @@ impl X11Platform {
                         .height(rect.height as u32),
                 )?
                 .check()?;
+            self.apply_surface_effect(
+                self.glass_surface,
+                SurfaceRole::NetworkPopup,
+                window,
+                SurfaceWindowGeometry {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    border_width: 1,
+                },
+            )?;
         }
         self.text
             .prepare_drawable("network-popup", window, self.glass_surface)?;
@@ -2713,6 +2788,11 @@ impl X11Platform {
             crate::core::MenuState::TrayLoaded { endpoint, .. } => Some(endpoint),
             _ => None,
         };
+        let popup_role = if tray_endpoint.is_some() {
+            SurfaceRole::TrayPopup
+        } else {
+            SurfaceRole::GlobalMenuPopup
+        };
         let anchor = self
             .bar_hits
             .iter()
@@ -2797,9 +2877,22 @@ impl X11Platform {
                                 .height(popup_layout.rect.height as u32),
                         )?
                         .check()?;
+                    self.apply_surface_effect(
+                        self.glass_surface,
+                        popup_role,
+                        window,
+                        SurfaceWindowGeometry {
+                            x: popup_layout.rect.x,
+                            y: popup_layout.rect.y,
+                            width: popup_layout.rect.width,
+                            height: popup_layout.rect.height,
+                            border_width: 1,
+                        },
+                    )?;
                 }
             } else {
                 self.create_glass_popup_window(
+                    popup_role,
                     window,
                     popup_layout.rect,
                     1,
@@ -3307,8 +3400,8 @@ fn is_xbar_owned_window(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_attention_property_reply, is_xbar_owned_window, tray_hit, AttentionPropertyRead,
-        RenderTarget,
+        blur_behind_rect, classify_attention_property_reply, is_xbar_owned_window, tray_hit,
+        AttentionPropertyRead, RenderTarget, SurfaceWindowGeometry,
     };
     use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
     use crate::ui::{layout::MenuRect, view::TrayVisualItem};
@@ -3327,6 +3420,30 @@ mod tests {
             extension_name: None,
             request_name: Some("GetProperty"),
         })
+    }
+
+    #[test]
+    fn blur_behind_rect_uses_the_actual_surface_dimensions() {
+        assert_eq!(
+            blur_behind_rect(SurfaceWindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 26,
+                border_width: 0,
+            }),
+            [0, 0, 1920, 26]
+        );
+        assert_eq!(
+            blur_behind_rect(SurfaceWindowGeometry {
+                x: -12,
+                y: 34,
+                width: 517,
+                height: 93,
+                border_width: 1,
+            }),
+            [0, 0, 517, 93]
+        );
     }
 
     #[test]
