@@ -2,7 +2,7 @@ use crate::core::{
     GtkMenuEndpoint, NetworkWifiTarget, OutputId, OutputState, State, StatusNotifierEndpoint,
     WindowId,
 };
-use crate::ui::style::{self, TextMeasurer, BAR_STYLE};
+use crate::ui::style::{self, TextMeasurer, BAR_STYLE, POPUP_STYLE};
 use crate::ui::{layout, view};
 use std::collections::HashMap;
 use std::error::Error;
@@ -30,6 +30,60 @@ fn trace_x11_resource(event: &str, role: &str, xid: u32) {
         let mut stderr = stderr.lock();
         let _ = writeln!(stderr, "xbar xft: {event} role={role} xid=0x{xid:x}");
         let _ = stderr.flush();
+    }
+}
+
+/// Render an eligible template pixel while retaining its source alpha as
+/// antialiasing. Color tray pixmaps bypass this function entirely.
+fn template_icon_pixel(pixel: u32, foreground: u32, background: u32) -> Option<u32> {
+    let alpha = (pixel >> 24) as u8;
+    if alpha == 0 {
+        return None;
+    }
+    if alpha == u8::MAX {
+        return Some(foreground);
+    }
+    let blend = |foreground: u8, background: u8| {
+        ((u16::from(foreground) * u16::from(alpha)
+            + u16::from(background) * u16::from(u8::MAX - alpha)
+            + 127)
+            / 255) as u8
+    };
+    Some(
+        (u32::from(blend(
+            ((foreground >> 16) & 0xff) as u8,
+            ((background >> 16) & 0xff) as u8,
+        )) << 16)
+            | (u32::from(blend(
+                ((foreground >> 8) & 0xff) as u8,
+                ((background >> 8) & 0xff) as u8,
+            )) << 8)
+            | u32::from(blend((foreground & 0xff) as u8, (background & 0xff) as u8)),
+    )
+}
+
+fn preserve_color_pixel(pixel: u32) -> Option<u32> {
+    ((pixel >> 24) as u8 != 0).then_some(pixel & 0x00ff_ffff)
+}
+
+const TRAY_ICON_MAX_SIZE: u16 = 14;
+
+fn tray_draw_size(width: u16, height: u16) -> (u16, u16) {
+    if width == 0 || height == 0 {
+        return (0, 0);
+    }
+    if width >= height {
+        (
+            TRAY_ICON_MAX_SIZE.min(width),
+            (u32::from(height) * u32::from(TRAY_ICON_MAX_SIZE.min(width)) / u32::from(width)).max(1)
+                as u16,
+        )
+    } else {
+        (
+            (u32::from(width) * u32::from(TRAY_ICON_MAX_SIZE.min(height)) / u32::from(height))
+                .max(1) as u16,
+            TRAY_ICON_MAX_SIZE.min(height),
+        )
     }
 }
 
@@ -97,6 +151,9 @@ pub struct X11Platform {
     audio_popup: Option<AudioPopupWindow>,
     bluetooth_popup: Option<BluetoothPopupWindow>,
     network_popup: Option<NetworkPopupWindow>,
+    popup_hover: Option<PopupHover>,
+    popup_hover_changed: bool,
+    hover_repaint_active: bool,
     notification: Option<NotificationWindow>,
     pointer_grabbed: bool,
     bar_hits: Vec<BarHitMap>,
@@ -127,6 +184,7 @@ struct Atoms {
     net_client_list: Atom,
     net_wm_window_opacity: Atom,
     blur_behind_region: Atom,
+    xomposite_effect_owner: Atom,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -185,6 +243,14 @@ struct NetworkPopupWindow {
     rect: layout::MenuRect,
     wireless: layout::MenuRect,
     access_points: Vec<(NetworkWifiTarget, layout::MenuRect)>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PopupHover {
+    MenuItem(crate::core::MenuItemId),
+    AudioOutputDevice(String),
+    AudioInputDevice(String),
+    NetworkWifi(NetworkWifiTarget),
+    NetworkWireless,
 }
 struct NotificationWindow {
     window: u32,
@@ -415,6 +481,17 @@ const fn blur_behind_rect(geometry: SurfaceWindowGeometry) -> [u32; 4] {
     [0, 0, geometry.width as u32, geometry.height as u32]
 }
 
+fn popup_effect_owner(windows: &[BarWindow], output: OutputId) -> Option<u32> {
+    windows
+        .iter()
+        .find(|bar| bar.output == output)
+        .map(|bar| bar.window)
+}
+
+const fn effect_owner_property_value(dock: u32) -> [u32; 1] {
+    [dock]
+}
+
 impl X11Platform {
     fn create_surface_window(
         &self,
@@ -470,6 +547,25 @@ impl X11Platform {
         Ok(())
     }
 
+    fn configure_auxiliary_effect_surface(
+        &self,
+        role: SurfaceRole,
+        popup: u32,
+        dock: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        debug_assert!(role.uses_effect_owner());
+        self.conn
+            .change_property32(
+                xproto::PropMode::REPLACE,
+                popup,
+                self.atoms.xomposite_effect_owner,
+                AtomEnum::WINDOW,
+                &effect_owner_property_value(dock),
+            )?
+            .check()?;
+        Ok(())
+    }
+
     fn create_glass_popup_window(
         &self,
         role: SurfaceRole,
@@ -478,6 +574,7 @@ impl X11Platform {
         border_width: u16,
         event_mask: EventMask,
     ) -> Result<(), Box<dyn Error>> {
+        debug_assert!(role.uses_override_redirect());
         self.create_surface_window(
             self.glass_surface,
             role,
@@ -489,11 +586,196 @@ impl X11Platform {
                 height: rect.height,
                 border_width,
             },
-            BAR_STYLE.material.background,
+            POPUP_STYLE.material.background,
             xproto::CreateWindowAux::new()
                 .override_redirect(1)
+                .border_pixel(self.glass_surface.opaque_pixel(POPUP_STYLE.border))
                 .event_mask(event_mask),
         )
+    }
+
+    fn draw_popup_frame(
+        &self,
+        window: u32,
+        gc: u32,
+        width: u16,
+        height: u16,
+    ) -> Result<(), Box<dyn Error>> {
+        self.conn
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new()
+                    .foreground(self.glass_surface.opaque_pixel(POPUP_STYLE.border)),
+            )?
+            .check()?;
+        self.conn
+            .poly_rectangle(
+                window,
+                gc,
+                &[xproto::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }],
+            )?
+            .check()?;
+        Ok(())
+    }
+
+    fn draw_popup_card(
+        &self,
+        window: u32,
+        gc: u32,
+        popup: layout::MenuRect,
+        card: layout::MenuRect,
+    ) -> Result<(), Box<dyn Error>> {
+        let x = card.x - popup.x;
+        let y = card.y - popup.y;
+        self.conn
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new().foreground(
+                    self.glass_surface
+                        .background_pixel(POPUP_STYLE.card_background),
+                ),
+            )?
+            .check()?;
+        self.fill_rounded_popup_card(window, gc, x, y, card.width, card.height)?;
+        Ok(())
+    }
+
+    fn fill_rounded_popup_card(
+        &self,
+        window: u32,
+        gc: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> Result<(), Box<dyn Error>> {
+        let radius = POPUP_STYLE.card_radius.min(width / 2).min(height / 2);
+        if radius == 0 {
+            self.conn.poly_fill_rectangle(
+                window,
+                gc,
+                &[xproto::Rectangle {
+                    x,
+                    y,
+                    width,
+                    height,
+                }],
+            )?;
+            return Ok(());
+        }
+        let mut strips = Vec::with_capacity(radius as usize * 2 + 1);
+        for offset in 0..radius {
+            let remaining = radius - offset - 1;
+            let inset = remaining.saturating_mul(remaining) / radius;
+            let strip_width = width.saturating_sub(inset.saturating_mul(2));
+            strips.push(xproto::Rectangle {
+                x: x + inset as i16,
+                y: y + offset as i16,
+                width: strip_width,
+                height: 1,
+            });
+            strips.push(xproto::Rectangle {
+                x: x + inset as i16,
+                y: y + height as i16 - offset as i16 - 1,
+                width: strip_width,
+                height: 1,
+            });
+        }
+        strips.push(xproto::Rectangle {
+            x,
+            y: y + radius as i16,
+            width,
+            height: height.saturating_sub(radius.saturating_mul(2)),
+        });
+        self.conn.poly_fill_rectangle(window, gc, &strips)?;
+        Ok(())
+    }
+
+    fn draw_popup_hover(
+        &self,
+        window: u32,
+        gc: u32,
+        popup: layout::MenuRect,
+        row: layout::MenuRect,
+    ) -> Result<(), Box<dyn Error>> {
+        self.conn
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new().foreground(
+                    self.glass_surface
+                        .background_pixel(POPUP_STYLE.hover_background),
+                ),
+            )?
+            .check()?;
+        self.conn.poly_fill_rectangle(
+            window,
+            gc,
+            &[xproto::Rectangle {
+                x: row.x - popup.x,
+                y: row.y - popup.y,
+                width: row.width,
+                height: row.height,
+            }],
+        )?;
+        Ok(())
+    }
+
+    fn draw_switch(
+        &self,
+        window: u32,
+        gc: u32,
+        popup: layout::MenuRect,
+        rect: layout::MenuRect,
+        enabled: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let track = if enabled { 0x61718a } else { 0x47515f };
+        self.conn
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new().foreground(self.glass_surface.opaque_pixel(track)),
+            )?
+            .check()?;
+        self.conn.poly_fill_rectangle(
+            window,
+            gc,
+            &[xproto::Rectangle {
+                x: rect.x - popup.x,
+                y: rect.y - popup.y,
+                width: rect.width,
+                height: rect.height,
+            }],
+        )?;
+        let thumb = rect.height.saturating_sub(6);
+        self.conn
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new().foreground(
+                    self.glass_surface
+                        .opaque_pixel(BAR_STYLE.material.foreground),
+                ),
+            )?
+            .check()?;
+        self.conn.poly_fill_rectangle(
+            window,
+            gc,
+            &[xproto::Rectangle {
+                x: rect.x - popup.x
+                    + if enabled {
+                        rect.width.saturating_sub(thumb + 3) as i16
+                    } else {
+                        3
+                    },
+                y: rect.y - popup.y + 3,
+                width: thumb,
+                height: thumb,
+            }],
+        )?;
+        Ok(())
     }
 
     fn fill_glass_background(
@@ -508,7 +790,7 @@ impl X11Platform {
                 gc,
                 &xproto::ChangeGCAux::new().foreground(
                     self.glass_surface
-                        .background_pixel(BAR_STYLE.material.background),
+                        .background_pixel(POPUP_STYLE.material.background),
                 ),
             )?
             .check()?;
@@ -562,6 +844,7 @@ impl X11Platform {
             net_client_list: intern(b"_NET_CLIENT_LIST")?,
             net_wm_window_opacity: intern(b"_NET_WM_WINDOW_OPACITY")?,
             blur_behind_region: intern(b"_KDE_NET_WM_BLUR_BEHIND_REGION")?,
+            xomposite_effect_owner: intern(b"_XOMPOSITE_EFFECT_OWNER")?,
         };
         let render_formats = conn
             .render_query_pict_formats()
@@ -647,6 +930,9 @@ impl X11Platform {
             audio_popup: None,
             bluetooth_popup: None,
             network_popup: None,
+            popup_hover: None,
+            popup_hover_changed: false,
+            hover_repaint_active: false,
             notification: None,
             pointer_grabbed: false,
             bar_hits: Vec::new(),
@@ -664,6 +950,21 @@ impl X11Platform {
     }
     pub fn pointer_grabbed(&self) -> bool {
         self.pointer_grabbed
+    }
+
+    /// Hover is renderer-local presentation state. It never changes a domain
+    /// model or action; a changed target asks only the mapped popup to redraw.
+    pub fn update_popup_hover(&mut self, target: Option<&HitTarget>) -> bool {
+        let (next, changed) = popup_hover_transition(&self.popup_hover, target);
+        if changed {
+            self.popup_hover = next;
+            self.popup_hover_changed = true;
+        }
+        changed
+    }
+
+    fn should_skip_popup_clear_for_hover(&self) -> bool {
+        self.hover_repaint_active
     }
 
     pub fn audio_track_percent(&self, event: &X11Event) -> Option<u32> {
@@ -1300,7 +1601,13 @@ impl X11Platform {
             self.render_dock(state, target)?;
         }
         if target.contains(RenderTarget::POPUP) {
-            self.reconcile_interactive_popup_surfaces(state)?;
+            // A hover transition only changes already-mapped popup content.
+            // Do not clear the ARGB surface (which briefly reveals its backdrop)
+            // and do not run structural popup reconciliation in that path.
+            self.hover_repaint_active = std::mem::take(&mut self.popup_hover_changed);
+            if !self.hover_repaint_active {
+                self.reconcile_interactive_popup_surfaces(state)?;
+            }
             if !state.audio_popup_open && !state.bluetooth_popup_open && !state.network_popup_open {
                 self.render_popups(state)?;
             } else {
@@ -1319,6 +1626,7 @@ impl X11Platform {
             } else {
                 self.render_audio_popup(state)?;
             }
+            self.hover_repaint_active = false;
         }
         if target.contains(RenderTarget::NOTIFICATION) {
             self.render_notification(state)?;
@@ -1850,8 +2158,7 @@ impl X11Platform {
                     height,
                     argb,
                 } = &tray.icon;
-                let draw_width = (*width).min(tray.rect.width);
-                let draw_height = (*height).min(tray.rect.height);
+                let (draw_width, draw_height) = tray_draw_size(*width, *height);
                 let x0 = tray.rect.x.saturating_sub(output.x)
                     + ((tray.rect.width - draw_width) / 2) as i16;
                 let y0 = tray.rect.y.saturating_sub(output.y)
@@ -1861,17 +2168,30 @@ impl X11Platform {
                         let source_x = px * *width / draw_width.max(1);
                         let source_y = py * *height / draw_height.max(1);
                         let index = (source_y * *width + source_x) as usize;
-                        let pixel = &argb[index];
-                        let alpha = (pixel >> 24) as u8;
-                        if alpha == 0 {
-                            continue;
-                        }
+                        let pixel = argb[index];
+                        let rendered_pixel = match tray.render_mode {
+                            view::TrayIconRenderMode::Template => {
+                                let Some(template_pixel) = template_icon_pixel(
+                                    pixel,
+                                    BAR_STYLE.material.foreground,
+                                    BAR_STYLE.material.background.rgb(),
+                                ) else {
+                                    continue;
+                                };
+                                template_pixel
+                            }
+                            view::TrayIconRenderMode::PreserveColor => {
+                                let Some(color_pixel) = preserve_color_pixel(pixel) else {
+                                    continue;
+                                };
+                                color_pixel
+                            }
+                        };
                         self.conn
                             .change_gc(
                                 gc,
-                                &xproto::ChangeGCAux::new().foreground(
-                                    self.glass_surface.opaque_pixel(pixel & 0x00ff_ffff),
-                                ),
+                                &xproto::ChangeGCAux::new()
+                                    .foreground(self.glass_surface.opaque_pixel(rendered_pixel)),
                             )?
                             .check()?;
                         self.conn.poly_fill_rectangle(
@@ -1998,7 +2318,7 @@ impl X11Platform {
         let output = state.outputs.first().ok_or("no output for audio popup")?;
         let output_count = state.audio.outputs.len().min(8);
         let input_count = state.audio.inputs.len().min(8);
-        let content_height = 232 + 22 + output_count as u16 * 24 + 22 + input_count as u16 * 24 + 8;
+        let content_height = 316 + output_count as u16 * 24 + input_count as u16 * 24;
         let popup_height = content_height
             .max(280)
             .min(output.height.saturating_sub(26).max(280));
@@ -2008,31 +2328,62 @@ impl X11Platform {
             width: 340,
             height: popup_height,
         };
+        let card_x = rect.x + POPUP_STYLE.outer_padding as i16;
+        let card_width = rect.width.saturating_sub(POPUP_STYLE.outer_padding * 2);
+        let master_card = layout::MenuRect {
+            x: card_x,
+            y: rect.y + POPUP_STYLE.outer_padding as i16,
+            width: card_width,
+            height: 92,
+        };
+        let input_control_card = layout::MenuRect {
+            x: card_x,
+            y: rect.y + 112,
+            width: card_width,
+            height: 104,
+        };
+        let output_card = layout::MenuRect {
+            x: card_x,
+            y: rect.y + 220,
+            width: card_width,
+            height: 29 + output_count as u16 * 24,
+        };
+        let input_card = layout::MenuRect {
+            x: card_x,
+            y: output_card.y + output_card.height as i16 + POPUP_STYLE.card_row_gap as i16,
+            width: card_width,
+            height: 29 + input_count as u16 * 24,
+        };
+        let master_content = layout::popup_card_content_rect(master_card);
+        let input_content = layout::popup_card_content_rect(input_control_card);
+        let audio_content_x = master_content.x - rect.x - layout::AUDIO_POPUP_BORDER as i16;
         let track = layout::MenuRect {
-            x: rect.x + 60,
-            y: rect.y + 56,
+            x: master_content.x + 38,
+            y: master_content.y + 34,
             width: 240,
             height: 22,
         };
         let mute = layout::MenuRect {
-            x: rect.x + 14,
-            y: rect.y + 28,
+            x: master_content.x,
+            y: master_content.y,
             width: 46,
             height: 48,
         };
         let input_track = layout::MenuRect {
-            x: rect.x + 60,
-            y: rect.y + 152,
+            x: input_content.x + 38,
+            y: input_content.y + 34,
             width: 240,
             height: 22,
         };
         let input_mute = layout::MenuRect {
-            x: rect.x + 14,
-            y: rect.y + 112,
+            x: input_content.x,
+            y: input_content.y,
             width: 46,
             height: 48,
         };
-        let output_label_y = 232_i32;
+        let output_label_y = (output_card.y - rect.y - layout::AUDIO_POPUP_BORDER as i16
+            + POPUP_STYLE.card_padding as i16
+            + 14) as i32;
         let input_label_y = output_label_y + 22 + output_count as i32 * 24;
         let output_devices = layout::audio_device_rows(
             rect,
@@ -2046,6 +2397,8 @@ impl X11Platform {
             (input_label_y + 22) as i16,
             &PopupMeasurer(&self.text),
         );
+        let effect_owner = popup_effect_owner(&self.windows, output.id)
+            .ok_or("no dock window for audio popup effect owner")?;
         if std::env::var_os("XBAR_TRACE").is_some() {
             eprintln!("xbar trace: audio device layout outputs={output_devices:?} inputs={input_devices:?}");
         }
@@ -2064,6 +2417,7 @@ impl X11Platform {
                     | EventMask::BUTTON_RELEASE
                     | EventMask::POINTER_MOTION,
             )?;
+            self.configure_auxiliary_effect_surface(SurfaceRole::AudioPopup, window, effect_owner)?;
             self.conn.map_window(window)?.check()?;
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!(
@@ -2127,44 +2481,55 @@ impl X11Platform {
                 window,
                 &xproto::CreateGCAux::new().foreground(
                     self.glass_surface
-                        .background_pixel(BAR_STYLE.material.background),
+                        .background_pixel(POPUP_STYLE.material.background),
                 ),
             )?
             .check()?;
-        self.fill_glass_background(window, gc, rect.width, rect.height)?;
-        self.conn
-            .change_gc(
-                gc,
-                &xproto::ChangeGCAux::new().foreground(
-                    self.glass_surface
-                        .opaque_pixel(BAR_STYLE.material.foreground),
-                ),
-            )?
-            .check()?;
-        self.conn.poly_rectangle(
-            window,
-            gc,
-            &[xproto::Rectangle {
-                x: 0,
-                y: 0,
-                width: rect.width,
-                height: rect.height,
-            }],
+        if !self.should_skip_popup_clear_for_hover() {
+            self.fill_glass_background(window, gc, rect.width, rect.height)?;
+            self.draw_popup_frame(window, gc, rect.width, rect.height)?;
+        }
+        for card in [master_card, input_control_card, output_card, input_card] {
+            self.draw_popup_card(window, gc, rect, card)?;
+        }
+        for device in &output_devices {
+            if matches!(
+                self.popup_hover,
+                Some(PopupHover::AudioOutputDevice(ref name)) if name == &device.name
+            ) {
+                self.draw_popup_hover(window, gc, rect, device.rect)?;
+            }
+        }
+        for device in &input_devices {
+            if matches!(
+                self.popup_hover,
+                Some(PopupHover::AudioInputDevice(ref name)) if name == &device.name
+            ) {
+                self.draw_popup_hover(window, gc, rect, device.rect)?;
+            }
+        }
+        self.text.draw_popup_utf8(
+            "Som",
+            audio_content_x as i32,
+            (master_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 14) as i32,
+            BAR_STYLE.material.foreground,
         )?;
-        self.text
-            .draw_popup_utf8("Som", 14, 26, BAR_STYLE.material.foreground)?;
         self.text.draw_popup_utf8(
             &format!(
                 "{}   {}%",
                 view::audio_glyph(&state.audio),
                 state.audio.volume_percent
             ),
-            14,
-            52,
+            audio_content_x as i32,
+            (master_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 40) as i32,
             BAR_STYLE.material.foreground,
         )?;
-        self.text
-            .draw_popup_utf8("Saída", 14, output_label_y, BAR_STYLE.material.foreground)?;
+        self.text.draw_popup_utf8(
+            "Saída",
+            audio_content_x as i32,
+            output_label_y,
+            BAR_STYLE.material.foreground,
+        )?;
         for device in &output_devices {
             let marker = if state.audio.default_output.as_deref() == Some(device.name.as_str()) {
                 "✓"
@@ -2179,8 +2544,12 @@ impl X11Platform {
                 BAR_STYLE.material.foreground,
             )?;
         }
-        self.text
-            .draw_popup_utf8("Entrada", 14, input_label_y, BAR_STYLE.material.foreground)?;
+        self.text.draw_popup_utf8(
+            "Entrada",
+            audio_content_x as i32,
+            input_label_y,
+            BAR_STYLE.material.foreground,
+        )?;
         for device in &input_devices {
             let marker = if state.audio.default_input.as_deref() == Some(device.name.as_str()) {
                 "✓"
@@ -2196,23 +2565,35 @@ impl X11Platform {
             )?;
         }
         self.draw_audio_slider(window, gc, track, state.audio.volume_percent)?;
-        self.text
-            .draw_popup_utf8("Mudo", 14, 94, BAR_STYLE.material.foreground)?;
-        self.text
-            .draw_popup_utf8("Microfone", 14, 122, BAR_STYLE.material.foreground)?;
+        self.text.draw_popup_utf8(
+            "Mudo",
+            audio_content_x as i32,
+            (master_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 82) as i32,
+            BAR_STYLE.material.foreground,
+        )?;
+        self.text.draw_popup_utf8(
+            "Microfone",
+            audio_content_x as i32,
+            (input_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 14) as i32,
+            BAR_STYLE.material.foreground,
+        )?;
         self.text.draw_popup_utf8(
             &format!(
                 "{}   {}%",
                 view::microphone_glyph(&state.audio),
                 state.audio.input_volume_percent
             ),
-            14,
-            148,
+            audio_content_x as i32,
+            (input_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 40) as i32,
             BAR_STYLE.material.foreground,
         )?;
         self.draw_audio_slider(window, gc, input_track, state.audio.input_volume_percent)?;
-        self.text
-            .draw_popup_utf8("Mudo", 14, 204, BAR_STYLE.material.foreground)?;
+        self.text.draw_popup_utf8(
+            "Mudo",
+            audio_content_x as i32,
+            (input_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 82) as i32,
+            BAR_STYLE.material.foreground,
+        )?;
         self.conn.free_gc(gc)?.check()?;
         if !self.pointer_grabbed {
             let grab = self
@@ -2264,25 +2645,17 @@ impl X11Platform {
         };
         let power = layout::MenuRect {
             x: rect.x + rect.width as i16 - 82,
-            y: rect.y + 8,
+            y: rect.y + POPUP_STYLE.outer_padding as i16 + POPUP_STYLE.card_padding as i16,
             width: 68,
             height: 28,
         };
         let rows: Vec<_> = devices
             .iter()
             .enumerate()
-            .map(|(i, d)| {
-                (
-                    d.path.clone(),
-                    layout::MenuRect {
-                        x: rect.x + 10,
-                        y: rect.y + 58 + i as i16 * 30,
-                        width: rect.width - 20,
-                        height: 28,
-                    },
-                )
-            })
+            .map(|(i, d)| (d.path.clone(), layout::bluetooth_device_row(rect, i)))
             .collect();
+        let effect_owner = popup_effect_owner(&self.windows, output.id)
+            .ok_or("no dock window for bluetooth popup effect owner")?;
         let window = if let Some(p) = &self.bluetooth_popup {
             p.window
         } else {
@@ -2292,9 +2665,10 @@ impl X11Platform {
                 SurfaceRole::BluetoothPopup,
                 w,
                 rect,
-                1,
+                POPUP_STYLE.border_width,
                 EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION,
             )?;
+            self.configure_auxiliary_effect_surface(SurfaceRole::BluetoothPopup, w, effect_owner)?;
             self.conn.map_window(w)?.check()?;
             w
         };
@@ -2328,7 +2702,7 @@ impl X11Platform {
                     y: rect.y,
                     width: rect.width,
                     height: rect.height,
-                    border_width: 1,
+                    border_width: POPUP_STYLE.border_width,
                 },
             )?;
         }
@@ -2341,32 +2715,25 @@ impl X11Platform {
                 window,
                 &xproto::CreateGCAux::new().foreground(
                     self.glass_surface
-                        .background_pixel(BAR_STYLE.material.background),
+                        .background_pixel(POPUP_STYLE.material.background),
                 ),
             )?
             .check()?;
-        self.fill_glass_background(window, gc, rect.width, rect.height)?;
-        self.conn
-            .change_gc(
-                gc,
-                &xproto::ChangeGCAux::new().foreground(
-                    self.glass_surface
-                        .opaque_pixel(BAR_STYLE.material.foreground),
-                ),
-            )?
-            .check()?;
-        self.conn
-            .poly_rectangle(
-                window,
-                gc,
-                &[xproto::Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: rect.width,
-                    height: rect.height,
-                }],
-            )?
-            .check()?;
+        if !self.should_skip_popup_clear_for_hover() {
+            self.fill_glass_background(window, gc, rect.width, rect.height)?;
+            self.draw_popup_frame(window, gc, rect.width, rect.height)?;
+        }
+        self.draw_popup_card(
+            window,
+            gc,
+            rect,
+            layout::MenuRect {
+                x: rect.x + POPUP_STYLE.outer_padding as i16,
+                y: rect.y + POPUP_STYLE.outer_padding as i16,
+                width: rect.width.saturating_sub(POPUP_STYLE.outer_padding * 2),
+                height: rect.height.saturating_sub(POPUP_STYLE.outer_padding * 2),
+            },
+        )?;
         let power_label = state
             .bluetooth_pending
             .iter()
@@ -2381,12 +2748,18 @@ impl X11Platform {
             .unwrap_or(if state.bluetooth.powered { "ON" } else { "OFF" });
         self.text.draw_popup_utf8(
             &format!("Bluetooth                 {power_label}"),
-            12,
-            25,
+            (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding - POPUP_STYLE.border_width)
+                as i32,
+            35,
             BAR_STYLE.material.foreground,
         )?;
-        self.text
-            .draw_popup_utf8("Dispositivos", 12, 50, BAR_STYLE.material.foreground)?;
+        self.text.draw_popup_utf8(
+            "Dispositivos",
+            (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding - POPUP_STYLE.border_width)
+                as i32,
+            59,
+            BAR_STYLE.material.foreground,
+        )?;
         for (i, d) in devices.iter().enumerate() {
             let name = if !d.alias.is_empty() {
                 &d.alias
@@ -2413,8 +2786,9 @@ impl X11Platform {
                 .unwrap_or(if d.connected { "Connected" } else { "Paired" });
             self.text.draw_popup_utf8(
                 &format!("{marker} {name:<20} {status}"),
-                14,
-                78 + i as i32 * 30,
+                (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding - POPUP_STYLE.border_width)
+                    as i32,
+                81 + i as i32 * 30,
                 BAR_STYLE.material.foreground,
             )?;
         }
@@ -2446,71 +2820,73 @@ impl X11Platform {
             return Ok(());
         }
         let output = state.outputs.first().ok_or("no output for network popup")?;
-        let mut rows = Vec::new();
-        let mut headers = Vec::new();
-        let mut row_index = 0;
-        for device in &state.network.wifi_devices {
-            headers.push((
-                device.interface.clone(),
-                device.driver.clone(),
-                crate::core::wifi_device_state_label(device.state).to_owned(),
-                device
+        let popup_width = 380_u16.min(output.width.max(1));
+        let card_padding = POPUP_STYLE.card_padding as i16;
+        let interface_targets: Vec<_> = state
+            .network
+            .wifi_devices
+            .iter()
+            .map(|device| {
+                let targets = device
                     .access_points
                     .iter()
-                    .find(|access_point| access_point.is_active)
                     .map(|access_point| {
-                        format!(
-                            "{} · {}",
-                            access_point.ssid,
-                            crate::core::wifi_band(access_point.frequency)
-                        )
-                    }),
-                row_index,
-            ));
-            row_index += 2;
-            for access_point in &device.access_points {
-                rows.push((
-                    NetworkWifiTarget {
-                        interface: access_point.interface.clone(),
-                        ssid: access_point.ssid.clone(),
-                        band: crate::core::wifi_band(access_point.frequency).into(),
-                        saved: access_point.saved_profile.is_some(),
-                        active: access_point.is_active,
-                    },
-                    layout::MenuRect {
-                        x: output.x + output.width as i16 - 350 + 10,
-                        y: output.y + 26 + 82 + row_index * 24,
-                        width: 330,
-                        height: 22,
-                    },
-                ));
-                row_index += 1;
-            }
-        }
+                        debug_assert_eq!(access_point.interface, device.interface);
+                        NetworkWifiTarget {
+                            interface: device.interface.clone(),
+                            ssid: access_point.ssid.clone(),
+                            band: crate::core::wifi_band(access_point.frequency).into(),
+                            saved: access_point.saved_profile.is_some(),
+                            active: access_point.is_active,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                (device.interface.clone(), targets)
+            })
+            .collect();
+        let interface_row_counts: Vec<_> = interface_targets
+            .iter()
+            .map(|(_, targets)| targets.len())
+            .collect();
         let rect = layout::MenuRect {
-            x: (output.x + output.width as i16 - 350).max(output.x),
+            x: (output.x + output.width as i16 - popup_width as i16).max(output.x),
             y: output.y + 26,
-            width: 350,
-            height: (78 + row_index as u16 * 24 + 10)
+            width: popup_width,
+            height: layout::network_popup_content_height(&interface_row_counts)
                 .min(output.height.saturating_sub(26).max(120)),
         };
+        let network_layout = layout::network_popup_layout(rect, &interface_row_counts);
+        let status_card = network_layout.status_card;
+        let available_section = network_layout.available_section;
+        let rows: Vec<_> = interface_targets
+            .iter()
+            .zip(&network_layout.interfaces)
+            .flat_map(|((_, targets), card)| targets.iter().cloned().zip(card.rows.iter().copied()))
+            .collect();
         let wireless = layout::MenuRect {
-            x: rect.x + rect.width as i16 - 100,
-            y: rect.y + 8,
-            width: 84,
-            height: 28,
+            x: status_card.x + status_card.width as i16 - card_padding - 46,
+            y: status_card.y + card_padding,
+            width: 46,
+            height: 22,
         };
         let window = if let Some(popup) = &self.network_popup {
             popup.window
         } else {
             let window = self.conn.generate_id()?;
+            let effect_owner = popup_effect_owner(&self.windows, output.id)
+                .ok_or("no dock window for network popup effect owner")?;
             trace_x11_resource("WINDOW_CREATE", "network-popup", window);
             self.create_glass_popup_window(
                 SurfaceRole::NetworkPopup,
                 window,
                 rect,
-                1,
+                POPUP_STYLE.border_width,
                 EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION,
+            )?;
+            self.configure_auxiliary_effect_surface(
+                SurfaceRole::NetworkPopup,
+                window,
+                effect_owner,
             )?;
             self.conn.map_window(window)?.check()?;
             window
@@ -2545,7 +2921,7 @@ impl X11Platform {
                     y: rect.y,
                     width: rect.width,
                     height: rect.height,
-                    border_width: 1,
+                    border_width: POPUP_STYLE.border_width,
                 },
             )?;
         }
@@ -2558,32 +2934,18 @@ impl X11Platform {
                 window,
                 &xproto::CreateGCAux::new().foreground(
                     self.glass_surface
-                        .background_pixel(BAR_STYLE.material.background),
+                        .background_pixel(POPUP_STYLE.material.background),
                 ),
             )?
             .check()?;
-        self.fill_glass_background(window, gc, rect.width, rect.height)?;
-        self.conn
-            .change_gc(
-                gc,
-                &xproto::ChangeGCAux::new().foreground(
-                    self.glass_surface
-                        .opaque_pixel(BAR_STYLE.material.foreground),
-                ),
-            )?
-            .check()?;
-        self.conn
-            .poly_rectangle(
-                window,
-                gc,
-                &[xproto::Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: rect.width,
-                    height: rect.height,
-                }],
-            )?
-            .check()?;
+        if !self.should_skip_popup_clear_for_hover() {
+            self.fill_glass_background(window, gc, rect.width, rect.height)?;
+            self.draw_popup_frame(window, gc, rect.width, rect.height)?;
+        }
+        self.draw_popup_card(window, gc, rect, status_card)?;
+        for interface in &network_layout.interfaces {
+            self.draw_popup_card(window, gc, rect, interface.card)?;
+        }
         let wireless_label = state
             .network_pending
             .iter()
@@ -2602,11 +2964,21 @@ impl X11Platform {
             } else {
                 "OFF"
             });
+        if matches!(self.popup_hover, Some(PopupHover::NetworkWireless)) {
+            self.draw_popup_hover(window, gc, rect, wireless)?;
+        }
+        self.draw_switch(window, gc, rect, wireless, state.network.wireless_enabled)?;
         self.text.draw_popup_utf8(
-            &format!("Wi-Fi                         {wireless_label}"),
-            12,
-            25,
+            "Wi-Fi",
+            (status_card.x - rect.x + card_padding) as i32,
+            (status_card.y - rect.y + card_padding + 16) as i32,
             BAR_STYLE.material.foreground,
+        )?;
+        self.text.draw_popup_utf8(
+            wireless_label,
+            (wireless.x - rect.x - 42) as i32,
+            (wireless.y - rect.y + 16) as i32,
+            POPUP_STYLE.muted_foreground,
         )?;
         self.text.draw_popup_utf8(
             &if state.network.link_kind == crate::core::NetworkLinkKind::Ethernet {
@@ -2619,36 +2991,23 @@ impl X11Platform {
             } else {
                 "Desconectado".to_string()
             },
-            12,
-            50,
+            (status_card.x - rect.x + card_padding) as i32,
+            (status_card.y - rect.y + 54) as i32,
             BAR_STYLE.material.foreground,
         )?;
-        self.text
-            .draw_popup_utf8("Redes disponíveis", 12, 74, BAR_STYLE.material.foreground)?;
-        for (interface, driver, device_state, active, index) in headers {
+        self.text.draw_popup_utf8(
+            "Redes disponíveis",
+            (available_section.x - rect.x) as i32,
+            (available_section.y - rect.y + self.text.popup_baseline(available_section.height))
+                as i32,
+            BAR_STYLE.material.foreground,
+        )?;
+        for ((interface, _), card) in interface_targets.iter().zip(&network_layout.interfaces) {
             self.text.draw_popup_utf8(
-                &format!(
-                    "{}{}",
-                    interface,
-                    driver
-                        .map(|driver| format!(" · {driver}"))
-                        .unwrap_or_default()
-                ),
-                14,
-                98 + index as i32 * 24,
-                BAR_STYLE.material.foreground,
-            )?;
-            self.text.draw_popup_utf8(
-                &format!(
-                    "{}{}",
-                    device_state,
-                    active
-                        .map(|active| format!(" · {active}"))
-                        .unwrap_or_default()
-                ),
-                14,
-                98 + (index as i32 + 1) * 24,
-                BAR_STYLE.material.foreground,
+                interface,
+                (card.header.x - rect.x) as i32,
+                (card.header.y - rect.y + self.text.popup_baseline(card.header.height)) as i32,
+                POPUP_STYLE.muted_foreground,
             )?;
         }
         for (target, row) in &rows {
@@ -2662,20 +3021,29 @@ impl X11Platform {
                         && crate::core::wifi_band(access_point.frequency) == target.band
                 })
                 .expect("network popup row has matching access point");
-            let band = crate::core::wifi_band(access_point.frequency);
-            let marker = if access_point.is_active { "●" } else { " " };
-            let saved = if access_point.saved_profile.is_some() {
-                "saved"
-            } else {
-                "unsaved"
+            if matches!(
+                self.popup_hover,
+                Some(PopupHover::NetworkWifi(ref hovered)) if hovered == target
+            ) {
+                self.draw_popup_hover(window, gc, rect, *row)?;
+            }
+            let button = layout::MenuRect {
+                x: row.x + row.width as i16 - 78,
+                y: row.y + 4,
+                width: 68,
+                height: row.height.saturating_sub(8),
             };
+            self.draw_popup_card(window, gc, rect, button)?;
             self.text.draw_popup_utf8(
-                &format!(
-                    "{marker} {:<7} {:<24} {band:<9} {:>3}% {saved}",
-                    access_point.interface, access_point.ssid, access_point.strength
-                ),
-                14,
-                (row.y - rect.y + 16) as i32,
+                &network_primary_row_label(&access_point.ssid, access_point.is_active),
+                (row.x - rect.x + card_padding) as i32,
+                (row.y - rect.y + self.text.popup_baseline(row.height)) as i32,
+                BAR_STYLE.material.foreground,
+            )?;
+            self.text.draw_popup_utf8(
+                if access_point.is_active { "✓" } else { "↗" },
+                (button.x - rect.x + 25) as i32,
+                (button.y - rect.y + self.text.popup_baseline(button.height)) as i32,
                 BAR_STYLE.material.foreground,
             )?;
         }
@@ -2814,6 +3182,8 @@ impl X11Platform {
         let Some(output) = state.outputs.iter().find(|output| output.id == output_id) else {
             return Ok(());
         };
+        let effect_owner = popup_effect_owner(&self.windows, output_id)
+            .ok_or("no dock window for menu popup effect owner")?;
         let first_mismatch = self
             .popups
             .iter()
@@ -2886,7 +3256,7 @@ impl X11Platform {
                             y: popup_layout.rect.y,
                             width: popup_layout.rect.width,
                             height: popup_layout.rect.height,
-                            border_width: 1,
+                            border_width: POPUP_STYLE.border_width,
                         },
                     )?;
                 }
@@ -2895,13 +3265,14 @@ impl X11Platform {
                     popup_role,
                     window,
                     popup_layout.rect,
-                    1,
+                    POPUP_STYLE.border_width,
                     EventMask::EXPOSURE
                         | EventMask::BUTTON_PRESS
                         | EventMask::POINTER_MOTION
                         | EventMask::ENTER_WINDOW
                         | EventMask::LEAVE_WINDOW,
                 )?;
+                self.configure_auxiliary_effect_surface(popup_role, window, effect_owner)?;
                 self.conn.map_window(window)?.check()?;
             }
             self.text
@@ -2913,46 +3284,36 @@ impl X11Platform {
                     window,
                     &xproto::CreateGCAux::new().foreground(
                         self.glass_surface
-                            .background_pixel(BAR_STYLE.material.background),
+                            .background_pixel(POPUP_STYLE.material.background),
                     ),
                 )?
                 .check()?;
-            self.fill_glass_background(
-                window,
-                gc,
-                popup_layout.rect.width,
-                popup_layout.rect.height,
-            )?;
-            self.conn
-                .change_gc(
-                    gc,
-                    &xproto::ChangeGCAux::new().foreground(
-                        self.glass_surface
-                            .opaque_pixel(BAR_STYLE.material.foreground),
-                    ),
-                )?
-                .check()?;
-            self.conn
-                .poly_rectangle(
+            if !self.should_skip_popup_clear_for_hover() {
+                self.fill_glass_background(
                     window,
                     gc,
-                    &[xproto::Rectangle {
-                        x: 0,
-                        y: 0,
-                        width: popup_layout.rect.width,
-                        height: popup_layout.rect.height,
-                    }],
-                )?
-                .check()?;
+                    popup_layout.rect.width,
+                    popup_layout.rect.height,
+                )?;
+                self.draw_popup_frame(
+                    window,
+                    gc,
+                    popup_layout.rect.width,
+                    popup_layout.rect.height,
+                )?;
+            }
+            let card = popup_layout.content_rect();
+            self.draw_popup_card(window, gc, popup_layout.rect, card)?;
             for item in &popup_layout.items {
                 if item.separator {
                     self.conn.poly_fill_rectangle(
                         window,
                         gc,
                         &[xproto::Rectangle {
-                            x: 4,
-                            y: item.rect.y - popup_layout.rect.y + 4,
-                            width: popup_layout.rect.width.saturating_sub(8),
+                            x: card.x - popup_layout.rect.x + POPUP_STYLE.card_padding as i16,
+                            y: item.rect.y - popup_layout.rect.y
+                                + (POPUP_STYLE.section_gap / 2) as i16,
+                            width: card.width.saturating_sub(POPUP_STYLE.card_padding * 2),
                             height: 1,
                         }],
                     )?;
@@ -2960,25 +3321,7 @@ impl X11Platform {
                 }
                 let hovered = state.menu_interaction.hovered_path.last() == Some(&item.id);
                 if hovered {
-                    self.conn
-                        .change_gc(
-                            gc,
-                            &xproto::ChangeGCAux::new().foreground(
-                                self.glass_surface
-                                    .opaque_pixel(BAR_STYLE.menu_hover_background),
-                            ),
-                        )?
-                        .check()?;
-                    self.conn.poly_fill_rectangle(
-                        window,
-                        gc,
-                        &[xproto::Rectangle {
-                            x: 2,
-                            y: item.rect.y - popup_layout.rect.y,
-                            width: popup_layout.rect.width.saturating_sub(4),
-                            height: item.rect.height,
-                        }],
-                    )?;
+                    self.draw_popup_hover(window, gc, popup_layout.rect, item.rect)?;
                     self.conn
                         .change_gc(
                             gc,
@@ -2992,7 +3335,7 @@ impl X11Platform {
                 let color = if item.enabled {
                     BAR_STYLE.material.foreground
                 } else {
-                    BAR_STYLE.menu_disabled_foreground
+                    POPUP_STYLE.muted_foreground
                 };
                 self.conn
                     .change_gc(
@@ -3003,9 +3346,10 @@ impl X11Platform {
                     .check()?;
                 self.text.draw_popup_utf8(
                     &item.label,
-                    8,
+                    (item.rect.x - popup_layout.rect.x + POPUP_STYLE.row_horizontal_padding as i16)
+                        as i32,
                     (item.rect.y - popup_layout.rect.y) as i32
-                        + self.text.popup_baseline(26) as i32,
+                        + self.text.popup_baseline(POPUP_STYLE.row_height) as i32,
                     color,
                 )?;
                 if let Some(shortcut) = &item.shortcut {
@@ -3014,20 +3358,22 @@ impl X11Platform {
                         shortcut,
                         popup_layout
                             .rect
-                            .width
-                            .saturating_sub(BAR_STYLE.horizontal_padding + width)
+                            .x
+                            .saturating_sub(popup_layout.rect.x)
+                            .saturating_add(item.rect.width as i16)
+                            .saturating_sub((POPUP_STYLE.row_horizontal_padding + width) as i16)
                             as i32,
                         (item.rect.y - popup_layout.rect.y) as i32
-                            + self.text.popup_baseline(26) as i32,
+                            + self.text.popup_baseline(POPUP_STYLE.row_height) as i32,
                         color,
                     )?;
                 }
                 if item.has_submenu {
                     self.text.draw_popup_utf8(
                         ">",
-                        popup_layout.rect.width.saturating_sub(14) as i32,
+                        (item.rect.x - popup_layout.rect.x + item.rect.width as i16 - 14) as i32,
                         (item.rect.y - popup_layout.rect.y) as i32
-                            + self.text.popup_baseline(26) as i32,
+                            + self.text.popup_baseline(POPUP_STYLE.row_height) as i32,
                         color,
                     )?;
                 }
@@ -3255,12 +3601,7 @@ impl X11Platform {
                 {
                     return HitTarget::BluetoothPower;
                 }
-                if let Some((path, _)) = popup.devices.iter().find(|(_, r)| {
-                    rx >= r.x
-                        && rx < r.x + r.width as i16
-                        && ry >= r.y
-                        && ry < r.y + r.height as i16
-                }) {
+                if let Some((path, _)) = popup.devices.iter().find(|(_, r)| r.contains(rx, ry)) {
                     return HitTarget::BluetoothDevice(path.clone());
                 }
                 return HitTarget::BluetoothInside;
@@ -3291,12 +3632,11 @@ impl X11Platform {
                 {
                     return HitTarget::NetworkWireless;
                 }
-                if let Some((target, _)) = popup.access_points.iter().find(|(_, rect)| {
-                    rx >= rect.x
-                        && rx < rect.x + rect.width as i16
-                        && ry >= rect.y
-                        && ry < rect.y + rect.height as i16
-                }) {
+                if let Some((target, _)) = popup
+                    .access_points
+                    .iter()
+                    .find(|(_, rect)| rect.contains(rx, ry))
+                {
                     return HitTarget::NetworkWifi(target.clone());
                 }
                 return HitTarget::NetworkInside;
@@ -3316,12 +3656,7 @@ impl X11Platform {
             } else {
                 y
             };
-            if let Some(item) = popup.layout.items.iter().find(|i| {
-                popup_x >= (i.rect.x - popup.layout.rect.x)
-                    && popup_x < (i.rect.x - popup.layout.rect.x + i.rect.width as i16)
-                    && popup_y >= (i.rect.y - popup.layout.rect.y)
-                    && popup_y < (i.rect.y - popup.layout.rect.y + i.rect.height as i16)
-            }) {
+            if let Some(item) = popup.layout.item_at_local(popup_x, popup_y) {
                 let mut path = Vec::new();
                 path.extend(self.popups.iter().take(level).map(|p| p.layout.parent_id));
                 path.push(item.id);
@@ -3330,6 +3665,32 @@ impl X11Platform {
         }
         HitTarget::Outside
     }
+}
+
+fn popup_hover_for(target: Option<&HitTarget>) -> Option<PopupHover> {
+    match target {
+        Some(HitTarget::Item(path)) => path.last().copied().map(PopupHover::MenuItem),
+        Some(HitTarget::AudioOutputDevice(name)) => {
+            Some(PopupHover::AudioOutputDevice(name.clone()))
+        }
+        Some(HitTarget::AudioInputDevice(name)) => Some(PopupHover::AudioInputDevice(name.clone())),
+        Some(HitTarget::NetworkWifi(target)) => Some(PopupHover::NetworkWifi(target.clone())),
+        Some(HitTarget::NetworkWireless) => Some(PopupHover::NetworkWireless),
+        _ => None,
+    }
+}
+
+fn network_primary_row_label(ssid: &str, active: bool) -> String {
+    format!("{} {ssid}", if active { "●" } else { " " })
+}
+
+fn popup_hover_transition(
+    old: &Option<PopupHover>,
+    target: Option<&HitTarget>,
+) -> (Option<PopupHover>, bool) {
+    let next = popup_hover_for(target);
+    let changed = *old != next;
+    (next, changed)
 }
 
 impl Drop for X11Platform {
@@ -3400,11 +3761,14 @@ fn is_xbar_owned_window(
 #[cfg(test)]
 mod tests {
     use super::{
-        blur_behind_rect, classify_attention_property_reply, is_xbar_owned_window, tray_hit,
-        AttentionPropertyRead, RenderTarget, SurfaceWindowGeometry,
+        blur_behind_rect, classify_attention_property_reply, effect_owner_property_value,
+        is_xbar_owned_window, network_primary_row_label, popup_effect_owner, popup_hover_for,
+        popup_hover_transition, preserve_color_pixel, template_icon_pixel, tray_draw_size,
+        tray_hit, AttentionPropertyRead, BarWindow, HitTarget, PopupHover, RenderTarget,
+        SurfaceWindowGeometry,
     };
     use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
-    use crate::ui::{layout::MenuRect, view::TrayVisualItem};
+    use crate::ui::{layout::MenuRect, view::TrayIconRenderMode, view::TrayVisualItem};
     use x11rb::errors::ReplyError;
     use x11rb::protocol::ErrorKind;
     use x11rb::x11_utils::X11Error;
@@ -3444,6 +3808,31 @@ mod tests {
             }),
             [0, 0, 517, 93]
         );
+    }
+
+    #[test]
+    fn network_effect_owner_is_the_dock_for_its_own_output() {
+        let windows = [
+            BarWindow {
+                output: crate::core::OutputId(1),
+                window: 0x400_002,
+            },
+            BarWindow {
+                output: crate::core::OutputId(2),
+                window: 0x400_003,
+            },
+        ];
+        assert_eq!(
+            popup_effect_owner(&windows, crate::core::OutputId(2)),
+            Some(0x400_003)
+        );
+        assert_eq!(popup_effect_owner(&windows, crate::core::OutputId(3)), None);
+    }
+
+    #[test]
+    fn effect_owner_property_contains_exactly_one_dock_xid() {
+        assert_eq!(effect_owner_property_value(0x400_003), [0x400_003]);
+        assert_eq!(effect_owner_property_value(0x400_003).len(), 1);
     }
 
     #[test]
@@ -3739,6 +4128,7 @@ mod tests {
                 height: 1,
                 argb: vec![0xffff_ffff],
             },
+            render_mode: TrayIconRenderMode::Template,
             rect: MenuRect {
                 x: 100,
                 y: 0,
@@ -3749,5 +4139,78 @@ mod tests {
         assert_eq!(tray_hit(&[item], 110, 12), Some(endpoint));
         assert_eq!(tray_hit(&[], 110, 12), None);
         assert_eq!(tray_hit(&[], 110, 12), None);
+    }
+
+    #[test]
+    fn template_icon_rendering_uses_bar_foreground_and_preserves_alpha_mask() {
+        assert_eq!(template_icon_pixel(0x0000_00ff, 0xe6eaf0, 0x20242b), None);
+        assert_eq!(
+            template_icon_pixel(0xff00_00ff, 0xe6eaf0, 0x20242b),
+            Some(0xe6eaf0)
+        );
+        assert_eq!(
+            template_icon_pixel(0x8000_00ff, 0xffffff, 0x000000),
+            Some(0x808080)
+        );
+    }
+
+    #[test]
+    fn template_icon_rendering_ignores_source_rgb_for_equal_alpha() {
+        assert_eq!(
+            template_icon_pixel(0x7f00_0000, 0x123456, 0x20242b),
+            template_icon_pixel(0x7fffffff, 0x123456, 0x20242b)
+        );
+    }
+
+    #[test]
+    fn preserve_color_rendering_keeps_source_rgb() {
+        assert_eq!(preserve_color_pixel(0x8012_3456), Some(0x123456));
+        assert_eq!(preserve_color_pixel(0x0012_3456), None);
+    }
+
+    #[test]
+    fn tray_icons_are_smaller_but_keep_aspect_ratio() {
+        assert_eq!(tray_draw_size(16, 16), (14, 14));
+        assert_eq!(tray_draw_size(32, 16), (14, 7));
+        assert_eq!(tray_draw_size(8, 16), (7, 14));
+    }
+
+    #[test]
+    fn popup_hover_uses_only_existing_interactive_hit_targets() {
+        assert_eq!(
+            popup_hover_for(Some(&HitTarget::AudioOutputDevice("sink.a".into()))),
+            Some(PopupHover::AudioOutputDevice("sink.a".into()))
+        );
+        assert_eq!(
+            popup_hover_for(Some(&HitTarget::NetworkWireless)),
+            Some(PopupHover::NetworkWireless)
+        );
+        assert_eq!(
+            popup_hover_for(Some(&HitTarget::Item(vec![crate::core::MenuItemId(7)]))),
+            Some(PopupHover::MenuItem(crate::core::MenuItemId(7)))
+        );
+        assert_eq!(popup_hover_for(Some(&HitTarget::AudioInside)), None);
+        assert_eq!(popup_hover_for(Some(&HitTarget::NetworkInside)), None);
+    }
+
+    #[test]
+    fn same_popup_hover_target_is_a_render_no_op() {
+        let old = Some(PopupHover::AudioOutputDevice("sink.a".into()));
+        let (next, changed) =
+            popup_hover_transition(&old, Some(&HitTarget::AudioOutputDevice("sink.a".into())));
+        assert_eq!(next, old);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn network_primary_label_keeps_only_the_compact_name_and_active_marker() {
+        assert_eq!(
+            network_primary_row_label("Guest 5 GHz", false),
+            "  Guest 5 GHz"
+        );
+        assert_eq!(
+            network_primary_row_label("Guest 5 GHz", true),
+            "● Guest 5 GHz"
+        );
     }
 }

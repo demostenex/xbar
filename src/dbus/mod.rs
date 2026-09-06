@@ -763,7 +763,7 @@ async fn load_status_notifier_item(
         .await
         .map(|value| parse_sni_status(&value))
         .unwrap_or(StatusNotifierStatus::Passive);
-    let _icon_name = proxy
+    let icon_name = proxy
         .get_property::<String>("IconName")
         .await
         .ok()
@@ -773,7 +773,7 @@ async fn load_status_notifier_item(
         .await
         .ok()
         .and_then(select_pixmap);
-    let _attention_icon_name = proxy
+    let attention_icon_name = proxy
         .get_property::<String>("AttentionIconName")
         .await
         .ok()
@@ -804,6 +804,8 @@ async fn load_status_notifier_item(
             endpoint,
             status,
             icon,
+            icon_name,
+            attention_icon_name,
             item_is_menu,
             menu,
         }),

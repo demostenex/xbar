@@ -66,6 +66,8 @@ pub struct StatusNotifierItem {
     pub endpoint: StatusNotifierEndpoint,
     pub status: StatusNotifierStatus,
     pub icon: Option<StatusNotifierIcon>,
+    pub icon_name: Option<String>,
+    pub attention_icon_name: Option<String>,
     pub item_is_menu: bool,
     pub menu: Option<super::MenuEndpoint>,
 }
@@ -224,6 +226,8 @@ mod tests {
             endpoint: endpoint(":1.50", "/StatusNotifierItem"),
             status,
             icon,
+            icon_name: None,
+            attention_icon_name: None,
             item_is_menu: false,
             menu: None,
         }

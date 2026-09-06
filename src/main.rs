@@ -328,6 +328,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 _ => None,
             };
+            let popup_hover_changed = matches!(
+                event,
+                Event::X11(platform::x11::X11Event::MotionNotify { .. })
+            ) && x11.update_popup_hover(mouse_target.as_ref());
             let activation = match (&event, mouse_target.as_ref()) {
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { timestamp, .. }),
@@ -666,6 +670,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let previous_audio_glyph = (state.audio.available, ui::view::audio_glyph(&state.audio));
             let mut event_render_target = render_target_for(&translated, &mouse_target, &x11);
+            if popup_hover_changed {
+                event_render_target = Some(RenderTarget::Popup);
+            }
             let tray_menu_open = match &translated {
                 Event::TrayMenuOpenRequested { endpoint } => Some(endpoint.clone()),
                 _ => None,
@@ -741,7 +748,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     event_render_target = None;
                 }
             }
-            dirty |= reduced;
+            dirty |= reduced || popup_hover_changed;
             match translated {
                 Event::AudioTrackChanged { input, percent }
                     if last_audio_command != Some((input, percent)) =>
@@ -1158,7 +1165,7 @@ fn render_target_for(
         Event::X11(platform::x11::X11Event::MotionNotify { .. })
         | Event::MenuItemHovered { .. } => match mouse_target {
             Some(HitTarget::Item(_)) => Some(RenderTarget::Popup),
-            Some(HitTarget::TopLevel(_)) => Some(RenderTarget::Dock),
+            Some(HitTarget::TopLevel(_)) => Some(RenderTarget::DockContext),
             Some(HitTarget::Outside) | None => None,
             Some(HitTarget::Tray(_)) => None,
             Some(HitTarget::AudioTrack) | Some(HitTarget::AudioInputTrack) => {

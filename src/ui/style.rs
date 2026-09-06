@@ -94,7 +94,6 @@ pub struct BarStyle {
     pub material: GlassMaterial,
     pub workspace_background: u32,
     pub workspace_foreground: u32,
-    pub menu_hover_background: u32,
     pub menu_hover_foreground: u32,
     pub menu_disabled_foreground: u32,
     /// Legacy whole-window opacity used only by the default depth-24 fallback.
@@ -108,7 +107,6 @@ pub const BAR_STYLE: BarStyle = BarStyle {
     material: GLASS_MATERIAL,
     workspace_background: 0x3a4352,
     workspace_foreground: 0xffffff,
-    menu_hover_background: 0x4b5568,
     menu_hover_foreground: 0xffffff,
     menu_disabled_foreground: 0x7b8492,
     fallback_window_opacity: 0.90,
@@ -163,6 +161,57 @@ pub struct GlassMaterial {
 pub const GLASS_MATERIAL: GlassMaterial = GlassMaterial {
     background: DOCK_BACKGROUND,
     foreground: 0xe6eaf0,
+};
+
+/// Temporary physical-review material for popup shells. The dock deliberately
+/// remains on `GLASS_MATERIAL` so material judgment changes one surface class
+/// at a time while popup blur is still unresolved.
+pub const POPUP_REVIEW_MATERIAL: GlassMaterial = GlassMaterial {
+    background: Rgba::new(0x20, 0x24, 0x2b, 0x98),
+    foreground: GLASS_MATERIAL.foreground,
+};
+
+/// Shared shell geometry and colors for every interactive glass popup.  Domain
+/// layouts may retain specialized controls, but their outer surface and normal
+/// menu rows resolve through this one compact contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PopupStyle {
+    pub material: GlassMaterial,
+    pub border: u32,
+    pub card_background: Rgba,
+    pub card_border: u32,
+    pub hover_background: Rgba,
+    pub muted_foreground: u32,
+    pub border_width: u16,
+    pub outer_padding: u16,
+    pub row_height: u16,
+    pub row_horizontal_padding: u16,
+    pub section_gap: u16,
+    pub separator_height: u16,
+    pub card_padding: u16,
+    pub card_gap: u16,
+    pub card_row_gap: u16,
+    pub card_radius: u16,
+}
+
+pub const POPUP_STYLE: PopupStyle = PopupStyle {
+    material: POPUP_REVIEW_MATERIAL,
+    // The shell is deliberately quieter than the content cards.
+    border: 0x2b3340,
+    card_background: Rgba::new(0x2a, 0x30, 0x3a, 0x94),
+    card_border: 0x394353,
+    hover_background: Rgba::new(0x5a, 0x68, 0x7d, 0x72),
+    muted_foreground: 0x7b8492,
+    border_width: 1,
+    outer_padding: 12,
+    row_height: 30,
+    row_horizontal_padding: 12,
+    section_gap: 8,
+    separator_height: 10,
+    card_padding: 10,
+    card_gap: 10,
+    card_row_gap: 4,
+    card_radius: 7,
 };
 
 pub const STATUS_ITEM_GAP: i16 = 6;
@@ -224,9 +273,29 @@ mod tests {
     }
 
     #[test]
-    fn bar_and_popups_resolve_the_same_glass_material() {
-        assert_eq!(BAR_STYLE.material.background, GLASS_MATERIAL.background);
+    fn bar_and_popups_keep_one_tint_with_an_explicit_review_alpha() {
+        assert_eq!(
+            BAR_STYLE.material.background.rgb(),
+            POPUP_STYLE.material.background.rgb()
+        );
+        assert_eq!(BAR_STYLE.material.background.alpha, 0xb8);
+        assert_eq!(POPUP_STYLE.material.background.alpha, 0x98);
         assert_eq!(BAR_STYLE.material.foreground, GLASS_MATERIAL.foreground);
+    }
+
+    #[test]
+    fn popup_shell_keeps_the_shared_glass_contract_explicit() {
+        assert_eq!(POPUP_STYLE.material, POPUP_REVIEW_MATERIAL);
+        assert_eq!(POPUP_STYLE.material.background.rgb(), DOCK_BACKGROUND.rgb());
+        assert_eq!(POPUP_STYLE.material.background.alpha, 0x98);
+        assert_eq!(POPUP_STYLE.border_width, 1);
+        assert_eq!(POPUP_STYLE.outer_padding, 12);
+        assert_eq!(POPUP_STYLE.row_height, 30);
+        assert_eq!(POPUP_STYLE.row_horizontal_padding, 12);
+        assert_eq!(POPUP_STYLE.section_gap, 8);
+        assert_eq!(POPUP_STYLE.card_padding, 10);
+        assert_eq!(POPUP_STYLE.card_gap, 10);
+        assert_eq!(POPUP_STYLE.card_radius, 7);
     }
 
     #[test]

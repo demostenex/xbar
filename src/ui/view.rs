@@ -38,7 +38,42 @@ pub struct PluginVisualItem {
 pub struct TrayVisualItem {
     pub endpoint: crate::core::StatusNotifierEndpoint,
     pub icon: StatusNotifierIcon,
+    pub render_mode: TrayIconRenderMode,
     pub rect: MenuRect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrayIconRenderMode {
+    Template,
+    PreserveColor,
+}
+
+/// Select presentation from icon metadata without changing SNI behavior.
+pub fn tray_icon_render_mode(
+    icon_name: Option<&str>,
+    icon: &StatusNotifierIcon,
+) -> TrayIconRenderMode {
+    if icon_name.is_some_and(|name| name.ends_with("-symbolic"))
+        || pixmap_is_effectively_monochrome(icon)
+    {
+        TrayIconRenderMode::Template
+    } else {
+        TrayIconRenderMode::PreserveColor
+    }
+}
+
+fn pixmap_is_effectively_monochrome(icon: &StatusNotifierIcon) -> bool {
+    let StatusNotifierIcon::Pixmap { argb, .. } = icon;
+    let visible = argb.iter().filter(|pixel| (**pixel >> 24) != 0);
+    let mut saw_visible = false;
+    let monochrome = visible.clone().all(|pixel| {
+        saw_visible = true;
+        let red = (*pixel >> 16) & 0xff;
+        let green = (*pixel >> 8) & 0xff;
+        let blue = *pixel & 0xff;
+        red == green && green == blue
+    });
+    saw_visible && monochrome
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -233,7 +268,18 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth_and_plugins<M: TextMea
     let tray_items = tray_items
         .iter()
         .filter(|item| !matches!(item.status, StatusNotifierStatus::Passive))
-        .filter_map(|item| item.icon.as_ref().map(|icon| (item, icon.clone())))
+        .filter_map(|item| {
+            item.icon.as_ref().map(|icon| {
+                let icon_name = if matches!(item.status, StatusNotifierStatus::NeedsAttention) {
+                    item.attention_icon_name
+                        .as_deref()
+                        .or(item.icon_name.as_deref())
+                } else {
+                    item.icon_name.as_deref()
+                };
+                (item, icon.clone(), tray_icon_render_mode(icon_name, icon))
+            })
+        })
         .collect::<Vec<_>>();
     let plugin_labels = plugins
         .iter()
@@ -423,9 +469,10 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth_and_plugins<M: TextMea
         tray: tray_items
             .into_iter()
             .zip(tray_rects)
-            .map(|((item, icon), rect)| TrayVisualItem {
+            .map(|((item, icon, render_mode), rect)| TrayVisualItem {
                 endpoint: item.endpoint.clone(),
                 icon,
+                render_mode,
                 rect,
             })
             .collect(),
@@ -449,7 +496,10 @@ fn right_cluster_reservation<M: TextMeasurer>(
         .map(|label| measurer.measure_width(label) as i32 + 12)
         .sum::<i32>();
     let plugin_gaps = plugin_labels.len().saturating_sub(1) as i32 * STATUS_ITEM_GAP as i32;
-    let tray_width = tray_count as i32 * 20;
+    const TRAY_ITEM_WIDTH: i32 = 20;
+    const TRAY_ITEM_GAP: i32 = 4;
+    let tray_width =
+        tray_count as i32 * TRAY_ITEM_WIDTH + tray_count.saturating_sub(1) as i32 * TRAY_ITEM_GAP;
     let audio_width = if audio.is_some_and(|state| state.available) {
         ["󰖁", "󰕿", "󰖀", "󰕾"]
             .iter()
@@ -691,9 +741,54 @@ mod tests {
                 height: 16,
                 argb: vec![0xffff_0000; 16 * 16],
             }),
+            icon_name: None,
+            attention_icon_name: None,
             item_is_menu: false,
             menu: None,
         }
+    }
+
+    fn tray_pixmap(argb: Vec<u32>) -> StatusNotifierIcon {
+        StatusNotifierIcon::Pixmap {
+            width: 1,
+            height: 1,
+            argb,
+        }
+    }
+
+    #[test]
+    fn symbolic_icon_name_selects_template_mode() {
+        assert_eq!(
+            tray_icon_render_mode(
+                Some("network-wireless-symbolic"),
+                &tray_pixmap(vec![0xffff0000])
+            ),
+            TrayIconRenderMode::Template
+        );
+    }
+
+    #[test]
+    fn ordinary_color_pixmap_preserves_color() {
+        assert_eq!(
+            tray_icon_render_mode(None, &tray_pixmap(vec![0xff12_3456])),
+            TrayIconRenderMode::PreserveColor
+        );
+    }
+
+    #[test]
+    fn effectively_monochrome_pixmap_is_safe_as_template() {
+        assert_eq!(
+            tray_icon_render_mode(None, &tray_pixmap(vec![0xff88_8888])),
+            TrayIconRenderMode::Template
+        );
+    }
+
+    #[test]
+    fn transparent_pixmap_does_not_force_template_mode() {
+        assert_eq!(
+            tray_icon_render_mode(None, &tray_pixmap(vec![0x0012_3456])),
+            TrayIconRenderMode::PreserveColor
+        );
     }
 
     #[test]

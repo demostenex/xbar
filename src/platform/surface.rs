@@ -116,6 +116,30 @@ impl SurfaceRole {
             _ => Some(SurfaceEffect::BlurBehind),
         }
     }
+
+    /// Current interactive glass popups use the auxiliary compositor owner.
+    /// Notifications remain outside this contract.
+    pub(crate) const fn uses_effect_owner(self) -> bool {
+        matches!(
+            self,
+            Self::GlobalMenuPopup
+                | Self::TrayPopup
+                | Self::NetworkPopup
+                | Self::BluetoothPopup
+                | Self::AudioPopup
+        )
+    }
+
+    pub(crate) const fn uses_override_redirect(self) -> bool {
+        matches!(
+            self,
+            Self::GlobalMenuPopup
+                | Self::TrayPopup
+                | Self::NetworkPopup
+                | Self::BluetoothPopup
+                | Self::AudioPopup
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,7 +159,7 @@ pub(crate) fn select_argb_visual(candidates: &[VisualCandidate]) -> Option<Visua
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::style::{GlassMaterial, GLASS_MATERIAL};
+    use crate::ui::style::{GlassMaterial, GLASS_MATERIAL, POPUP_STYLE};
 
     const ARGB_8888: DirectPixelFormat = DirectPixelFormat {
         red_shift: 16,
@@ -216,16 +240,17 @@ mod tests {
     }
 
     #[test]
-    fn dock_and_popup_background_restoration_share_one_canonical_native_pixel() {
+    fn dock_and_popup_review_materials_keep_the_same_tint_with_distinct_alphas() {
         let surface = SurfaceVisual::argb(0x22, 0x33, ARGB_8888);
         let initial_map = surface.background_pixel(GLASS_MATERIAL.background);
         let dock_regional_redraw = surface.background_pixel(GLASS_MATERIAL.background);
-        let popup_initial_map = surface.background_pixel(GLASS_MATERIAL.background);
-        let popup_repaint = surface.background_pixel(GLASS_MATERIAL.background);
+        let popup_initial_map = surface.background_pixel(POPUP_STYLE.material.background);
+        let popup_repaint = surface.background_pixel(POPUP_STYLE.material.background);
 
         assert_eq!(initial_map, dock_regional_redraw);
-        assert_eq!(dock_regional_redraw, popup_initial_map);
         assert_eq!(popup_initial_map, popup_repaint);
+        assert_eq!(initial_map & 0x00ff_ffff, popup_initial_map & 0x00ff_ffff);
+        assert_ne!(initial_map >> 24, popup_initial_map >> 24);
     }
 
     #[test]
@@ -236,6 +261,22 @@ mod tests {
         assert_eq!(surface.background_pixel(material.background), 0xb820_242b,);
         assert_eq!(surface.opaque_pixel(material.foreground), 0xffe6_eaf0,);
         assert_eq!(surface.window_opacity(0.90), None);
+    }
+
+    #[test]
+    fn interactive_popups_use_the_auxiliary_effect_owner() {
+        for role in [
+            SurfaceRole::GlobalMenuPopup,
+            SurfaceRole::TrayPopup,
+            SurfaceRole::NetworkPopup,
+            SurfaceRole::BluetoothPopup,
+            SurfaceRole::AudioPopup,
+        ] {
+            assert!(role.uses_effect_owner());
+        }
+        assert!(SurfaceRole::NetworkPopup.uses_override_redirect());
+        assert!(!SurfaceRole::Notification.uses_effect_owner());
+        assert!(!SurfaceRole::Dock.uses_effect_owner());
     }
 
     #[test]

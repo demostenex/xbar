@@ -2121,6 +2121,8 @@ mod tests {
                 endpoint: item_endpoint.clone(),
                 status: super::super::StatusNotifierStatus::Active,
                 icon: None,
+                icon_name: None,
+                attention_icon_name: None,
                 item_is_menu: false,
                 menu: Some(menu_endpoint.clone()),
             });
@@ -2135,6 +2137,8 @@ mod tests {
                 endpoint: item_endpoint.clone(),
                 status: super::super::StatusNotifierStatus::Active,
                 icon: None,
+                icon_name: None,
+                attention_icon_name: None,
                 item_is_menu: false,
                 menu: None,
             }),
@@ -2158,6 +2162,8 @@ mod tests {
                 endpoint: item_endpoint,
                 status: super::super::StatusNotifierStatus::Active,
                 icon: None,
+                icon_name: None,
+                attention_icon_name: None,
                 item_is_menu: false,
                 menu: Some(MenuEndpoint {
                     service: ":1.9".into(),

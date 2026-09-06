@@ -1,6 +1,6 @@
 use crate::core::{ChildrenDisplay, MenuItem, MenuItemId, MenuItemType};
 use crate::core::{OutputState, WorkspaceState};
-use crate::ui::style::{TextMeasurer, BAR_STYLE};
+use crate::ui::style::{TextMeasurer, BAR_STYLE, POPUP_STYLE};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorkspaceRect {
     pub x: i16,
@@ -17,8 +17,151 @@ pub struct MenuRect {
     pub height: u16,
 }
 
-pub const AUDIO_POPUP_BORDER: u16 = 1;
+impl MenuRect {
+    pub fn contains(self, x: i16, y: i16) -> bool {
+        let x = i32::from(x);
+        let y = i32::from(y);
+        let left = i32::from(self.x);
+        let top = i32::from(self.y);
+        x >= left
+            && x < left + i32::from(self.width)
+            && y >= top
+            && y < top + i32::from(self.height)
+    }
+}
+
+/// The reusable content area inside a popup card. Card bounds are expressed in
+/// root coordinates, so every specialized popup can derive its content axis
+/// without inventing another local offset.
+pub fn popup_card_content_rect(card: MenuRect) -> MenuRect {
+    let inset = POPUP_STYLE.card_padding;
+    MenuRect {
+        x: card.x + inset as i16,
+        y: card.y + inset as i16,
+        width: card.width.saturating_sub(inset.saturating_mul(2)),
+        height: card.height.saturating_sub(inset.saturating_mul(2)),
+    }
+}
+
+pub const AUDIO_POPUP_BORDER: u16 = POPUP_STYLE.border_width;
 const AUDIO_DEVICE_ROW_HEIGHT: u16 = 24;
+const NETWORK_STATUS_CARD_HEIGHT: u16 = 72;
+const NETWORK_SECTION_HEADER_HEIGHT: u16 = 24;
+const NETWORK_ROW_HEIGHT: u16 = 28;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkInterfaceCardLayout {
+    pub card: MenuRect,
+    pub header: MenuRect,
+    pub rows: Vec<MenuRect>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkPopupLayout {
+    pub status_card: MenuRect,
+    pub available_section: MenuRect,
+    pub interfaces: Vec<NetworkInterfaceCardLayout>,
+}
+
+pub fn network_popup_content_height(interface_row_counts: &[usize]) -> u16 {
+    let shell = POPUP_STYLE.outer_padding;
+    let interface_heights: u16 = interface_row_counts
+        .iter()
+        .map(|count| network_interface_card_height(*count))
+        .sum();
+    let interface_gaps = POPUP_STYLE
+        .card_gap
+        .saturating_mul(interface_row_counts.len().saturating_sub(1) as u16);
+    shell
+        .saturating_mul(2)
+        .saturating_add(NETWORK_STATUS_CARD_HEIGHT)
+        .saturating_add(POPUP_STYLE.card_gap)
+        .saturating_add(NETWORK_SECTION_HEADER_HEIGHT)
+        .saturating_add(POPUP_STYLE.card_gap)
+        .saturating_add(interface_heights)
+        .saturating_add(interface_gaps)
+}
+
+pub fn network_popup_layout(rect: MenuRect, interface_row_counts: &[usize]) -> NetworkPopupLayout {
+    let shell = POPUP_STYLE.outer_padding as i16;
+    let card_padding = POPUP_STYLE.card_padding as i16;
+    let card_width = rect
+        .width
+        .saturating_sub(POPUP_STYLE.outer_padding.saturating_mul(2));
+    let status_card = MenuRect {
+        x: rect.x + shell,
+        y: rect.y + shell,
+        width: card_width,
+        height: NETWORK_STATUS_CARD_HEIGHT,
+    };
+    let available_section = MenuRect {
+        x: status_card.x,
+        y: status_card.y + status_card.height as i16 + POPUP_STYLE.card_gap as i16,
+        width: card_width,
+        height: NETWORK_SECTION_HEADER_HEIGHT,
+    };
+    let mut cursor_y =
+        available_section.y + available_section.height as i16 + POPUP_STYLE.card_gap as i16;
+    let interfaces = interface_row_counts
+        .iter()
+        .map(|count| {
+            let card = MenuRect {
+                x: status_card.x,
+                y: cursor_y,
+                width: card_width,
+                height: network_interface_card_height(*count),
+            };
+            let header = MenuRect {
+                x: card.x + card_padding,
+                y: card.y + card_padding,
+                width: card
+                    .width
+                    .saturating_sub(POPUP_STYLE.card_padding.saturating_mul(2)),
+                height: NETWORK_SECTION_HEADER_HEIGHT,
+            };
+            let mut row_y = header.y + header.height as i16 + POPUP_STYLE.card_row_gap as i16;
+            let rows = (0..*count)
+                .map(|_| {
+                    let row = MenuRect {
+                        x: header.x,
+                        y: row_y,
+                        width: header.width,
+                        height: NETWORK_ROW_HEIGHT,
+                    };
+                    row_y += NETWORK_ROW_HEIGHT as i16 + POPUP_STYLE.card_row_gap as i16;
+                    row
+                })
+                .collect();
+            cursor_y += card.height as i16 + POPUP_STYLE.card_gap as i16;
+            NetworkInterfaceCardLayout { card, header, rows }
+        })
+        .collect();
+    NetworkPopupLayout {
+        status_card,
+        available_section,
+        interfaces,
+    }
+}
+
+fn network_interface_card_height(row_count: usize) -> u16 {
+    let rows = (NETWORK_ROW_HEIGHT + POPUP_STYLE.card_row_gap)
+        .saturating_mul(row_count as u16)
+        .saturating_sub(if row_count == 0 {
+            0
+        } else {
+            POPUP_STYLE.card_row_gap
+        });
+    POPUP_STYLE
+        .card_padding
+        .saturating_mul(2)
+        .saturating_add(NETWORK_SECTION_HEADER_HEIGHT)
+        .saturating_add(if row_count == 0 {
+            0
+        } else {
+            POPUP_STYLE.card_row_gap
+        })
+        .saturating_add(rows)
+}
 
 /// Audio device rows use root coordinates, including the popup's one-pixel border.
 /// Both drawing and pointer lookup consume these same rows.
@@ -61,18 +204,39 @@ pub fn audio_device_rows<M: TextMeasurer>(
             name: device.name.clone(),
             display_name: device.display_name.clone(),
             rect: MenuRect {
-                x: popup.x + AUDIO_POPUP_BORDER as i16 + 14,
+                x: popup.x + POPUP_STYLE.outer_padding as i16 + POPUP_STYLE.card_padding as i16,
                 y: popup.y
                     + AUDIO_POPUP_BORDER as i16
                     + first_baseline
                     + index as i16 * AUDIO_DEVICE_ROW_HEIGHT as i16
                     - baseline_offset,
-                width: popup.width.saturating_sub(28),
+                width: popup.width.saturating_sub(
+                    POPUP_STYLE
+                        .outer_padding
+                        .saturating_add(POPUP_STYLE.card_padding)
+                        .saturating_mul(2),
+                ),
                 height: AUDIO_DEVICE_ROW_HEIGHT,
             },
             baseline_offset,
         })
         .collect()
+}
+
+pub fn bluetooth_device_row(popup: MenuRect, index: usize) -> MenuRect {
+    let card = MenuRect {
+        x: popup.x + POPUP_STYLE.outer_padding as i16,
+        y: popup.y + POPUP_STYLE.outer_padding as i16,
+        width: popup.width.saturating_sub(POPUP_STYLE.outer_padding * 2),
+        height: popup.height.saturating_sub(POPUP_STYLE.outer_padding * 2),
+    };
+    let content = popup_card_content_rect(card);
+    MenuRect {
+        x: content.x,
+        y: content.y + 40 + index as i16 * 30,
+        width: content.width,
+        height: 28,
+    }
 }
 
 pub const LEFT_PADDING: i32 = 8;
@@ -94,6 +258,32 @@ pub struct PopupLayout {
     pub parent_id: MenuItemId,
     pub rect: MenuRect,
     pub items: Vec<PopupItemRect>,
+}
+
+impl PopupLayout {
+    pub fn content_rect(&self) -> MenuRect {
+        let padding = POPUP_STYLE.outer_padding;
+        MenuRect {
+            x: self.rect.x + padding as i16,
+            y: self.rect.y + padding as i16,
+            width: self.rect.width.saturating_sub(padding.saturating_mul(2)),
+            height: self.rect.height.saturating_sub(padding.saturating_mul(2)),
+        }
+    }
+
+    /// The popup renderer and event dispatcher consume the same item
+    /// rectangles. Coordinates here are relative to the popup client window.
+    pub fn item_at_local(&self, x: i16, y: i16) -> Option<&PopupItemRect> {
+        self.items.iter().find(|item| {
+            MenuRect {
+                x: item.rect.x - self.rect.x,
+                y: item.rect.y - self.rect.y,
+                width: item.rect.width,
+                height: item.rect.height,
+            }
+            .contains(x, y)
+        })
+    }
 }
 
 fn text_width<M: TextMeasurer>(measurer: &M, text: &str) -> u16 {
@@ -134,7 +324,7 @@ pub fn popup_layout_with_measurer<M: TextMeasurer>(
     measurer: &M,
 ) -> PopupLayout {
     let children: Vec<_> = visible_children(parent).collect();
-    let mut width = 120_u16;
+    let mut width = 120_u16.saturating_add(POPUP_STYLE.outer_padding.saturating_mul(2));
     for item in &children {
         let label = item
             .label
@@ -148,7 +338,11 @@ pub fn popup_layout_with_measurer<M: TextMeasurer>(
             0
         };
         width = width.max(
-            24_u16
+            POPUP_STYLE
+                .outer_padding
+                .saturating_mul(2)
+                .saturating_add(POPUP_STYLE.row_horizontal_padding.saturating_mul(2))
+                .saturating_add(8)
                 .saturating_add(text_width(measurer, &label))
                 .saturating_add(
                     shortcut
@@ -160,8 +354,8 @@ pub fn popup_layout_with_measurer<M: TextMeasurer>(
         );
     }
     width = width.min(output.width.max(1));
-    let item_height = 26_i32;
-    let separator_height = 10_i32;
+    let item_height = i32::from(POPUP_STYLE.row_height);
+    let separator_height = i32::from(POPUP_STYLE.separator_height);
     let content_height: i32 = children
         .iter()
         .map(|item| {
@@ -172,7 +366,9 @@ pub fn popup_layout_with_measurer<M: TextMeasurer>(
             }
         })
         .sum();
-    let height = (content_height + 8).min(output.height.max(1) as i32).max(1) as u16;
+    let height = (content_height + i32::from(POPUP_STYLE.outer_padding.saturating_mul(2)))
+        .min(output.height.max(1) as i32)
+        .max(1) as u16;
     let ox = output.x as i32;
     let oy = output.y as i32;
     let right = ox + output.width as i32;
@@ -198,7 +394,17 @@ pub fn popup_layout_with_measurer<M: TextMeasurer>(
         width,
         height,
     };
-    let mut cursor = y + 4;
+    let content = MenuRect {
+        x: rect.x + POPUP_STYLE.outer_padding as i16,
+        y: rect.y + POPUP_STYLE.outer_padding as i16,
+        width: rect
+            .width
+            .saturating_sub(POPUP_STYLE.outer_padding.saturating_mul(2)),
+        height: rect
+            .height
+            .saturating_sub(POPUP_STYLE.outer_padding.saturating_mul(2)),
+    };
+    let mut cursor = i32::from(content.y);
     let items = children
         .into_iter()
         .map(|item| {
@@ -209,9 +415,9 @@ pub fn popup_layout_with_measurer<M: TextMeasurer>(
                 item_height
             };
             let item_rect = MenuRect {
-                x: rect.x,
+                x: content.x,
                 y: cursor as i16,
-                width,
+                width: content.width,
                 height: h as u16,
             };
             cursor += h;
@@ -368,6 +574,7 @@ pub fn allocate_context_with_reserved_right<M: TextMeasurer>(
 
 pub fn allocate_tray(future: MenuRect, count: usize) -> Vec<MenuRect> {
     const ITEM_WIDTH: i32 = 20;
+    const ITEM_GAP: i32 = 4;
     let mut right = future.x as i32 + future.width as i32;
     let left = future.x as i32;
     let mut result = Vec::new();
@@ -382,6 +589,7 @@ pub fn allocate_tray(future: MenuRect, count: usize) -> Vec<MenuRect> {
             width: ITEM_WIDTH as u16,
             height: future.height,
         });
+        right -= ITEM_GAP;
     }
     result.reverse();
     result
@@ -481,13 +689,13 @@ mod tests {
         for (index, row) in rows.iter().enumerate() {
             assert_eq!(row.name, devices[index].name);
             assert_eq!(row.display_name, devices[index].display_name);
-            assert_eq!(row.label_position(popup), (22, 254 + index as i32 * 24));
+            assert_eq!(row.label_position(popup), (29, 254 + index as i32 * 24));
             assert_eq!(
                 row.rect,
                 MenuRect {
-                    x: 1595,
+                    x: 1602,
                     y: 264 + index as i16 * 24,
-                    width: 312,
+                    width: 296,
                     height: 24,
                 }
             );
@@ -526,9 +734,9 @@ mod tests {
         }
         for row in &rows {
             assert!(row.contains(row.rect.x, row.rect.y));
-            assert!(row.contains(row.rect.x + 311, row.rect.y + 23));
+            assert!(row.contains(row.rect.x + row.rect.width as i16 - 1, row.rect.y + 23));
             assert!(!row.contains(row.rect.x - 1, row.rect.y));
-            assert!(!row.contains(row.rect.x + 312, row.rect.y));
+            assert!(!row.contains(row.rect.x + row.rect.width as i16, row.rect.y));
             assert!(!row.contains(row.rect.x, row.rect.y + 24));
         }
     }
@@ -561,7 +769,7 @@ mod tests {
                 let rows = audio_device_rows(popup, &devices, 254, &measurer);
                 for (index, row) in rows.iter().enumerate() {
                     let (local_x, local_baseline) = row.label_position(popup);
-                    assert_eq!((local_x, local_baseline), (22, 254 + index as i32 * 24));
+                    assert_eq!((local_x, local_baseline), (29, 254 + index as i32 * 24));
                     let root_baseline = popup.y + 1 + local_baseline as i16;
                     assert_eq!(row.rect.y + measurer.baseline(24), root_baseline);
                     for ink_y in root_baseline - ascent..root_baseline + descent {
@@ -579,7 +787,7 @@ mod tests {
         let input_header_baseline = 254 + 2 * 24;
         let rows = audio_device_rows(popup, &devices, input_header_baseline + 22, &measurer);
         for (index, row) in rows.iter().enumerate() {
-            assert_eq!(row.label_position(popup), (22, 324 + index as i32 * 24));
+            assert_eq!(row.label_position(popup), (29, 324 + index as i32 * 24));
             assert_eq!(row.rect.y, 334 + index as i16 * 24);
             let label_y = popup.y + 1 + 324 + index as i16 * 24 - 8;
             assert_eq!(
@@ -644,9 +852,10 @@ mod tests {
         let slots = allocate_tray(future, 3);
         assert_eq!(
             slots.iter().map(|slot| slot.x).collect::<Vec<_>>(),
-            vec![140, 160, 180]
+            vec![132, 156, 180]
         );
-        assert_eq!(slots[0].x + slots[0].width as i16, slots[1].x);
+        assert_eq!(slots[0].x + slots[0].width as i16 + 4, slots[1].x);
+        assert_eq!(slots[1].x + slots[1].width as i16 + 4, slots[2].x);
         assert_eq!(slots[2].x + slots[2].width as i16, 200);
     }
 
@@ -659,9 +868,8 @@ mod tests {
             height: 26,
         };
         let slots = allocate_tray(future, 3);
-        assert_eq!(slots.len(), 2);
-        assert_eq!(slots[0].x, 100);
-        assert_eq!(slots[1].x, 120);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].x, 120);
     }
 
     #[test]
@@ -794,6 +1002,71 @@ mod tests {
     }
 
     #[test]
+    fn menu_draw_and_hit_share_the_popup_item_rect() {
+        let popup = popup_layout(
+            &output(),
+            &popup_parent(),
+            MenuRect {
+                x: 120,
+                y: 20,
+                width: 80,
+                height: 26,
+            },
+            false,
+        );
+        let item = &popup.items[0];
+        let local_x = item.rect.x - popup.rect.x + 1;
+        let local_y = item.rect.y - popup.rect.y + 1;
+        assert_eq!(
+            popup.item_at_local(local_x, local_y).map(|item| item.id),
+            Some(item.id)
+        );
+        assert!(popup
+            .item_at_local(item.rect.x - popup.rect.x + item.rect.width as i16, local_y)
+            .is_none());
+    }
+
+    #[test]
+    fn popup_shell_keeps_card_content_symmetric_and_rows_inside_it() {
+        let popup = popup_layout(
+            &output(),
+            &popup_parent(),
+            MenuRect {
+                x: 120,
+                y: 20,
+                width: 80,
+                height: 26,
+            },
+            false,
+        );
+        let content = popup.content_rect();
+        assert_eq!(content.x - popup.rect.x, POPUP_STYLE.outer_padding as i16);
+        assert_eq!(
+            popup.rect.x + popup.rect.width as i16 - (content.x + content.width as i16),
+            POPUP_STYLE.outer_padding as i16
+        );
+        assert_eq!(popup.items[0].rect.height, POPUP_STYLE.row_height);
+        assert!(popup.items.iter().all(|item| {
+            item.rect.x >= content.x
+                && item.rect.x + item.rect.width as i16 <= content.x + content.width as i16
+        }));
+    }
+
+    #[test]
+    fn network_style_rows_use_the_same_rect_for_draw_and_hit_bounds() {
+        let row = MenuRect {
+            x: 1570,
+            y: 108,
+            width: 330,
+            height: 22,
+        };
+        assert!(row.contains(1570, 108));
+        assert!(row.contains(1899, 129));
+        assert!(!row.contains(1900, 129));
+        assert!(!row.contains(1570, 130));
+    }
+
+    #[test]
     fn submenu_flips_left_and_clamps_vertical_on_offset_output() {
         let mut o = output();
         o.x = 1920;
@@ -833,5 +1106,157 @@ mod tests {
         );
         assert!(p.rect.width > 0 && p.rect.height > 0);
         assert!(p.rect.width <= o.width && p.rect.height <= o.height);
+    }
+
+    #[test]
+    fn network_section_has_a_positive_gap_before_the_first_interface_card() {
+        let rect = MenuRect {
+            x: 1540,
+            y: 26,
+            width: 380,
+            height: network_popup_content_height(&[2, 1]),
+        };
+        let network = network_popup_layout(rect, &[2, 1]);
+        let section_bottom = network.available_section.y + network.available_section.height as i16;
+        assert!(section_bottom + POPUP_STYLE.card_gap as i16 <= network.interfaces[0].card.y);
+    }
+
+    #[test]
+    fn network_interfaces_have_independent_non_overlapping_cards_and_rows() {
+        let rect = MenuRect {
+            x: 1540,
+            y: 26,
+            width: 380,
+            height: network_popup_content_height(&[2, 1]),
+        };
+        let network = network_popup_layout(rect, &[2, 1]);
+        let wlan0 = &network.interfaces[0];
+        let wlan1 = &network.interfaces[1];
+        assert!(wlan0.card.y + wlan0.card.height as i16 <= wlan1.card.y);
+        for card in &network.interfaces {
+            for row in &card.rows {
+                assert!(row.x >= card.card.x + POPUP_STYLE.card_padding as i16);
+                assert!(
+                    row.x + row.width as i16
+                        <= card.card.x + card.card.width as i16 - POPUP_STYLE.card_padding as i16
+                );
+                assert!(row.y >= card.card.y);
+                assert!(row.y + row.height as i16 <= card.card.y + card.card.height as i16);
+            }
+        }
+    }
+
+    #[test]
+    fn audio_rows_respect_popup_outer_and_card_padding() {
+        let popup = MenuRect {
+            x: 100,
+            y: 200,
+            width: 340,
+            height: 400,
+        };
+        let rows = audio_device_rows(
+            popup,
+            &[crate::core::AudioDevice {
+                name: "sink".to_owned(),
+                display_name: "Sink".to_owned(),
+            }],
+            254,
+            &AudioMeasurer(crate::ui::style::FontMetrics {
+                ascent: 16,
+                descent: 5,
+            }),
+        );
+        let row = &rows[0].rect;
+        let inset = (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding) as i16;
+        assert!(row.x >= popup.x + inset);
+        assert!(row.x + row.width as i16 <= popup.x + popup.width as i16 - inset);
+        let card = MenuRect {
+            x: popup.x + POPUP_STYLE.outer_padding as i16,
+            y: popup.y + POPUP_STYLE.outer_padding as i16,
+            width: popup.width.saturating_sub(POPUP_STYLE.outer_padding * 2),
+            height: popup.height.saturating_sub(POPUP_STYLE.outer_padding * 2),
+        };
+        assert_eq!(row.x, popup_card_content_rect(card).x);
+    }
+
+    #[test]
+    fn bluetooth_rows_respect_popup_outer_and_card_padding() {
+        let popup = MenuRect {
+            x: 100,
+            y: 200,
+            width: 330,
+            height: 180,
+        };
+        let row = bluetooth_device_row(popup, 0);
+        let inset = (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding) as i16;
+        assert!(row.x >= popup.x + inset);
+        assert!(row.x + row.width as i16 <= popup.x + popup.width as i16 - inset);
+        assert!(row.y >= popup.y + POPUP_STYLE.outer_padding as i16);
+        assert!(row.y + row.height as i16 <= popup.y + popup.height as i16);
+    }
+
+    #[test]
+    fn specialized_cards_use_canonical_content_top_and_left_axes() {
+        let popup = MenuRect {
+            x: 100,
+            y: 200,
+            width: 340,
+            height: 500,
+        };
+        let card = MenuRect {
+            x: popup.x + POPUP_STYLE.outer_padding as i16,
+            y: popup.y + POPUP_STYLE.outer_padding as i16,
+            width: popup.width.saturating_sub(POPUP_STYLE.outer_padding * 2),
+            height: 100,
+        };
+        let content = popup_card_content_rect(card);
+        assert_eq!(content.x - popup.x, 22);
+        assert_eq!(content.y - popup.y, 22);
+
+        let bluetooth_row = bluetooth_device_row(popup, 0);
+        assert_eq!(bluetooth_row.x, content.x);
+        assert_eq!(bluetooth_row.y, content.y + 40);
+
+        let audio_rows = audio_device_rows(
+            popup,
+            &[crate::core::AudioDevice {
+                name: "sink".into(),
+                display_name: "Sink".into(),
+            }],
+            254,
+            &AudioMeasurer(crate::ui::style::FontMetrics {
+                ascent: 16,
+                descent: 5,
+            }),
+        );
+        assert_eq!(audio_rows[0].rect.x, content.x);
+        let (label_x, _) = audio_rows[0].label_position(popup);
+        assert_eq!(
+            popup.x + AUDIO_POPUP_BORDER as i16 + label_x as i16,
+            content.x + 8
+        );
+    }
+
+    #[test]
+    fn bluetooth_rows_remain_inside_their_card_after_top_inset() {
+        let popup = MenuRect {
+            x: 100,
+            y: 200,
+            width: 330,
+            height: 180,
+        };
+        let card = MenuRect {
+            x: popup.x + POPUP_STYLE.outer_padding as i16,
+            y: popup.y + POPUP_STYLE.outer_padding as i16,
+            width: popup.width.saturating_sub(POPUP_STYLE.outer_padding * 2),
+            height: popup.height.saturating_sub(POPUP_STYLE.outer_padding * 2),
+        };
+        let row = bluetooth_device_row(popup, 0);
+        assert!(row.y >= card.y + POPUP_STYLE.card_padding as i16);
+        assert!(row.y + row.height as i16 <= card.y + card.height as i16);
+        assert!(
+            row.x + row.width as i16
+                <= card.x + card.width as i16 - POPUP_STYLE.card_padding as i16
+        );
     }
 }
