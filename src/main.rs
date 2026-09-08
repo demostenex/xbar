@@ -9,7 +9,7 @@ mod ui;
 mod xnm;
 
 use clock::ClockSource;
-use core::{Event, MenuSource, State, StatusNotifierAction};
+use core::{Event, MenuLayoutReloadTracker, MenuSource, State, StatusNotifierAction};
 use i3::I3Client;
 use platform::x11::{HitTarget, RenderTarget, X11Platform};
 use std::error::Error;
@@ -49,6 +49,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("xbar trace: Xft metrics={:?}", x11.text_metrics());
     }
     let mut next_menu_request_id = 1_u64;
+    let mut menu_layout_reloads = MenuLayoutReloadTracker::default();
     let mut last_audio_command = None;
 
     i3.subscribe()?;
@@ -573,6 +574,96 @@ fn main() -> Result<(), Box<dyn Error>> {
                 ) => Event::MenuItemHovered { path: vec![] },
                 _ => event.clone(),
             };
+            let watcher_to_end = match &translated {
+                Event::MenuUnregistered { window_id } => registry
+                    .lock()
+                    .expect("registry poisoned")
+                    .get(*window_id)
+                    .cloned(),
+                Event::MenuRegistered {
+                    window_id,
+                    endpoint: MenuSource::DbusMenu(new_endpoint),
+                } => registry
+                    .lock()
+                    .expect("registry poisoned")
+                    .get(*window_id)
+                    .filter(|old_endpoint| *old_endpoint != new_endpoint)
+                    .cloned(),
+                _ => None,
+            };
+            if let Event::MenuWatcherReady {
+                endpoint,
+                watcher_generation,
+                request_id,
+            } = &translated
+            {
+                menu_layout_reloads.watcher_ready(
+                    endpoint.clone(),
+                    *watcher_generation,
+                    *request_id,
+                );
+            }
+            match &translated {
+                Event::WindowFocused(_)
+                | Event::WindowFocusedWithApp { .. }
+                | Event::MenuRegistered { .. }
+                | Event::MenuUnregistered { .. }
+                | Event::GtkMenuDiscovered { .. }
+                | Event::GtkMenuRemoved { .. } => menu_layout_reloads.clear_active(),
+                Event::MenuOwnerVanished { sender } => {
+                    menu_layout_reloads.remove_watchers_for_owner(sender);
+                    menu_layout_reloads.clear_active();
+                }
+                _ => {}
+            }
+            if let Some(endpoint) = watcher_to_end.as_ref() {
+                menu_layout_reloads.remove_watcher(&MenuSource::DbusMenu(endpoint.clone()));
+            }
+            let stale_menu_watcher_event = match &translated {
+                Event::MenuLayoutInvalidated {
+                    endpoint,
+                    watcher_generation: Some(watcher_generation),
+                    ..
+                }
+                | Event::MenuPropertiesUpdated {
+                    endpoint,
+                    watcher_generation: Some(watcher_generation),
+                    ..
+                } => !menu_layout_reloads.accepts_watcher(endpoint, *watcher_generation),
+                _ => false,
+            };
+            if stale_menu_watcher_event {
+                continue;
+            }
+            let active_menu_endpoint =
+                state.active_menu_endpoint(&registry.lock().expect("registry poisoned"));
+            let stale_layout = matches!(
+                &translated,
+                Event::MenuLayoutInvalidated {
+                    endpoint,
+                    revision: Some(revision),
+                    ..
+                } if active_menu_endpoint.as_ref() == Some(endpoint)
+                    && state.active_menu_model().is_some_and(|model| model.revision >= *revision)
+            );
+            let accepted_layout_invalidation = match &translated {
+                Event::MenuLayoutInvalidated {
+                    endpoint,
+                    watcher_generation: Some(watcher_generation),
+                    revision,
+                } if !stale_layout && active_menu_endpoint.as_ref() == Some(endpoint) => {
+                    menu_layout_reloads.record(endpoint.clone(), *watcher_generation, *revision)
+                }
+                Event::MenuLayoutInvalidated {
+                    endpoint,
+                    watcher_generation: None,
+                    ..
+                } => active_menu_endpoint.as_ref() == Some(endpoint),
+                _ => false,
+            };
+            if let Some(endpoint) = watcher_to_end {
+                dbus.end_menu_watcher(endpoint);
+            }
             let hovered_before = if matches!(
                 &event,
                 Event::X11(platform::x11::X11Event::MotionNotify { .. })
@@ -609,15 +700,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 );
             }
             outputs_changed |= matches!(&event, Event::OutputsChanged(_));
-            let stale_layout = matches!(
-                &event,
-                Event::MenuLayoutInvalidated {
-                    endpoint,
-                    revision: Some(revision),
-                } if state.active_menu_endpoint(&registry.lock().expect("registry poisoned")) == Some(endpoint.clone())
-                    && state.active_menu_model().is_some_and(|model| model.revision >= *revision)
+            let layout_in_flight = matches!(
+                &state.menu,
+                core::MenuState::Loading { endpoint: current, .. }
+                    if state.active_menu_endpoint(&registry.lock().expect("registry poisoned"))
+                        == Some(current.clone())
             );
-            let request_menu = !stale_layout
+            let mut request_menu = !stale_layout
                 && (matches!(
                     &translated,
                     Event::WindowFocused(_)
@@ -627,12 +716,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         | Event::GtkMenuRemoved { .. }
                         | Event::MenuUnregistered { .. }
                         | Event::MenuOwnerVanished { .. }
-                ) || matches!(
-                    &translated,
-                    Event::MenuLayoutInvalidated { endpoint, .. }
-                        if state.active_menu_endpoint(&registry.lock().expect("registry poisoned")) == Some(endpoint.clone())
-                ) || (matches!(&translated, Event::MenuRootClicked(_))
-                    && matches!(state.menu, core::MenuState::TrayLoaded { .. })));
+                ) || (accepted_layout_invalidation && !layout_in_flight)
+                    || (matches!(&translated, Event::MenuRootClicked(_))
+                        && matches!(state.menu, core::MenuState::TrayLoaded { .. })));
             if trace {
                 match &translated {
                     Event::WindowFocused(new_window) => eprintln!(
@@ -709,6 +795,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Event::WindowFocusedWithApp { .. } => "WindowFocusedWithApp",
                     _ => "other",
                 });
+            }
+            if let Event::MenuLoaded {
+                endpoint,
+                request_id,
+                model,
+                ..
+            } = &translated
+            {
+                if menu_layout_reloads.complete_load(endpoint, *request_id, model.revision) {
+                    request_menu = true;
+                }
             }
             if trace && matches!(translated, Event::ActiveAiUsageChanged(_)) {
                 eprintln!(
@@ -1086,6 +1183,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     match endpoint {
                         MenuSource::DbusMenu(endpoint) => {
+                            menu_layout_reloads
+                                .begin_load(MenuSource::DbusMenu(endpoint.clone()), request_id);
                             dbus.request_layout(window_id, endpoint, request_id)
                         }
                         MenuSource::GtkGMenu(endpoint) => {
@@ -1148,6 +1247,7 @@ fn render_target_for(
         Event::X11(platform::x11::X11Event::InstanceLost)
         | Event::X11(platform::x11::X11Event::Close) => None,
         Event::WindowFocusedWithApp { .. } => Some(RenderTarget::DockContext),
+        Event::MenuWatcherReady { .. } => None,
         Event::MenuRegistered { .. }
         | Event::GtkMenuDiscovered { .. }
         | Event::GtkMenuRemoved { .. }
@@ -1206,6 +1306,7 @@ fn render_target_for(
         Event::StatusNotifierRegistered(_)
         | Event::StatusNotifierUnregistered(_)
         | Event::StatusNotifierOwnerVanished(_)
+        | Event::StatusNotifierWatcherUnavailable
         | Event::StatusNotifierItemUpdated(_) => Some(RenderTarget::Tray),
         Event::StatusNotifierHostRegistered => Some(RenderTarget::Tray),
         Event::MenuRootClicked(_)

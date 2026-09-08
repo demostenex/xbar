@@ -65,21 +65,21 @@ pub struct NetworkPopupLayout {
 
 pub fn network_popup_content_height(interface_row_counts: &[usize]) -> u16 {
     let shell = POPUP_STYLE.outer_padding;
-    let interface_heights: u16 = interface_row_counts
+    let interface_heights: u32 = interface_row_counts
         .iter()
-        .map(|count| network_interface_card_height(*count))
-        .sum();
-    let interface_gaps = POPUP_STYLE
-        .card_gap
-        .saturating_mul(interface_row_counts.len().saturating_sub(1) as u16);
-    shell
+        .map(|count| u32::from(network_interface_card_height(*count)))
+        .fold(0_u32, u32::saturating_add);
+    let interface_gaps = u32::from(POPUP_STYLE.card_gap)
+        .saturating_mul(interface_row_counts.len().saturating_sub(1) as u32);
+    u32::from(shell)
         .saturating_mul(2)
-        .saturating_add(NETWORK_STATUS_CARD_HEIGHT)
-        .saturating_add(POPUP_STYLE.card_gap)
-        .saturating_add(NETWORK_SECTION_HEADER_HEIGHT)
-        .saturating_add(POPUP_STYLE.card_gap)
+        .saturating_add(u32::from(NETWORK_STATUS_CARD_HEIGHT))
+        .saturating_add(u32::from(POPUP_STYLE.card_gap))
+        .saturating_add(u32::from(NETWORK_SECTION_HEADER_HEIGHT))
+        .saturating_add(u32::from(POPUP_STYLE.card_gap))
         .saturating_add(interface_heights)
         .saturating_add(interface_gaps)
+        .min(u32::from(u16::MAX)) as u16
 }
 
 pub fn network_popup_layout(rect: MenuRect, interface_row_counts: &[usize]) -> NetworkPopupLayout {
@@ -102,40 +102,50 @@ pub fn network_popup_layout(rect: MenuRect, interface_row_counts: &[usize]) -> N
     };
     let mut cursor_y =
         available_section.y + available_section.height as i16 + POPUP_STYLE.card_gap as i16;
-    let interfaces = interface_row_counts
-        .iter()
-        .map(|count| {
-            let card = MenuRect {
-                x: status_card.x,
-                y: cursor_y,
-                width: card_width,
-                height: network_interface_card_height(*count),
-            };
-            let header = MenuRect {
-                x: card.x + card_padding,
-                y: card.y + card_padding,
-                width: card
-                    .width
-                    .saturating_sub(POPUP_STYLE.card_padding.saturating_mul(2)),
-                height: NETWORK_SECTION_HEADER_HEIGHT,
-            };
-            let mut row_y = header.y + header.height as i16 + POPUP_STYLE.card_row_gap as i16;
-            let rows = (0..*count)
-                .map(|_| {
-                    let row = MenuRect {
-                        x: header.x,
-                        y: row_y,
-                        width: header.width,
-                        height: NETWORK_ROW_HEIGHT,
-                    };
-                    row_y += NETWORK_ROW_HEIGHT as i16 + POPUP_STYLE.card_row_gap as i16;
-                    row
-                })
-                .collect();
-            cursor_y += card.height as i16 + POPUP_STYLE.card_gap as i16;
-            NetworkInterfaceCardLayout { card, header, rows }
-        })
-        .collect();
+    let popup_bottom = rect.y + rect.height as i16;
+    let mut interfaces = Vec::new();
+    for count in interface_row_counts {
+        if cursor_y >= popup_bottom {
+            break;
+        }
+        let card_height =
+            network_interface_card_height(*count).min((popup_bottom - cursor_y).max(0) as u16);
+        let card = MenuRect {
+            x: status_card.x,
+            y: cursor_y,
+            width: card_width,
+            height: card_height,
+        };
+        let header = MenuRect {
+            x: card.x + card_padding,
+            y: card.y + card_padding,
+            width: card
+                .width
+                .saturating_sub(POPUP_STYLE.card_padding.saturating_mul(2)),
+            height: NETWORK_SECTION_HEADER_HEIGHT,
+        };
+        let row_area = card
+            .height
+            .saturating_sub(POPUP_STYLE.card_padding.saturating_mul(2))
+            .saturating_sub(header.height)
+            .saturating_sub(POPUP_STYLE.card_row_gap);
+        let visible_count = usize::from(row_area / (NETWORK_ROW_HEIGHT + POPUP_STYLE.card_row_gap));
+        let mut row_y = header.y + header.height as i16 + POPUP_STYLE.card_row_gap as i16;
+        let rows = (0..(*count).min(visible_count))
+            .map(|_| {
+                let row = MenuRect {
+                    x: header.x,
+                    y: row_y,
+                    width: header.width,
+                    height: NETWORK_ROW_HEIGHT,
+                };
+                row_y += NETWORK_ROW_HEIGHT as i16 + POPUP_STYLE.card_row_gap as i16;
+                row
+            })
+            .collect();
+        cursor_y += card.height as i16 + POPUP_STYLE.card_gap as i16;
+        interfaces.push(NetworkInterfaceCardLayout { card, header, rows });
+    }
     NetworkPopupLayout {
         status_card,
         available_section,
@@ -144,23 +154,24 @@ pub fn network_popup_layout(rect: MenuRect, interface_row_counts: &[usize]) -> N
 }
 
 fn network_interface_card_height(row_count: usize) -> u16 {
-    let rows = (NETWORK_ROW_HEIGHT + POPUP_STYLE.card_row_gap)
-        .saturating_mul(row_count as u16)
+    let row_count = u32::try_from(row_count).unwrap_or(u32::MAX);
+    let rows = u32::from(NETWORK_ROW_HEIGHT + POPUP_STYLE.card_row_gap)
+        .saturating_mul(row_count)
         .saturating_sub(if row_count == 0 {
             0
         } else {
-            POPUP_STYLE.card_row_gap
+            u32::from(POPUP_STYLE.card_row_gap)
         });
-    POPUP_STYLE
-        .card_padding
+    let height = u32::from(POPUP_STYLE.card_padding)
         .saturating_mul(2)
-        .saturating_add(NETWORK_SECTION_HEADER_HEIGHT)
+        .saturating_add(u32::from(NETWORK_SECTION_HEADER_HEIGHT))
         .saturating_add(if row_count == 0 {
             0
         } else {
-            POPUP_STYLE.card_row_gap
+            u32::from(POPUP_STYLE.card_row_gap)
         })
-        .saturating_add(rows)
+        .saturating_add(rows);
+    height.min(u32::from(u16::MAX)) as u16
 }
 
 /// Audio device rows use root coordinates, including the popup's one-pixel border.
@@ -196,14 +207,13 @@ pub fn audio_device_rows<M: TextMeasurer>(
     measurer: &M,
 ) -> Vec<AudioDeviceRow> {
     let baseline_offset = measurer.baseline(AUDIO_DEVICE_ROW_HEIGHT);
+    let popup_bottom = popup.y + popup.height as i16;
     devices
         .iter()
         .take(8)
         .enumerate()
-        .map(|(index, device)| AudioDeviceRow {
-            name: device.name.clone(),
-            display_name: device.display_name.clone(),
-            rect: MenuRect {
+        .filter_map(|(index, device)| {
+            let rect = MenuRect {
                 x: popup.x + POPUP_STYLE.outer_padding as i16 + POPUP_STYLE.card_padding as i16,
                 y: popup.y
                     + AUDIO_POPUP_BORDER as i16
@@ -217,8 +227,15 @@ pub fn audio_device_rows<M: TextMeasurer>(
                         .saturating_mul(2),
                 ),
                 height: AUDIO_DEVICE_ROW_HEIGHT,
-            },
-            baseline_offset,
+            };
+            (rect.y >= popup.y && rect.y + rect.height as i16 <= popup_bottom).then_some(
+                AudioDeviceRow {
+                    name: device.name.clone(),
+                    display_name: device.display_name.clone(),
+                    rect,
+                    baseline_offset,
+                },
+            )
         })
         .collect()
 }
@@ -288,6 +305,32 @@ impl PopupLayout {
 
 fn text_width<M: TextMeasurer>(measurer: &M, text: &str) -> u16 {
     measurer.measure_width(text)
+}
+
+pub fn truncate_text_to_width<M: TextMeasurer>(
+    text: &str,
+    width: u16,
+    measurer: &M,
+) -> Option<String> {
+    if width == 0 {
+        return None;
+    }
+    if text_width(measurer, text) <= width {
+        return Some(text.to_owned());
+    }
+    let ellipsis = "…";
+    if text_width(measurer, ellipsis) > width {
+        return None;
+    }
+    let mut result = String::new();
+    for ch in text.chars() {
+        let candidate = format!("{result}{ch}{ellipsis}");
+        if text_width(measurer, &candidate) > width {
+            break;
+        }
+        result.push(ch);
+    }
+    Some(format!("{result}{ellipsis}"))
 }
 
 fn shortcut_text(item: &MenuItem) -> Option<String> {
@@ -365,7 +408,7 @@ pub fn popup_layout_with_measurer<M: TextMeasurer>(
                 item_height
             }
         })
-        .sum();
+        .fold(0_i32, i32::saturating_add);
     let height = (content_height + i32::from(POPUP_STYLE.outer_padding.saturating_mul(2)))
         .min(output.height.max(1) as i32)
         .max(1) as u16;
@@ -405,38 +448,62 @@ pub fn popup_layout_with_measurer<M: TextMeasurer>(
             .saturating_sub(POPUP_STYLE.outer_padding.saturating_mul(2)),
     };
     let mut cursor = i32::from(content.y);
-    let items = children
-        .into_iter()
-        .map(|item| {
-            let separator = item.item_type == MenuItemType::Separator;
-            let h = if separator {
-                separator_height
-            } else {
-                item_height
-            };
-            let item_rect = MenuRect {
-                x: content.x,
-                y: cursor as i16,
-                width: content.width,
-                height: h as u16,
-            };
-            cursor += h;
-            PopupItemRect {
-                id: item.id,
-                rect: item_rect,
-                label: item
-                    .label
-                    .as_deref()
-                    .map(crate::ui::view::present_label)
-                    .unwrap_or_default(),
-                enabled: item.enabled,
-                separator,
-                has_submenu: item.children_display == Some(ChildrenDisplay::Submenu)
-                    && !item.children.is_empty(),
-                shortcut: shortcut_text(item),
-            }
-        })
-        .collect();
+    let mut items = Vec::new();
+    for item in children {
+        let separator = item.item_type == MenuItemType::Separator;
+        let h = if separator {
+            separator_height
+        } else {
+            item_height
+        };
+        if cursor + h > i32::from(content.y) + i32::from(content.height) {
+            break;
+        }
+        let item_rect = MenuRect {
+            x: content.x,
+            y: cursor as i16,
+            width: content.width,
+            height: h as u16,
+        };
+        cursor += h;
+        let indicator = if item.children_display == Some(ChildrenDisplay::Submenu) {
+            16
+        } else {
+            0
+        };
+        let shortcut_limit = content
+            .width
+            .saturating_sub(POPUP_STYLE.row_horizontal_padding.saturating_mul(2))
+            .saturating_sub(indicator)
+            .saturating_sub(4);
+        let shortcut = shortcut_text(item)
+            .and_then(|shortcut| truncate_text_to_width(&shortcut, shortcut_limit, measurer));
+        let shortcut_width = shortcut
+            .as_deref()
+            .map(|text| text_width(measurer, text))
+            .unwrap_or(0);
+        let label_width = content
+            .width
+            .saturating_sub(POPUP_STYLE.row_horizontal_padding.saturating_mul(2))
+            .saturating_sub(indicator)
+            .saturating_sub(shortcut_width)
+            .saturating_sub(4);
+        let label = item
+            .label
+            .as_deref()
+            .map(crate::ui::view::present_label)
+            .unwrap_or_default();
+        items.push(PopupItemRect {
+            id: item.id,
+            rect: item_rect,
+            label: truncate_text_to_width(&label, label_width, measurer).unwrap_or_default(),
+            enabled: item.enabled,
+            separator,
+            has_submenu: item.children_display == Some(ChildrenDisplay::Submenu)
+                && !item.children.is_empty(),
+            shortcut,
+        });
+    }
     PopupLayout {
         parent_id: parent.id,
         rect,
@@ -496,12 +563,12 @@ pub fn allocate_context_with_reserved_right<M: TextMeasurer>(
 ) {
     let output_left = output.x as i32;
     let output_right = output_left + output.width as i32;
-    let workspace_width = workspaces
+    let workspace_natural_width = workspaces
         .first()
         .map(|workspace| {
             (text_width(measurer, &workspace.name) as i32
                 + (BAR_STYLE.horizontal_padding as i32 * 2))
-                .clamp(24, output.width as i32) as u16
+                .clamp(24.min(output.width as i32), output.width as i32)
         })
         .unwrap_or(0);
     let datetime_width = datetime
@@ -510,11 +577,19 @@ pub fn allocate_context_with_reserved_right<M: TextMeasurer>(
                 .min(output.width as i32)
         })
         .unwrap_or(0);
-    let datetime_x = output_right - RIGHT_PADDING - datetime_width;
+    let datetime_x = (output_right - RIGHT_PADDING - datetime_width).max(output_left);
     let content_right = datetime_x - if datetime.is_some() { RIGHT_PADDING } else { 0 };
     let content_left = output_left + LEFT_PADDING;
-    let available_menu =
-        (content_right - content_left - workspace_width as i32 - reserved_right.max(0)).max(0);
+    let workspace_available = content_right
+        .saturating_sub(content_left)
+        .saturating_sub(reserved_right.max(0))
+        .max(0);
+    let workspace_width = workspace_natural_width.min(workspace_available) as u16;
+    let available_menu = content_right
+        .saturating_sub(content_left)
+        .saturating_sub(workspace_width as i32)
+        .saturating_sub(reserved_right.max(0))
+        .max(0);
     let mut menu_width = 0_i32;
     let mut widths = Vec::new();
     for (_, label, _) in menu {
@@ -525,7 +600,10 @@ pub fn allocate_context_with_reserved_right<M: TextMeasurer>(
             + (BAR_STYLE.horizontal_padding as i32 * 2)
             + BAR_STYLE.item_spacing as i32)
             .max(20);
-        let width = natural.min(available_menu - menu_width);
+        let width = natural.min(available_menu.saturating_sub(menu_width));
+        if width == 0 {
+            break;
+        }
         widths.push(width as u16);
         menu_width += width;
     }
@@ -556,8 +634,8 @@ pub fn allocate_context_with_reserved_right<M: TextMeasurer>(
         width: datetime_width as u16,
         height: 26,
     });
-    let future_left = x;
     let future_right = content_right;
+    let future_left = x.min(future_right).max(output_left);
     let future_rect = MenuRect {
         x: future_left as i16,
         y: output.y,
@@ -605,10 +683,12 @@ pub fn allocate_plugins(
     let mut rects = Vec::with_capacity(labels.len());
     for label in labels.iter().rev() {
         let width = (measurer.measure_width(label) as i32 + 12).max(20);
-        let x = cursor - width;
-        if x < left as i32 {
+        let available = cursor.saturating_sub(left as i32);
+        if available <= 0 {
             break;
         }
+        let width = width.min(available);
+        let x = cursor - width;
         rects.push(MenuRect {
             x: x as i16,
             y: 0,
@@ -663,7 +743,7 @@ mod tests {
                 x: 1580,
                 y: 26,
                 width: 340,
-                height: 404,
+                height: 500,
             },
             vec![
                 crate::core::AudioDevice {
@@ -981,6 +1061,18 @@ mod tests {
     }
 
     #[test]
+    fn truncation_is_deterministic_and_never_exceeds_allocation() {
+        let measurer = WidthMeasurer(8);
+        assert_eq!(
+            truncate_text_to_width("abcdef", 48, &measurer),
+            Some("abcdef".into())
+        );
+        let clipped = truncate_text_to_width("abcdefgh", 32, &measurer).expect("ellipsis fits");
+        assert!(measurer.measure_width(&clipped) <= 32);
+        assert_eq!(truncate_text_to_width("abcdef", 0, &measurer), None);
+    }
+
+    #[test]
     fn popup_is_below_anchor_and_hides_hidden_items() {
         let p = popup_layout(
             &output(),
@@ -999,6 +1091,74 @@ mod tests {
             vec![MenuItemId(2), MenuItemId(3)]
         );
         assert!(p.items[1].separator && p.items[1].rect.height > 0);
+    }
+
+    #[test]
+    fn revision_eight_submenus_project_all_children_into_popups() {
+        let child = |id: i32, label: &str| MenuItem {
+            id: MenuItemId(id),
+            label: Some(label.into()),
+            enabled: true,
+            visible: true,
+            item_type: MenuItemType::Standard,
+            children_display: None,
+            shortcut: None,
+            icon_name: None,
+            action: None,
+            children: vec![],
+        };
+        let tools = MenuItem {
+            id: MenuItemId(8),
+            label: Some("Tools".into()),
+            enabled: true,
+            visible: true,
+            item_type: MenuItemType::Standard,
+            children_display: Some(ChildrenDisplay::Submenu),
+            shortcut: None,
+            icon_name: None,
+            action: None,
+            children: vec![child(16, "Settings"), child(17, "Reload")],
+        };
+        let view = MenuItem {
+            id: MenuItemId(9),
+            label: Some("View".into()),
+            enabled: true,
+            visible: true,
+            item_type: MenuItemType::Standard,
+            children_display: Some(ChildrenDisplay::Submenu),
+            shortcut: None,
+            icon_name: None,
+            action: None,
+            children: vec![
+                child(18, "show/hide Menu"),
+                child(19, "Zoom +"),
+                child(20, "Zoom -"),
+            ],
+        };
+        let tools_popup = popup_layout(
+            &output(),
+            &tools,
+            MenuRect {
+                x: 120,
+                y: 20,
+                width: 80,
+                height: 26,
+            },
+            true,
+        );
+        let view_popup = popup_layout(
+            &output(),
+            &view,
+            MenuRect {
+                x: 120,
+                y: 20,
+                width: 80,
+                height: 26,
+            },
+            true,
+        );
+        assert_eq!(tools_popup.items.len(), 2);
+        assert_eq!(view_popup.items.len(), 3);
     }
 
     #[test]
@@ -1050,6 +1210,60 @@ mod tests {
             item.rect.x >= content.x
                 && item.rect.x + item.rect.width as i16 <= content.x + content.width as i16
         }));
+    }
+
+    #[test]
+    fn popup_vertical_overflow_omits_rows_and_hit_targets() {
+        let mut small = output();
+        small.height = 60;
+        let popup = popup_layout(
+            &small,
+            &popup_parent(),
+            MenuRect {
+                x: 20,
+                y: 20,
+                width: 80,
+                height: 26,
+            },
+            false,
+        );
+        assert!(popup.items.iter().all(|item| {
+            item.rect.y >= popup.rect.y
+                && item.rect.y + item.rect.height as i16 <= popup.rect.y + popup.rect.height as i16
+        }));
+        assert!(popup.item_at_local(20, 59).is_none());
+    }
+
+    #[test]
+    fn narrow_context_widths_do_not_wrap_or_escape_output() {
+        let mut narrow = output();
+        narrow.width = 1;
+        let workspaces = vec![WorkspaceState {
+            name: "1".into(),
+            output: Some("HDMI-1".into()),
+            focused: true,
+        }];
+        let (_, menus, datetime, future) = allocate_context_with_reserved_right(
+            &narrow,
+            &workspaces,
+            &[(MenuItemId(1), "A very long menu label".into(), true)],
+            Some("A very long date"),
+            i32::MAX,
+            &WidthMeasurer(8),
+        );
+        assert!(menus.iter().all(|rect| rect.width == 0));
+        assert!(datetime.is_none_or(|rect| rect.width <= narrow.width));
+        assert!(future.width <= narrow.width);
+    }
+
+    #[test]
+    fn plugins_clip_to_remaining_viewport_instead_of_wrapping() {
+        let labels = vec!["a very long plugin".into(), "another long plugin".into()];
+        let rects = allocate_plugins(100, 130, &labels, &WidthMeasurer(8));
+        assert!(!rects.is_empty());
+        assert!(rects
+            .iter()
+            .all(|rect| { rect.x >= 100 && rect.x + rect.width as i16 <= 130 && rect.width > 0 }));
     }
 
     #[test]

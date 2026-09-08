@@ -417,8 +417,10 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 false
             }
         }
-        Event::MenuLayoutInvalidated { .. } => false,
-        Event::MenuPropertiesUpdated { endpoint, updates } => {
+        Event::MenuWatcherReady { .. } | Event::MenuLayoutInvalidated { .. } => false,
+        Event::MenuPropertiesUpdated {
+            endpoint, updates, ..
+        } => {
             if !matches!(&state.menu, MenuState::Loaded { endpoint: current, .. } if current == &endpoint)
                 || !state
                     .focused_window
@@ -963,6 +965,22 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.menu_interaction = Default::default();
             }
             removed
+        }
+        Event::StatusNotifierWatcherUnavailable => {
+            let changed = !state.status_notifiers.is_empty()
+                || !state.status_notifier_items.items().is_empty()
+                || state.status_notifier_host_registered;
+            state.status_notifiers = super::StatusNotifierRegistry::default();
+            state.status_notifier_items = super::StatusNotifierItemRegistry::default();
+            state.status_notifier_host_registered = false;
+            if matches!(
+                state.menu,
+                MenuState::TrayLoaded { .. } | MenuState::TrayLoading { .. }
+            ) {
+                state.menu = MenuState::NoMenu;
+                state.menu_interaction = Default::default();
+            }
+            changed
         }
         Event::StatusNotifierItemUpdated(item) => {
             let closes = matches!(&state.menu, MenuState::TrayLoaded { endpoint, .. } | MenuState::TrayLoading { endpoint, .. }
@@ -2177,6 +2195,28 @@ mod tests {
     }
 
     #[test]
+    fn watcher_loss_clears_only_tray_projection() {
+        let mut state = State {
+            focused_app_name: Some("keep-me".into()),
+            ..Default::default()
+        };
+        state
+            .status_notifiers
+            .register(super::super::StatusNotifierEndpoint {
+                service: ":1.9".into(),
+                object_path: "/StatusNotifierItem".into(),
+            });
+        assert!(reduce(
+            &mut state,
+            Event::StatusNotifierWatcherUnavailable,
+            &mut MenuRegistry::default(),
+        ));
+        assert!(state.status_notifiers.is_empty());
+        assert!(state.status_notifier_items.items().is_empty());
+        assert_eq!(state.focused_app_name.as_deref(), Some("keep-me"));
+    }
+
+    #[test]
     fn tray_scroll_action_does_not_dirty_state() {
         let mut state = State::default();
         assert!(!reduce(
@@ -2549,6 +2589,7 @@ mod tests {
             &mut state,
             Event::MenuLayoutInvalidated {
                 endpoint: MenuSource::DbusMenu(ep()),
+                watcher_generation: None,
                 revision: None,
             },
             &mut registry,
@@ -3122,6 +3163,7 @@ mod tests {
             &mut state,
             Event::MenuPropertiesUpdated {
                 endpoint: MenuSource::DbusMenu(ep()),
+                watcher_generation: None,
                 updates: vec![super::super::MenuItemPropertiesUpdate {
                     item_id: MenuItemId(2),
                     properties: vec![super::super::MenuPropertyUpdate::Enabled(false)],
@@ -3135,6 +3177,7 @@ mod tests {
             &mut state,
             Event::MenuPropertiesUpdated {
                 endpoint: MenuSource::DbusMenu(ep()),
+                watcher_generation: None,
                 updates: vec![super::super::MenuItemPropertiesUpdate {
                     item_id: MenuItemId(2),
                     properties: vec![super::super::MenuPropertyUpdate::Label(Some(
@@ -3152,6 +3195,7 @@ mod tests {
             &mut state,
             Event::MenuPropertiesUpdated {
                 endpoint: MenuSource::DbusMenu(ep()),
+                watcher_generation: None,
                 updates: vec![super::super::MenuItemPropertiesUpdate {
                     item_id: MenuItemId(2),
                     properties: vec![super::super::MenuPropertyUpdate::Label(Some(
@@ -3165,6 +3209,7 @@ mod tests {
             &mut state,
             Event::MenuPropertiesUpdated {
                 endpoint: MenuSource::DbusMenu(ep()),
+                watcher_generation: None,
                 updates: vec![super::super::MenuItemPropertiesUpdate {
                     item_id: MenuItemId(999),
                     properties: vec![super::super::MenuPropertyUpdate::Enabled(false)],
@@ -3192,6 +3237,7 @@ mod tests {
             &mut state,
             Event::MenuPropertiesUpdated {
                 endpoint: MenuSource::DbusMenu(ep()),
+                watcher_generation: None,
                 updates: vec![super::super::MenuItemPropertiesUpdate {
                     item_id: MenuItemId(2),
                     properties: vec![

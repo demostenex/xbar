@@ -36,6 +36,11 @@ pub enum Event {
     MenuOwnerVanished {
         sender: String,
     },
+    MenuWatcherReady {
+        endpoint: MenuSource,
+        watcher_generation: u64,
+        request_id: u64,
+    },
     MenuLoadRequested {
         window_id: WindowId,
         endpoint: MenuSource,
@@ -94,10 +99,12 @@ pub enum Event {
     },
     MenuLayoutInvalidated {
         endpoint: MenuSource,
+        watcher_generation: Option<u64>,
         revision: Option<u32>,
     },
     MenuPropertiesUpdated {
         endpoint: MenuSource,
+        watcher_generation: Option<u64>,
         updates: Vec<MenuItemPropertiesUpdate>,
     },
     OutputsChanged(Vec<OutputState>),
@@ -150,6 +157,7 @@ pub enum Event {
     StatusNotifierRegistered(StatusNotifierEndpoint),
     StatusNotifierUnregistered(StatusNotifierEndpoint),
     StatusNotifierOwnerVanished(String),
+    StatusNotifierWatcherUnavailable,
     StatusNotifierItemUpdated(StatusNotifierItem),
     StatusNotifierHostRegistered,
     StatusNotifierActionRequested {

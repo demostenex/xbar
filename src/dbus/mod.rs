@@ -1,10 +1,10 @@
 #[cfg(test)]
 use crate::core::NetworkAccessPoint;
 use crate::core::{
-    format_notifier_item_id, parse_notifier_item_id, BluetoothDevice, BluetoothPendingAction,
-    BluetoothState, Event, GtkMenuEndpoint, MenuActionTarget, MenuRegistry, MenuSource,
-    NotificationId, StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierIcon,
-    StatusNotifierItem, StatusNotifierStatus,
+    parse_notifier_item_id, BluetoothDevice, BluetoothPendingAction, BluetoothState, Event,
+    GtkMenuEndpoint, MenuActionTarget, MenuEndpoint, MenuRegistry, MenuSource, NotificationId,
+    StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierIcon, StatusNotifierItem,
+    StatusNotifierStatus,
 };
 mod ai_usage;
 mod gmenu;
@@ -12,11 +12,16 @@ mod menu;
 use crate::notifications::{self, SharedStore, SharedTimer, REASON_CLOSED, REASON_EXPIRED};
 use async_channel::{Receiver, Sender};
 use futures_lite::StreamExt;
+use std::collections::hash_map::Entry;
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use zbus::message::Header;
@@ -32,11 +37,112 @@ const DBUSMENU_INTERFACE: &str = "com.canonical.dbusmenu";
 const NOTIFICATIONS_NAME: &str = "org.freedesktop.Notifications";
 const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 
+fn sibling_sni_watcher_path(executable: &Path) -> Option<PathBuf> {
+    executable
+        .parent()
+        .map(|parent| parent.join("xbar-sni-watcher"))
+}
+
+fn sibling_sni_watcher(executable: &Path) -> Option<PathBuf> {
+    sibling_sni_watcher_path(executable).filter(|candidate| candidate.is_file())
+}
+
+fn ensure_status_notifier_watcher() {
+    let current = std::env::current_exe().ok();
+    let companion = current
+        .as_deref()
+        .and_then(sibling_sni_watcher)
+        .unwrap_or_else(|| PathBuf::from("xbar-sni-watcher"));
+    if Command::new(&companion).spawn().is_err() && std::env::var_os("XBAR_TRACE").is_some() {
+        eprintln!("xbar trace: xbar-sni-watcher was not found or could not start");
+    }
+}
+
+fn retain_sni_owner_on_setup_failure(owner: &mut Option<String>, live_owner: &str) {
+    *owner = Some(live_owner.to_owned());
+}
+
+fn dbus_menu_endpoint_key(endpoint: &MenuEndpoint) -> String {
+    format!("{}\0{}", endpoint.service, endpoint.object_path)
+}
+
 #[derive(Clone, Debug)]
 struct LayoutRequest {
     window_id: crate::core::WindowId,
     endpoint: crate::core::MenuEndpoint,
     request_id: u64,
+}
+
+struct MenuWatcherControl {
+    watcher_generation: u64,
+    signal_cancel: Sender<()>,
+    loads: HashMap<u64, Sender<()>>,
+}
+
+struct InstalledMenuSignalWatcher {
+    cancel: Sender<()>,
+    start: Sender<u64>,
+}
+
+fn allocate_menu_watcher_generation(next: &mut u64) -> u64 {
+    let generation = *next;
+    *next = (*next).wrapping_add(1);
+    generation
+}
+
+fn cancel_watchers_for_unique_owner(
+    watchers: &mut HashMap<String, MenuWatcherControl>,
+    owner: &str,
+) {
+    let vanished_service = format!("{owner}\0");
+    watchers.retain(|key, control| {
+        if key.starts_with(&vanished_service) {
+            control.cancel();
+            false
+        } else {
+            true
+        }
+    });
+}
+
+fn finish_layout_load(
+    watchers: &mut HashMap<String, MenuWatcherControl>,
+    endpoint: &MenuEndpoint,
+    request_id: u64,
+) -> bool {
+    watchers
+        .get_mut(&dbus_menu_endpoint_key(endpoint))
+        .is_some_and(|control| control.finish_load(request_id))
+}
+
+impl MenuWatcherControl {
+    fn new(watcher_generation: u64, signal_cancel: Sender<()>) -> Self {
+        Self {
+            watcher_generation,
+            signal_cancel,
+            loads: HashMap::new(),
+        }
+    }
+
+    fn start_load(&mut self, request_id: u64) -> Receiver<()> {
+        for cancel in self.loads.drain().map(|(_, cancel)| cancel) {
+            let _ = cancel.try_send(());
+        }
+        let (sender, receiver) = async_channel::bounded(1);
+        self.loads.insert(request_id, sender);
+        receiver
+    }
+
+    fn finish_load(&mut self, request_id: u64) -> bool {
+        self.loads.remove(&request_id).is_some()
+    }
+
+    fn cancel(&self) {
+        let _ = self.signal_cancel.try_send(());
+        for cancel in self.loads.values() {
+            let _ = cancel.try_send(());
+        }
+    }
 }
 #[derive(Clone, Debug)]
 struct AboutRequest {
@@ -60,165 +166,14 @@ struct GtkActivateRequest {
     target: Option<MenuActionTarget>,
 }
 
-#[derive(Default)]
-struct StatusNotifierWatcherState {
-    items: Mutex<Vec<StatusNotifierEndpoint>>,
-    hosts: Mutex<HashSet<String>>,
-}
-
-struct StatusNotifierWatcher {
-    events: EventQueue,
-    wake: Arc<Mutex<UnixStream>>,
-    state: Arc<StatusNotifierWatcherState>,
-    connection: Arc<Mutex<Option<zbus::Connection>>>,
-}
-
-impl StatusNotifierWatcher {
-    fn push(&self, event: Event) {
-        push_event(&self.events, &self.wake, event);
-    }
-}
-
-#[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
-impl StatusNotifierWatcher {
-    async fn register_status_notifier_item(
-        &self,
-        item: String,
-        #[zbus(header)] header: Header<'_>,
-    ) -> zbus::fdo::Result<()> {
-        let sender = header
-            .sender()
-            .ok_or_else(|| zbus::fdo::Error::Failed("registration has no sender".into()))?
-            .to_string();
-        if !item.starts_with('/') {
-            let connection = self
-                .connection
-                .lock()
-                .expect("SNI connection poisoned")
-                .clone()
-                .ok_or_else(|| zbus::fdo::Error::Failed("watcher is not ready".into()))?;
-            let name: zbus::names::BusName<'_> = item.as_str().try_into().map_err(|error| {
-                zbus::fdo::Error::InvalidArgs(format!("invalid service: {error}"))
-            })?;
-            let dbus = zbus::fdo::DBusProxy::new(&connection)
-                .await
-                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
-            if !dbus
-                .name_has_owner(name)
-                .await
-                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
-            {
-                return Err(zbus::fdo::Error::NameHasNoOwner(item));
-            }
-        }
-        let endpoint = if item.starts_with('/') {
-            StatusNotifierEndpoint {
-                service: sender,
-                object_path: item.clone(),
-            }
-        } else {
-            StatusNotifierEndpoint {
-                service: item.clone(),
-                object_path: "/StatusNotifierItem".into(),
-            }
-        };
-        let added = {
-            let mut items = self.state.items.lock().expect("SNI items poisoned");
-            if items.contains(&endpoint) {
-                false
-            } else {
-                items.push(endpoint.clone());
-                true
-            }
-        };
-        if added {
-            self.push(Event::StatusNotifierRegistered(endpoint.clone()));
-            let connection = self
-                .connection
-                .lock()
-                .expect("SNI connection poisoned")
-                .clone();
-            if let Some(connection) = connection {
-                let emitter = zbus::object_server::SignalEmitter::new(&connection, SNI_PATH)?;
-                Self::status_notifier_item_registered(&emitter, format_notifier_item_id(&endpoint))
-                    .await?;
-                load_status_notifier_item(&connection, endpoint.clone(), &self.events, &self.wake)
-                    .await;
-                watch_status_notifier_item(&connection, endpoint, &self.events, &self.wake);
-            }
-        }
-        Ok(())
-    }
-
-    async fn register_status_notifier_host(&self, host: String) -> zbus::fdo::Result<()> {
-        let added = self
-            .state
-            .hosts
-            .lock()
-            .expect("SNI hosts poisoned")
-            .insert(host.clone());
-        if added {
-            self.push(Event::StatusNotifierHostRegistered);
-            let connection = self
-                .connection
-                .lock()
-                .expect("SNI connection poisoned")
-                .clone();
-            if let Some(connection) = connection {
-                let emitter = zbus::object_server::SignalEmitter::new(&connection, SNI_PATH)?;
-                Self::status_notifier_host_registered(&emitter, host).await?;
-            }
-        }
-        Ok(())
-    }
-
-    #[zbus(property)]
-    fn registered_status_notifier_items(&self) -> Vec<String> {
-        self.state
-            .items
-            .lock()
-            .expect("SNI items poisoned")
-            .iter()
-            .map(format_notifier_item_id)
-            .collect()
-    }
-
-    #[zbus(property)]
-    fn is_status_notifier_host_registered(&self) -> bool {
-        !self
-            .state
-            .hosts
-            .lock()
-            .expect("SNI hosts poisoned")
-            .is_empty()
-    }
-
-    #[zbus(property)]
-    fn protocol_version(&self) -> i32 {
-        0
-    }
-
-    #[zbus(signal)]
-    async fn status_notifier_item_registered(
-        emitter: &zbus::object_server::SignalEmitter<'_>,
-        item: String,
-    ) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn status_notifier_item_unregistered(
-        emitter: &zbus::object_server::SignalEmitter<'_>,
-        item: String,
-    ) -> zbus::Result<()>;
-
-    #[zbus(signal)]
-    async fn status_notifier_host_registered(
-        emitter: &zbus::object_server::SignalEmitter<'_>,
-        host: String,
-    ) -> zbus::Result<()>;
-}
 #[derive(Clone, Debug)]
 enum Request {
     Layout(LayoutRequest),
+    LayoutFinished {
+        request: LayoutRequest,
+        result: Result<crate::core::MenuModel, String>,
+    },
+    EndMenuWatcher(MenuEndpoint),
     GtkLayout {
         window_id: crate::core::WindowId,
         endpoint: GtkMenuEndpoint,
@@ -254,6 +209,182 @@ type PropertiesSignal = (
     Vec<(i32, HashMap<String, zbus::zvariant::OwnedValue>)>,
     Vec<(i32, Vec<String>)>,
 );
+
+async fn cancellable_layout_load<L, T, E>(load: L, cancel: Receiver<()>) -> Option<Result<T, E>>
+where
+    L: Future<Output = Result<T, E>>,
+{
+    futures_lite::future::race(async { Some(load.await) }, async {
+        let _ = cancel.recv().await;
+        None
+    })
+    .await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ItemWake {
+    PropertyChanged,
+    PropertyStreamEnded,
+    ItemCancelled,
+}
+
+fn item_wake_is_terminal(wake: ItemWake) -> bool {
+    !matches!(wake, ItemWake::PropertyChanged)
+}
+
+struct StatusNotifierAttachmentControl {
+    cancel_sender: Sender<()>,
+    cancel_receiver: Receiver<()>,
+    active: AtomicBool,
+    publication: Mutex<()>,
+    next_item_id: Mutex<u64>,
+    items: Mutex<HashMap<StatusNotifierEndpoint, (u64, Sender<()>)>>,
+}
+
+impl StatusNotifierAttachmentControl {
+    fn cancel(&self) {
+        let _publication = self
+            .publication
+            .lock()
+            .expect("SNI publication gate poisoned");
+        self.active.store(false, Ordering::SeqCst);
+        let _ = self.cancel_sender.try_send(());
+        let mut items = self.items.lock().expect("SNI attachment items poisoned");
+        for (_, sender) in items.drain().map(|(_, value)| value) {
+            let _ = sender.try_send(());
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    fn publish(&self, events: &EventQueue, wake: &Arc<Mutex<UnixStream>>, event: Event) -> bool {
+        let _publication = self
+            .publication
+            .lock()
+            .expect("SNI publication gate poisoned");
+        if !self.active.load(Ordering::SeqCst) {
+            return false;
+        }
+        push_event(events, wake, event);
+        true
+    }
+
+    fn publish_item(
+        &self,
+        endpoint: &StatusNotifierEndpoint,
+        id: u64,
+        events: &EventQueue,
+        wake: &Arc<Mutex<UnixStream>>,
+        event: Event,
+    ) -> bool {
+        let _publication = self
+            .publication
+            .lock()
+            .expect("SNI publication gate poisoned");
+        if !self.active.load(Ordering::SeqCst)
+            || self
+                .items
+                .lock()
+                .expect("SNI attachment items poisoned")
+                .get(endpoint)
+                .is_none_or(|(current, _)| *current != id)
+        {
+            return false;
+        }
+        push_event(events, wake, event);
+        true
+    }
+
+    fn start_item(&self, endpoint: &StatusNotifierEndpoint) -> Option<(u64, Receiver<()>)> {
+        // Publication, cancellation, and item-generation transitions all use
+        // this lock.  The lock order is publication -> items -> item id.
+        let _publication = self
+            .publication
+            .lock()
+            .expect("SNI publication gate poisoned");
+        if !self.active.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut items = self.items.lock().expect("SNI attachment items poisoned");
+        if items.contains_key(endpoint) {
+            return None;
+        }
+        let (sender, receiver) = async_channel::bounded(1);
+        let mut next = self.next_item_id.lock().expect("SNI item id poisoned");
+        let id = *next;
+        *next = next.wrapping_add(1);
+        items.insert(endpoint.clone(), (id, sender));
+        Some((id, receiver))
+    }
+
+    fn stop_item(&self, endpoint: &StatusNotifierEndpoint) {
+        let _publication = self
+            .publication
+            .lock()
+            .expect("SNI publication gate poisoned");
+        if let Some((_, sender)) = self
+            .items
+            .lock()
+            .expect("SNI attachment items poisoned")
+            .remove(endpoint)
+        {
+            let _ = sender.try_send(());
+        }
+    }
+
+    fn is_current_item(&self, endpoint: &StatusNotifierEndpoint, id: u64) -> bool {
+        let _publication = self
+            .publication
+            .lock()
+            .expect("SNI publication gate poisoned");
+        self.active.load(Ordering::SeqCst)
+            && self
+                .items
+                .lock()
+                .expect("SNI attachment items poisoned")
+                .get(endpoint)
+                .is_some_and(|(current, _)| *current == id)
+    }
+
+    fn finish_item(&self, endpoint: &StatusNotifierEndpoint, id: u64) {
+        let _publication = self
+            .publication
+            .lock()
+            .expect("SNI publication gate poisoned");
+        let mut items = self.items.lock().expect("SNI attachment items poisoned");
+        if items
+            .get(endpoint)
+            .is_some_and(|(current, _)| *current == id)
+        {
+            items.remove(endpoint);
+        }
+    }
+}
+
+struct StatusNotifierAttachment {
+    owner: String,
+    control: Arc<StatusNotifierAttachmentControl>,
+}
+
+struct ItemRegistrationGuard {
+    control: Arc<StatusNotifierAttachmentControl>,
+    endpoint: StatusNotifierEndpoint,
+    id: u64,
+}
+
+impl Drop for ItemRegistrationGuard {
+    fn drop(&mut self) {
+        self.control.finish_item(&self.endpoint, self.id);
+    }
+}
+
+impl Drop for StatusNotifierAttachment {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
+}
 
 pub struct DbusBridge {
     reader: UnixStream,
@@ -350,6 +481,10 @@ impl DbusBridge {
             endpoint,
             request_id,
         }));
+    }
+
+    pub fn end_menu_watcher(&self, endpoint: MenuEndpoint) {
+        let _ = self.requests.try_send(Request::EndMenuWatcher(endpoint));
     }
     pub fn request_about_to_show(
         &self,
@@ -543,81 +678,71 @@ async fn setup_status_notifier(
     connection: &zbus::Connection,
     events: &EventQueue,
     wake: &Arc<Mutex<UnixStream>>,
-    watcher_exists: bool,
-) -> zbus::Result<()> {
+) -> zbus::Result<StatusNotifierAttachment> {
+    let (cancel_sender, cancel_receiver) = async_channel::bounded(1);
+    let control = Arc::new(StatusNotifierAttachmentControl {
+        cancel_sender,
+        cancel_receiver,
+        active: AtomicBool::new(true),
+        publication: Mutex::new(()),
+        next_item_id: Mutex::new(0),
+        items: Mutex::new(HashMap::new()),
+    });
+    let attachment = StatusNotifierAttachment {
+        owner: String::new(),
+        control: Arc::clone(&control),
+    };
     let watcher =
         zbus::Proxy::new_owned(connection.clone(), SNI_NAME, SNI_PATH, SNI_INTERFACE).await?;
     let host = format!("org.kde.StatusNotifierHost-{}-xbar", std::process::id());
     let _: () = watcher.call("RegisterStatusNotifierHost", &(host,)).await?;
-    push_event(events, wake, Event::StatusNotifierHostRegistered);
-    if !watcher_exists {
-        // The local Watcher has already emitted the internal host event.
-        // This call also verifies the same public API used by external hosts.
-        if std::env::var_os("XBAR_TRACE").is_some() {
-            eprintln!("xbar trace: StatusNotifierWatcher owned by xbar, ProtocolVersion=0");
-        }
-    }
+    let bootstrap_done = install_status_notifier_signal_watcher(
+        connection,
+        events,
+        wake,
+        watcher.clone(),
+        Arc::clone(&control),
+    )
+    .await?;
     let existing: Vec<String> = watcher
         .get_property("RegisteredStatusNotifierItems")
         .await?;
     for item in existing {
         if let Some(endpoint) = parse_notifier_item_id(&item) {
-            push_event(
+            let Some((endpoint, item_id, item_cancel)) = apply_ordered_watcher_event(
+                &control,
                 events,
                 wake,
-                Event::StatusNotifierRegistered(endpoint.clone()),
+                OrderedWatcherEvent::Registered(endpoint),
+            ) else {
+                continue;
+            };
+            spawn_item_bootstrap(
+                connection,
+                endpoint,
+                events,
+                wake,
+                Arc::clone(&control),
+                item_id,
+                item_cancel,
             );
-            load_status_notifier_item(connection, endpoint.clone(), events, wake).await;
-            watch_status_notifier_item(connection, endpoint, events, wake);
         }
     }
-    if watcher_exists {
-        install_status_notifier_signal_watcher(connection, events, wake, watcher);
+    if control.is_active() {
+        control.publish(events, wake, Event::StatusNotifierHostRegistered);
     }
-    Ok(())
+    let _ = bootstrap_done.try_send(());
+    Ok(attachment)
 }
 
-async fn watcher_state_remove_service(
-    state: &StatusNotifierWatcherState,
+fn spawn_item_bootstrap(
+    connection: &zbus::Connection,
+    endpoint: StatusNotifierEndpoint,
     events: &EventQueue,
     wake: &Arc<Mutex<UnixStream>>,
-    connection: &zbus::Connection,
-    service: &str,
-) {
-    let removed = {
-        let mut items = state.items.lock().expect("SNI items poisoned");
-        let mut removed = Vec::new();
-        items.retain(|endpoint| {
-            if endpoint.service == service {
-                removed.push(endpoint.clone());
-                false
-            } else {
-                true
-            }
-        });
-        removed
-    };
-    for endpoint in removed {
-        push_event(
-            events,
-            wake,
-            Event::StatusNotifierUnregistered(endpoint.clone()),
-        );
-        if let Ok(emitter) = zbus::object_server::SignalEmitter::new(connection, SNI_PATH) {
-            let _ = StatusNotifierWatcher::status_notifier_item_unregistered(
-                &emitter,
-                format_notifier_item_id(&endpoint),
-            )
-            .await;
-        }
-    }
-}
-
-fn install_status_notifier_signal_watcher(
-    connection: &zbus::Connection,
-    events: &EventQueue,
-    wake: &Arc<Mutex<UnixStream>>,
-    watcher: zbus::Proxy<'static>,
+    control: Arc<StatusNotifierAttachmentControl>,
+    item_id: u64,
+    item_cancel: Receiver<()>,
 ) {
     let connection = connection.clone();
     let events = Arc::clone(events);
@@ -627,67 +752,189 @@ fn install_status_notifier_signal_watcher(
         .executor()
         .spawn(
             async move {
-                let mut registered =
-                    match watcher.receive_signal("StatusNotifierItemRegistered").await {
-                        Ok(stream) => stream,
-                        Err(_) => return,
-                    };
-                let mut unregistered = match watcher
-                    .receive_signal("StatusNotifierItemUnregistered")
+                let load_cancel = item_cancel.clone();
+                load_status_notifier_item(
+                    &connection,
+                    endpoint.clone(),
+                    &events,
+                    &wake,
+                    (Arc::clone(&control), item_id, load_cancel),
+                )
+                .await;
+                if control.is_current_item(&endpoint, item_id) {
+                    watch_status_notifier_item_with_cancel(
+                        &connection,
+                        endpoint,
+                        &events,
+                        &wake,
+                        control,
+                        item_id,
+                        item_cancel,
+                    );
+                }
+            },
+            "xbar-status-notifier-item-bootstrap",
+        )
+        .detach();
+}
+
+async fn await_item_phase<T, F>(future: F, cancel: &Receiver<()>) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    futures_lite::future::race(async { Some(future.await) }, async {
+        let _ = cancel.recv().await;
+        None
+    })
+    .await
+}
+
+async fn setup_status_notifier_reconciled(
+    connection: &zbus::Connection,
+    events: &EventQueue,
+    wake: &Arc<Mutex<UnixStream>>,
+    dbus: &zbus::fdo::DBusProxy<'_>,
+    expected_owner: &str,
+) -> zbus::Result<StatusNotifierAttachment> {
+    match setup_status_notifier(connection, events, wake).await {
+        Ok(attachment) => Ok(attachment),
+        Err(first_error) => {
+            let still_owned = dbus
+                .get_name_owner(SNI_NAME.try_into()?)
+                .await
+                .ok()
+                .is_some_and(|owner| owner.as_str() == expected_owner);
+            if still_owned {
+                setup_status_notifier(connection, events, wake)
                     .await
-                {
-                    Ok(stream) => stream,
-                    Err(_) => return,
-                };
+                    .map_err(|_| first_error)
+            } else {
+                Err(first_error)
+            }
+        }
+    }
+}
+
+enum OrderedWatcherEvent {
+    Registered(StatusNotifierEndpoint),
+    Unregistered(StatusNotifierEndpoint),
+}
+
+fn apply_ordered_watcher_event(
+    control: &StatusNotifierAttachmentControl,
+    events: &EventQueue,
+    wake: &Arc<Mutex<UnixStream>>,
+    event: OrderedWatcherEvent,
+) -> Option<(StatusNotifierEndpoint, u64, Receiver<()>)> {
+    match event {
+        OrderedWatcherEvent::Registered(endpoint) => {
+            let (item_id, item_cancel) = control.start_item(&endpoint)?;
+            control.publish(
+                events,
+                wake,
+                Event::StatusNotifierRegistered(endpoint.clone()),
+            );
+            Some((endpoint, item_id, item_cancel))
+        }
+        OrderedWatcherEvent::Unregistered(endpoint) => {
+            control.stop_item(&endpoint);
+            control.publish(events, wake, Event::StatusNotifierUnregistered(endpoint));
+            None
+        }
+    }
+}
+
+async fn install_status_notifier_signal_watcher(
+    connection: &zbus::Connection,
+    events: &EventQueue,
+    wake: &Arc<Mutex<UnixStream>>,
+    watcher: zbus::Proxy<'static>,
+    control: Arc<StatusNotifierAttachmentControl>,
+) -> zbus::Result<Sender<()>> {
+    // One match rule covers both members.  This closes the subscription gap
+    // and preserves the bus' ordering authority across registration changes.
+    let mut signals = watcher.receive_all_signals().await?;
+    let connection = connection.clone();
+    let events = Arc::clone(events);
+    let wake = Arc::clone(wake);
+    let cancel = control.cancel_receiver.clone();
+    let (bootstrap_done, bootstrap_ready) = async_channel::bounded(1);
+    connection
+        .clone()
+        .executor()
+        .spawn(
+            async move {
+                // The match streams are subscribed before the snapshot, but
+                // queued signals are not applied until bootstrap has finished.
+                let ready = futures_lite::future::race(
+                    async {
+                        let _ = bootstrap_ready.recv().await;
+                        true
+                    },
+                    async {
+                        let _ = cancel.recv().await;
+                        false
+                    },
+                )
+                .await;
+                if !ready {
+                    return;
+                }
                 loop {
-                    let registered_signal = async { Either::Owner(registered.next().await) };
-                    let unregistered_signal = async { Either::Request(unregistered.next().await) };
-                    match futures_lite::future::race(registered_signal, unregistered_signal).await {
-                        Either::Owner(Some(signal)) => {
+                    let next = futures_lite::future::race(async { signals.next().await }, async {
+                        let _ = cancel.recv().await;
+                        None
+                    })
+                    .await;
+                    let Some(signal) = next else {
+                        break;
+                    };
+                    match signal.header().member().map(|member| member.as_str()) {
+                        Some("StatusNotifierItemRegistered") => {
                             if let Ok(item) = signal.body().deserialize::<String>() {
                                 if let Some(endpoint) = parse_notifier_item_id(&item) {
-                                    push_event(
-                                        &events,
-                                        &wake,
-                                        Event::StatusNotifierRegistered(endpoint.clone()),
-                                    );
-                                    if let Some(endpoint) = parse_notifier_item_id(&item) {
-                                        load_status_notifier_item(
-                                            &connection,
-                                            endpoint.clone(),
+                                    let Some((endpoint, item_id, item_cancel)) =
+                                        apply_ordered_watcher_event(
+                                            &control,
                                             &events,
                                             &wake,
+                                            OrderedWatcherEvent::Registered(endpoint),
                                         )
-                                        .await;
-                                        watch_status_notifier_item(
-                                            &connection,
-                                            endpoint,
-                                            &events,
-                                            &wake,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Either::Request(Some(signal)) => {
-                            if let Ok(item) = signal.body().deserialize::<String>() {
-                                if let Some(endpoint) = parse_notifier_item_id(&item) {
-                                    push_event(
+                                    else {
+                                        continue;
+                                    };
+                                    spawn_item_bootstrap(
+                                        &connection,
+                                        endpoint,
                                         &events,
                                         &wake,
-                                        Event::StatusNotifierUnregistered(endpoint),
+                                        Arc::clone(&control),
+                                        item_id,
+                                        item_cancel,
                                     );
                                 }
                             }
                         }
-                        Either::Owner(None) | Either::Request(None) => break,
-                        Either::Network => unreachable!("network tick is not used by this watcher"),
+                        Some("StatusNotifierItemUnregistered") => {
+                            if let Ok(item) = signal.body().deserialize::<String>() {
+                                if let Some(endpoint) = parse_notifier_item_id(&item) {
+                                    apply_ordered_watcher_event(
+                                        &control,
+                                        &events,
+                                        &wake,
+                                        OrderedWatcherEvent::Unregistered(endpoint),
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             },
             "xbar-status-notifier-signals",
         )
         .detach();
+    Ok(bootstrap_done)
 }
 
 fn parse_sni_status(status: &str) -> StatusNotifierStatus {
@@ -747,76 +994,121 @@ async fn load_status_notifier_item(
     endpoint: StatusNotifierEndpoint,
     events: &EventQueue,
     wake: &Arc<Mutex<UnixStream>>,
+    current: (Arc<StatusNotifierAttachmentControl>, u64, Receiver<()>),
 ) {
-    let Ok(proxy) = zbus::Proxy::new(
-        connection,
-        endpoint.service.as_str(),
-        endpoint.object_path.as_str(),
-        "org.kde.StatusNotifierItem",
+    let (control, item_id, cancel) = current;
+    if !control.is_current_item(&endpoint, item_id) {
+        return;
+    }
+    let proxy = match await_item_phase(
+        zbus::Proxy::new(
+            connection,
+            endpoint.service.as_str(),
+            endpoint.object_path.as_str(),
+            "org.kde.StatusNotifierItem",
+        ),
+        &cancel,
     )
     .await
-    else {
-        return;
+    {
+        Some(Ok(proxy)) => proxy,
+        _ => return,
     };
-    let status = proxy
-        .get_property::<String>("Status")
-        .await
-        .map(|value| parse_sni_status(&value))
-        .unwrap_or(StatusNotifierStatus::Passive);
-    let icon_name = proxy
-        .get_property::<String>("IconName")
-        .await
-        .ok()
-        .filter(|value| !value.is_empty());
-    let icon_pixmap = proxy
-        .get_property::<Vec<(i32, i32, Vec<u8>)>>("IconPixmap")
-        .await
-        .ok()
-        .and_then(select_pixmap);
-    let attention_icon_name = proxy
-        .get_property::<String>("AttentionIconName")
-        .await
-        .ok()
-        .filter(|value| !value.is_empty());
-    let attention_icon_pixmap = proxy
-        .get_property::<Vec<(i32, i32, Vec<u8>)>>("AttentionIconPixmap")
-        .await
-        .ok()
-        .and_then(select_pixmap);
-    let item_is_menu = proxy
-        .get_property::<bool>("ItemIsMenu")
-        .await
-        .unwrap_or(false);
-    let menu = proxy
-        .get_property::<OwnedObjectPath>("Menu")
-        .await
-        .ok()
-        .filter(|path| path.as_str() != "/")
-        .map(|path| crate::core::MenuEndpoint {
-            service: endpoint.service.clone(),
-            object_path: path.to_string(),
-        });
+    if !control.is_current_item(&endpoint, item_id) {
+        return;
+    }
+    let status = match await_item_phase(proxy.get_property::<String>("Status"), &cancel).await {
+        Some(result) => result
+            .map(|value| parse_sni_status(&value))
+            .unwrap_or(StatusNotifierStatus::Passive),
+        None => return,
+    };
+    if !control.is_current_item(&endpoint, item_id) {
+        return;
+    }
+    let icon_name = match await_item_phase(proxy.get_property::<String>("IconName"), &cancel).await
+    {
+        Some(result) => result.ok().filter(|value| !value.is_empty()),
+        None => return,
+    };
+    if !control.is_current_item(&endpoint, item_id) {
+        return;
+    }
+    let icon_pixmap = match await_item_phase(
+        proxy.get_property::<Vec<(i32, i32, Vec<u8>)>>("IconPixmap"),
+        &cancel,
+    )
+    .await
+    {
+        Some(result) => result.ok().and_then(select_pixmap),
+        None => return,
+    };
+    if !control.is_current_item(&endpoint, item_id) {
+        return;
+    }
+    let attention_icon_name =
+        match await_item_phase(proxy.get_property::<String>("AttentionIconName"), &cancel).await {
+            Some(result) => result.ok().filter(|value| !value.is_empty()),
+            None => return,
+        };
+    if !control.is_current_item(&endpoint, item_id) {
+        return;
+    }
+    let attention_icon_pixmap = match await_item_phase(
+        proxy.get_property::<Vec<(i32, i32, Vec<u8>)>>("AttentionIconPixmap"),
+        &cancel,
+    )
+    .await
+    {
+        Some(result) => result.ok().and_then(select_pixmap),
+        None => return,
+    };
+    if !control.is_current_item(&endpoint, item_id) {
+        return;
+    }
+    let item_is_menu =
+        match await_item_phase(proxy.get_property::<bool>("ItemIsMenu"), &cancel).await {
+            Some(result) => result.unwrap_or(false),
+            None => return,
+        };
+    if !control.is_current_item(&endpoint, item_id) {
+        return;
+    }
+    let menu =
+        match await_item_phase(proxy.get_property::<OwnedObjectPath>("Menu"), &cancel).await {
+            Some(result) => result.ok().filter(|path| path.as_str() != "/").map(|path| {
+                crate::core::MenuEndpoint {
+                    service: endpoint.service.clone(),
+                    object_path: path.to_string(),
+                }
+            }),
+            None => return,
+        };
+    if !control.is_current_item(&endpoint, item_id) {
+        return;
+    }
     let icon = choose_sni_icon(&status, icon_pixmap, attention_icon_pixmap);
-    push_event(
-        events,
-        wake,
-        Event::StatusNotifierItemUpdated(StatusNotifierItem {
-            endpoint,
-            status,
-            icon,
-            icon_name,
-            attention_icon_name,
-            item_is_menu,
-            menu,
-        }),
-    );
+    let event_endpoint = endpoint.clone();
+    let event = Event::StatusNotifierItemUpdated(StatusNotifierItem {
+        endpoint,
+        status,
+        icon,
+        icon_name,
+        attention_icon_name,
+        item_is_menu,
+        menu,
+    });
+    control.publish_item(&event_endpoint, item_id, events, wake, event);
 }
 
-fn watch_status_notifier_item(
+fn watch_status_notifier_item_with_cancel(
     connection: &zbus::Connection,
     endpoint: StatusNotifierEndpoint,
     events: &EventQueue,
     wake: &Arc<Mutex<UnixStream>>,
+    control: Arc<StatusNotifierAttachmentControl>,
+    item_id: u64,
+    item_cancel: Receiver<()>,
 ) {
     let connection = connection.clone();
     let events = Arc::clone(events);
@@ -826,59 +1118,153 @@ fn watch_status_notifier_item(
         .executor()
         .spawn(
             async move {
+                let _item_guard = ItemRegistrationGuard {
+                    control: Arc::clone(&control),
+                    endpoint: endpoint.clone(),
+                    id: item_id,
+                };
                 let Ok(destination): Result<zbus::names::OwnedBusName, _> =
                     endpoint.service.clone().try_into()
                 else {
                     return;
                 };
+                if !control.is_current_item(&endpoint, item_id) {
+                    return;
+                }
                 let Ok(path): Result<OwnedObjectPath, _> = endpoint.object_path.clone().try_into()
                 else {
                     return;
                 };
-                let Ok(proxy) = zbus::Proxy::new_owned(
-                    connection.clone(),
-                    destination,
-                    path,
-                    "org.kde.StatusNotifierItem",
+                let proxy = match await_item_phase(
+                    zbus::Proxy::new_owned(
+                        connection.clone(),
+                        destination,
+                        path,
+                        "org.kde.StatusNotifierItem",
+                    ),
+                    &item_cancel,
                 )
                 .await
-                else {
-                    return;
+                {
+                    Some(Ok(proxy)) => proxy,
+                    _ => return,
                 };
-                let Ok(mut new_icon) = proxy.receive_signal("NewIcon").await else {
+                if !control.is_current_item(&endpoint, item_id) {
                     return;
-                };
-                let Ok(mut new_attention_icon) = proxy.receive_signal("NewAttentionIcon").await
-                else {
+                }
+                let mut new_icon =
+                    match await_item_phase(proxy.receive_signal("NewIcon"), &item_cancel).await {
+                        Some(Ok(stream)) => stream,
+                        _ => return,
+                    };
+                if !control.is_current_item(&endpoint, item_id) {
                     return;
-                };
-                let Ok(mut new_status) = proxy.receive_signal("NewStatus").await else {
+                }
+                let mut new_attention_icon =
+                    match await_item_phase(proxy.receive_signal("NewAttentionIcon"), &item_cancel)
+                        .await
+                    {
+                        Some(Ok(stream)) => stream,
+                        _ => return,
+                    };
+                if !control.is_current_item(&endpoint, item_id) {
                     return;
-                };
-                let Ok(mut new_item_is_menu) = proxy.receive_signal("NewItemIsMenu").await else {
+                }
+                let mut new_status =
+                    match await_item_phase(proxy.receive_signal("NewStatus"), &item_cancel).await {
+                        Some(Ok(stream)) => stream,
+                        _ => return,
+                    };
+                if !control.is_current_item(&endpoint, item_id) {
                     return;
-                };
-                let Ok(mut new_menu) = proxy.receive_signal("NewMenu").await else {
+                }
+                let mut new_item_is_menu =
+                    match await_item_phase(proxy.receive_signal("NewItemIsMenu"), &item_cancel)
+                        .await
+                    {
+                        Some(Ok(stream)) => stream,
+                        _ => return,
+                    };
+                if !control.is_current_item(&endpoint, item_id) {
                     return;
-                };
+                }
+                let mut new_menu =
+                    match await_item_phase(proxy.receive_signal("NewMenu"), &item_cancel).await {
+                        Some(Ok(stream)) => stream,
+                        _ => return,
+                    };
+                if !control.is_current_item(&endpoint, item_id) {
+                    return;
+                }
                 loop {
-                    let icon = async { new_icon.next().await.map(|_| ()) };
-                    let attention = async { new_attention_icon.next().await.map(|_| ()) };
-                    let status = async { new_status.next().await.map(|_| ()) };
-                    let item_is_menu = async { new_item_is_menu.next().await.map(|_| ()) };
-                    let menu = async { new_menu.next().await.map(|_| ()) };
-                    let changed = futures_lite::future::race(
+                    let changes = async {
+                        let icon = async {
+                            new_icon
+                                .next()
+                                .await
+                                .map_or(ItemWake::PropertyStreamEnded, |_| {
+                                    ItemWake::PropertyChanged
+                                })
+                        };
+                        let attention = async {
+                            new_attention_icon
+                                .next()
+                                .await
+                                .map_or(ItemWake::PropertyStreamEnded, |_| {
+                                    ItemWake::PropertyChanged
+                                })
+                        };
+                        let status = async {
+                            new_status
+                                .next()
+                                .await
+                                .map_or(ItemWake::PropertyStreamEnded, |_| {
+                                    ItemWake::PropertyChanged
+                                })
+                        };
+                        let item_is_menu = async {
+                            new_item_is_menu
+                                .next()
+                                .await
+                                .map_or(ItemWake::PropertyStreamEnded, |_| {
+                                    ItemWake::PropertyChanged
+                                })
+                        };
+                        let menu = async {
+                            new_menu
+                                .next()
+                                .await
+                                .map_or(ItemWake::PropertyStreamEnded, |_| {
+                                    ItemWake::PropertyChanged
+                                })
+                        };
                         futures_lite::future::race(
-                            futures_lite::future::race(icon, attention),
-                            status,
-                        ),
-                        futures_lite::future::race(item_is_menu, menu),
-                    )
+                            futures_lite::future::race(
+                                futures_lite::future::race(icon, attention),
+                                status,
+                            ),
+                            futures_lite::future::race(item_is_menu, menu),
+                        )
+                        .await
+                    };
+                    let wake_reason = futures_lite::future::race(changes, async {
+                        let _ = item_cancel.recv().await;
+                        ItemWake::ItemCancelled
+                    })
                     .await;
-                    if changed.is_none() {
+                    if item_wake_is_terminal(wake_reason)
+                        || !control.is_current_item(&endpoint, item_id)
+                    {
                         break;
                     }
-                    load_status_notifier_item(&connection, endpoint.clone(), &events, &wake).await;
+                    load_status_notifier_item(
+                        &connection,
+                        endpoint.clone(),
+                        &events,
+                        &wake,
+                        (Arc::clone(&control), item_id, item_cancel.clone()),
+                    )
+                    .await;
                 }
             },
             "xbar-status-notifier-item",
@@ -1181,13 +1567,6 @@ async fn run(
 ) -> zbus::Result<()> {
     let wake = Arc::new(Mutex::new(writer));
     let notification_store = Arc::new(Mutex::new(notifications::Store::default()));
-    let probe = zbus::Connection::session().await?;
-    let probe_dbus = zbus::fdo::DBusProxy::new(&probe).await?;
-    let watcher_name: zbus::names::BusName<'_> = SNI_NAME.try_into()?;
-    let watcher_exists = probe_dbus.name_has_owner(watcher_name).await?;
-    drop(probe);
-    let watcher_state = Arc::new(StatusNotifierWatcherState::default());
-    let watcher_connection = Arc::new(Mutex::new(None));
     let mut builder = zbus::connection::Builder::session()?.serve_at(
         REGISTRAR_PATH,
         Registrar {
@@ -1205,20 +1584,6 @@ async fn run(
             wake: Arc::clone(&wake),
         },
     )?;
-    if !watcher_exists {
-        builder = builder.serve_at(
-            SNI_PATH,
-            StatusNotifierWatcher {
-                events: Arc::clone(&events),
-                wake: Arc::clone(&wake),
-                state: Arc::clone(&watcher_state),
-                connection: Arc::clone(&watcher_connection),
-            },
-        )?;
-    }
-    if !watcher_exists {
-        builder = builder.name(SNI_NAME)?;
-    }
     let connection = builder
         .name(REGISTRAR_NAME)?
         .name(NOTIFICATIONS_NAME)?
@@ -1226,9 +1591,17 @@ async fn run(
         .replace_existing_names(false)
         .build()
         .await?;
-    *watcher_connection.lock().expect("SNI connection poisoned") = Some(connection.clone());
     let dbus = zbus::fdo::DBusProxy::new(&connection).await?;
     let mut owner_changes = dbus.receive_name_owner_changed().await?;
+    let mut sni_owner = dbus
+        .get_name_owner(SNI_NAME.try_into()?)
+        .await
+        .ok()
+        .map(|owner| owner.to_string());
+    let mut sni_attachment = None;
+    if sni_owner.is_none() {
+        ensure_status_notifier_watcher();
+    }
     let mut ai_usage = ai_usage::AiUsageSubscription::default();
     let mut ai_activation = ai_usage::ActivationGate::default();
     ai_usage::subscribe_signal_watcher(&connection, &request_sender).await?;
@@ -1265,7 +1638,24 @@ async fn run(
             }
         }
     }
-    setup_status_notifier(&connection, &events, &wake, watcher_exists).await?;
+    if let Some(owner) = sni_owner.clone() {
+        match setup_status_notifier_reconciled(&connection, &events, &wake, &dbus, &owner).await {
+            Ok(mut attachment) => {
+                attachment.owner = owner;
+                sni_attachment = Some(attachment);
+            }
+            Err(_) => {
+                // Keep the live owner as an explicit setup-failed state.  A
+                // later NameOwnerChanged disappearance/replacement is the
+                // only event that advances this state; the owner is never
+                // discarded merely because setup failed.
+                retain_sni_owner_on_setup_failure(&mut sni_owner, &owner);
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!("xbar trace: SNI setup failed for live owner {owner}");
+                }
+            }
+        }
+    }
     if std::env::var_os("XBAR_TRACE").is_some() {
         eprintln!("xbar trace: NetworkManager system connection starting");
     }
@@ -1302,25 +1692,62 @@ async fn run(
         None
     };
     let mut watched_endpoints = HashSet::new();
+    let mut menu_signal_watchers = HashMap::<String, MenuWatcherControl>::new();
+    let mut next_menu_watcher_generation = 1_u64;
     let mut gmenu_subscriptions = HashMap::new();
     let bluetooth_in_flight = Arc::new(Mutex::new(HashSet::<BluetoothPendingAction>::new()));
     loop {
         let owner = async { Either::Owner(owner_changes.next().await) };
         let request = async { Either::Request(requests.recv().await) };
-        let dbus = futures_lite::future::race(owner, request);
+        let owner_or_request = futures_lite::future::race(owner, request);
         let next = if let Some((_, executor)) = &system_connection {
-            futures_lite::future::race(dbus, async {
+            futures_lite::future::race(owner_or_request, async {
                 executor.tick().await;
                 Either::Network
             })
             .await
         } else {
-            dbus.await
+            owner_or_request.await
         };
         match next {
             Either::Network => continue,
             Either::Owner(Some(signal)) => {
                 let args = signal.args()?;
+                if args.name().as_str() == SNI_NAME {
+                    if let Some(new_owner) = args.new_owner().as_ref() {
+                        let new_owner = new_owner.to_string();
+                        if sni_owner.as_deref() != Some(new_owner.as_str()) {
+                            sni_attachment.take();
+                            if sni_owner.take().is_some() {
+                                push_event(&events, &wake, Event::StatusNotifierWatcherUnavailable);
+                            }
+                            if let Ok(mut attachment) = setup_status_notifier_reconciled(
+                                &connection,
+                                &events,
+                                &wake,
+                                &dbus,
+                                &new_owner,
+                            )
+                            .await
+                            {
+                                attachment.owner = new_owner.clone();
+                                sni_attachment = Some(attachment);
+                            }
+                            // Whether setup succeeds or fails, this owner is
+                            // now the active event-driven lifecycle state.
+                            sni_owner = Some(new_owner);
+                        }
+                    } else {
+                        let old_owner = args.old_owner().as_ref().map(ToString::to_string);
+                        if sni_owner.as_deref() != old_owner.as_deref() {
+                            continue;
+                        }
+                        sni_attachment.take();
+                        sni_owner = None;
+                        push_event(&events, &wake, Event::StatusNotifierWatcherUnavailable);
+                    }
+                    continue;
+                }
                 if args.name().as_str() == ai_usage::BUS_NAME {
                     let new_owner = args.new_owner().as_ref().map(ToString::to_string);
                     let old_owner = args.old_owner().as_ref().map(ToString::to_string);
@@ -1337,6 +1764,10 @@ async fn run(
                     continue;
                 }
                 if args.name().as_str().starts_with(':') && args.new_owner().is_none() {
+                    cancel_watchers_for_unique_owner(
+                        &mut menu_signal_watchers,
+                        args.name().as_str(),
+                    );
                     push_event(
                         &events,
                         &wake,
@@ -1349,19 +1780,81 @@ async fn run(
                         &wake,
                         Event::StatusNotifierOwnerVanished(args.name().to_string()),
                     );
-                    watcher_state_remove_service(
-                        &watcher_state,
-                        &events,
-                        &wake,
-                        &connection,
-                        args.name().as_str(),
-                    )
-                    .await;
                 }
             }
             Either::Owner(None) | Either::Request(Err(_)) => break,
             Either::Request(Ok(Request::Layout(request))) => {
-                let event = match load_layout(&connection, &request).await {
+                let key = dbus_menu_endpoint_key(&request.endpoint);
+                if let Entry::Vacant(watcher_entry) = menu_signal_watchers.entry(key.clone()) {
+                    match install_signal_watcher(
+                        &connection,
+                        &events,
+                        &wake,
+                        request.endpoint.clone(),
+                    )
+                    .await
+                    {
+                        Ok(installed) => {
+                            let watcher_generation =
+                                allocate_menu_watcher_generation(&mut next_menu_watcher_generation);
+                            let mut control =
+                                MenuWatcherControl::new(watcher_generation, installed.cancel);
+                            let load_cancel = control.start_load(request.request_id);
+                            // The control is published before the load future
+                            // is spawned.  Every lifecycle path can cancel it.
+                            watcher_entry.insert(control);
+                            push_event(
+                                &events,
+                                &wake,
+                                Event::MenuWatcherReady {
+                                    endpoint: MenuSource::DbusMenu(request.endpoint.clone()),
+                                    watcher_generation,
+                                    request_id: request.request_id,
+                                },
+                            );
+                            let _ = installed.start.try_send(watcher_generation);
+                            spawn_layout_load(&connection, &request_sender, request, load_cancel);
+                        }
+                        Err(error) => {
+                            if std::env::var_os("XBAR_TRACE").is_some() {
+                                eprintln!(
+                                    "xbar trace: DBusMenu signal subscription failed service={} path={}: {error}",
+                                    request.endpoint.service, request.endpoint.object_path
+                                );
+                            }
+                            let event = Event::MenuLoadFailed {
+                                window_id: request.window_id,
+                                endpoint: MenuSource::DbusMenu(request.endpoint),
+                                request_id: request.request_id,
+                                error,
+                            };
+                            push_event(&events, &wake, event);
+                        }
+                    }
+                } else if let Some(control) = menu_signal_watchers.get_mut(&key) {
+                    let watcher_generation = control.watcher_generation;
+                    let load_cancel = control.start_load(request.request_id);
+                    push_event(
+                        &events,
+                        &wake,
+                        Event::MenuWatcherReady {
+                            endpoint: MenuSource::DbusMenu(request.endpoint.clone()),
+                            watcher_generation,
+                            request_id: request.request_id,
+                        },
+                    );
+                    spawn_layout_load(&connection, &request_sender, request, load_cancel);
+                }
+            }
+            Either::Request(Ok(Request::LayoutFinished { request, result })) => {
+                if !finish_layout_load(
+                    &mut menu_signal_watchers,
+                    &request.endpoint,
+                    request.request_id,
+                ) {
+                    continue;
+                }
+                let event = match result {
                     Ok(model) if request.window_id.0 == u32::MAX => Event::TrayMenuLoaded {
                         endpoint: request.endpoint.clone(),
                         request_id: request.request_id,
@@ -1386,12 +1879,12 @@ async fn run(
                     },
                 };
                 push_event(&events, &wake, event);
-                let key = format!(
-                    "{}{}",
-                    request.endpoint.service, request.endpoint.object_path
-                );
-                if watched_endpoints.insert(key) {
-                    install_signal_watcher(&connection, &events, &wake, request.endpoint);
+            }
+            Either::Request(Ok(Request::EndMenuWatcher(endpoint))) => {
+                if let Some(cancel) =
+                    menu_signal_watchers.remove(&dbus_menu_endpoint_key(&endpoint))
+                {
+                    cancel.cancel();
                 }
             }
             Either::Request(Ok(Request::GtkLayout {
@@ -1944,36 +2437,76 @@ async fn load_gmenu(
     ))
 }
 
-fn install_signal_watcher(
+fn spawn_layout_load(
     connection: &zbus::Connection,
-    events: &EventQueue,
-    wake: &Arc<Mutex<UnixStream>>,
-    endpoint: crate::core::MenuEndpoint,
+    request_sender: &Sender<Request>,
+    request: LayoutRequest,
+    cancel: Receiver<()>,
 ) {
     let connection = connection.clone();
-    let events = Arc::clone(events);
-    let wake = Arc::clone(wake);
+    let request_sender = request_sender.clone();
     connection
         .clone()
         .executor()
         .spawn(
             async move {
-                let proxy = match zbus::Proxy::new_owned(
-                    connection,
-                    endpoint.service.clone(),
-                    endpoint.object_path.clone(),
-                    DBUSMENU_INTERFACE,
-                )
-                .await
+                if let Some(result) =
+                    cancellable_layout_load(load_layout(&connection, &request), cancel).await
                 {
-                    Ok(proxy) => proxy,
-                    Err(_) => return,
+                    let _ = request_sender.try_send(Request::LayoutFinished { request, result });
+                }
+            },
+            "xbar-dbusmenu-layout",
+        )
+        .detach();
+}
+
+async fn install_signal_watcher(
+    connection: &zbus::Connection,
+    events: &EventQueue,
+    wake: &Arc<Mutex<UnixStream>>,
+    endpoint: crate::core::MenuEndpoint,
+) -> Result<InstalledMenuSignalWatcher, String> {
+    let connection = connection.clone();
+    let events = Arc::clone(events);
+    let wake = Arc::clone(wake);
+    let proxy = zbus::Proxy::new_owned(
+        connection.clone(),
+        endpoint.service.clone(),
+        endpoint.object_path.clone(),
+        DBUSMENU_INTERFACE,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let mut signals = proxy
+        .receive_all_signals()
+        .await
+        .map_err(|error| error.to_string())?;
+    let (cancel_sender, cancel_receiver) = async_channel::bounded(1);
+    let (start_sender, start_receiver) = async_channel::bounded(1);
+    connection
+        .clone()
+        .executor()
+        .spawn(
+            async move {
+                let watcher_generation =
+                    futures_lite::future::race(async { start_receiver.recv().await.ok() }, async {
+                        let _ = cancel_receiver.recv().await;
+                        None
+                    })
+                    .await;
+                let Some(watcher_generation) = watcher_generation else {
+                    return;
                 };
-                let mut signals = match proxy.receive_all_signals().await {
-                    Ok(signals) => signals,
-                    Err(_) => return,
-                };
-                while let Some(signal) = signals.next().await {
+                loop {
+                    let next = futures_lite::future::race(async { signals.next().await }, async {
+                        let _ = cancel_receiver.recv().await;
+                        None
+                    })
+                    .await;
+                    let Some(signal) = next else {
+                        break;
+                    };
                     match signal.header().member().map(|member| member.as_str()) {
                         Some("LayoutUpdated") => {
                             let (revision, _parent): (u32, i32) = match signal.body().deserialize()
@@ -1986,6 +2519,7 @@ fn install_signal_watcher(
                                 &wake,
                                 Event::MenuLayoutInvalidated {
                                     endpoint: MenuSource::DbusMenu(endpoint.clone()),
+                                    watcher_generation: Some(watcher_generation),
                                     revision: Some(revision),
                                 },
                             );
@@ -2002,6 +2536,7 @@ fn install_signal_watcher(
                                     &wake,
                                     Event::MenuPropertiesUpdated {
                                         endpoint: MenuSource::DbusMenu(endpoint.clone()),
+                                        watcher_generation: Some(watcher_generation),
                                         updates,
                                     },
                                 );
@@ -2014,6 +2549,10 @@ fn install_signal_watcher(
             "xbar-dbusmenu-signals",
         )
         .detach();
+    Ok(InstalledMenuSignalWatcher {
+        cancel: cancel_sender,
+        start: start_sender,
+    })
 }
 
 fn install_gmenu_signal_watcher(
@@ -2051,6 +2590,7 @@ fn install_gmenu_signal_watcher(
                         &wake,
                         Event::MenuLayoutInvalidated {
                             endpoint: MenuSource::GtkGMenu(endpoint.clone()),
+                            watcher_generation: None,
                             revision: None,
                         },
                     );
@@ -2117,9 +2657,9 @@ mod ai_usage_bridge_tests {
 #[cfg(test)]
 mod status_notifier_tests {
     use super::{choose_sni_icon, select_pixmap};
+    use crate::core::status_notifier::format_notifier_item_id;
     use crate::core::{
-        format_notifier_item_id, parse_notifier_item_id, StatusNotifierEndpoint,
-        StatusNotifierIcon, StatusNotifierStatus,
+        parse_notifier_item_id, StatusNotifierEndpoint, StatusNotifierIcon, StatusNotifierStatus,
     };
 
     #[test]
@@ -2185,6 +2725,464 @@ mod status_notifier_tests {
             ),
             Some(normal)
         );
+    }
+}
+
+#[cfg(test)]
+mod dbus_menu_lifecycle_tests {
+    use super::{
+        allocate_menu_watcher_generation, cancel_watchers_for_unique_owner,
+        cancellable_layout_load, dbus_menu_endpoint_key, finish_layout_load, MenuWatcherControl,
+    };
+    use async_channel::bounded;
+    use std::collections::HashMap;
+
+    fn endpoint(service: &str, path: &str) -> crate::core::MenuEndpoint {
+        crate::core::MenuEndpoint {
+            service: service.into(),
+            object_path: path.into(),
+        }
+    }
+
+    #[test]
+    fn unregister_cancels_pending_layout_and_late_completion_cannot_reinsert_watcher() {
+        let endpoint = endpoint(":1.7", "/menu");
+        let (signal_cancel, signal_receiver) = bounded(1);
+        let mut watchers = HashMap::new();
+        let mut control = MenuWatcherControl::new(10, signal_cancel);
+        let load_cancel = control.start_load(7);
+        watchers.insert(
+            format!("{}\0{}", endpoint.service, endpoint.object_path),
+            control,
+        );
+
+        let (ready_sender, ready_receiver) = bounded(1);
+        let pending_load = async move {
+            ready_sender.send(()).await.expect("ready receiver");
+            std::future::pending::<Result<(), String>>().await
+        };
+        let cancellation = async {
+            ready_receiver.recv().await.expect("pending load ready");
+            let control = watchers
+                .remove(&format!("{}\0{}", endpoint.service, endpoint.object_path))
+                .expect("watcher registered");
+            control.cancel();
+        };
+        let (result, ()) = zbus::block_on(futures_lite::future::zip(
+            cancellable_layout_load(pending_load, load_cancel),
+            cancellation,
+        ));
+        assert!(result.is_none());
+        assert!(watchers.is_empty());
+        assert!(signal_receiver.try_recv().is_ok());
+
+        assert!(!finish_layout_load(&mut watchers, &endpoint, 7));
+        assert!(watchers.is_empty());
+    }
+
+    #[test]
+    fn owner_disappearance_cancels_pending_layout_and_late_completion_cannot_reinsert_watcher() {
+        let endpoint = endpoint(":1.8", "/menu");
+        let (signal_cancel, signal_receiver) = bounded(1);
+        let mut watchers = HashMap::new();
+        let mut control = MenuWatcherControl::new(11, signal_cancel);
+        let load_cancel = control.start_load(8);
+        watchers.insert(
+            format!("{}\0{}", endpoint.service, endpoint.object_path),
+            control,
+        );
+
+        let (ready_sender, ready_receiver) = bounded(1);
+        let pending_load = async move {
+            ready_sender.send(()).await.expect("ready receiver");
+            std::future::pending::<Result<(), String>>().await
+        };
+        let disappearance = async {
+            ready_receiver.recv().await.expect("pending load ready");
+            cancel_watchers_for_unique_owner(&mut watchers, ":1.8");
+        };
+        let (result, ()) = zbus::block_on(futures_lite::future::zip(
+            cancellable_layout_load(pending_load, load_cancel),
+            disappearance,
+        ));
+        assert!(result.is_none());
+        assert!(watchers.is_empty());
+        assert!(signal_receiver.try_recv().is_ok());
+        assert!(!finish_layout_load(&mut watchers, &endpoint, 8));
+    }
+
+    #[test]
+    fn watcher_generation_is_reused_until_control_is_recreated() {
+        let endpoint = endpoint(":1.9", "/menu");
+        let key = dbus_menu_endpoint_key(&endpoint);
+        let mut next_generation = 10;
+        let mut watchers = HashMap::new();
+        let (first_cancel, _) = bounded(1);
+        let first_generation = allocate_menu_watcher_generation(&mut next_generation);
+        watchers.insert(
+            key.clone(),
+            MenuWatcherControl::new(first_generation, first_cancel),
+        );
+
+        assert_eq!(watchers[&key].watcher_generation, 10);
+        watchers.get_mut(&key).expect("live watcher").start_load(25);
+        watchers
+            .get_mut(&key)
+            .expect("reused watcher")
+            .start_load(26);
+        assert_eq!(watchers[&key].watcher_generation, first_generation);
+        assert_eq!(next_generation, 11);
+
+        watchers.remove(&key).expect("first watcher").cancel();
+        let (second_cancel, _) = bounded(1);
+        let second_generation = allocate_menu_watcher_generation(&mut next_generation);
+        watchers.insert(
+            key.clone(),
+            MenuWatcherControl::new(second_generation, second_cancel),
+        );
+
+        assert_eq!(watchers[&key].watcher_generation, 11);
+        assert_ne!(first_generation, second_generation);
+    }
+
+    #[test]
+    fn same_owner_paths_have_independent_controls_generations_and_cancellation() {
+        let endpoint_a = endpoint(":1.9", "/a");
+        let endpoint_b = endpoint(":1.9", "/b");
+        let key_a = dbus_menu_endpoint_key(&endpoint_a);
+        let key_b = dbus_menu_endpoint_key(&endpoint_b);
+        let (cancel_a, receiver_a) = bounded(1);
+        let (cancel_b, receiver_b) = bounded(1);
+        let mut watchers = HashMap::new();
+        watchers.insert(key_a.clone(), MenuWatcherControl::new(10, cancel_a));
+        watchers.insert(key_b.clone(), MenuWatcherControl::new(11, cancel_b));
+
+        let control_a = watchers.remove(&key_a).expect("watcher A");
+        control_a.cancel();
+
+        assert!(receiver_a.try_recv().is_ok());
+        assert!(receiver_b.try_recv().is_err());
+        assert_eq!(watchers[&key_b].watcher_generation, 11);
+    }
+
+    #[test]
+    fn owner_disappearance_removes_all_of_its_paths_but_not_another_owner() {
+        let endpoint_a = endpoint(":1.9", "/a");
+        let endpoint_b = endpoint(":1.9", "/b");
+        let endpoint_c = endpoint(":1.10", "/a");
+        let (cancel_a, receiver_a) = bounded(1);
+        let (cancel_b, receiver_b) = bounded(1);
+        let (cancel_c, receiver_c) = bounded(1);
+        let mut watchers = HashMap::new();
+        watchers.insert(
+            dbus_menu_endpoint_key(&endpoint_a),
+            MenuWatcherControl::new(10, cancel_a),
+        );
+        watchers.insert(
+            dbus_menu_endpoint_key(&endpoint_b),
+            MenuWatcherControl::new(11, cancel_b),
+        );
+        watchers.insert(
+            dbus_menu_endpoint_key(&endpoint_c),
+            MenuWatcherControl::new(12, cancel_c),
+        );
+
+        cancel_watchers_for_unique_owner(&mut watchers, ":1.9");
+
+        assert!(receiver_a.try_recv().is_ok());
+        assert!(receiver_b.try_recv().is_ok());
+        assert!(receiver_c.try_recv().is_err());
+        assert_eq!(watchers.len(), 1);
+        assert_eq!(
+            watchers[&dbus_menu_endpoint_key(&endpoint_c)].watcher_generation,
+            12
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_notifier_attachment_tests {
+    use super::*;
+
+    fn control() -> Arc<StatusNotifierAttachmentControl> {
+        let (cancel_sender, cancel_receiver) = async_channel::bounded(1);
+        Arc::new(StatusNotifierAttachmentControl {
+            cancel_sender,
+            cancel_receiver,
+            active: AtomicBool::new(true),
+            next_item_id: Mutex::new(0),
+            items: Mutex::new(HashMap::new()),
+            publication: Mutex::new(()),
+        })
+    }
+
+    fn endpoint() -> StatusNotifierEndpoint {
+        StatusNotifierEndpoint {
+            service: ":1.9".into(),
+            object_path: "/StatusNotifierItem".into(),
+        }
+    }
+
+    fn apply_ordered(control: &StatusNotifierAttachmentControl, event: OrderedWatcherEvent) {
+        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let (reader, writer) = UnixStream::pair().expect("wake pair");
+        let wake = Arc::new(Mutex::new(writer));
+        let _ = apply_ordered_watcher_event(control, &events, &wake, event);
+        drop(reader);
+    }
+
+    #[test]
+    fn unregister_stops_item_and_allows_fresh_registration() {
+        let control = control();
+        let item = endpoint();
+        assert!(control.start_item(&item).is_some());
+        control.stop_item(&item);
+        assert!(control.start_item(&item).is_some());
+    }
+
+    #[test]
+    fn attachment_drop_cancels_all_item_watchers() {
+        let control = control();
+        let item = endpoint();
+        let (_, item_cancel) = control.start_item(&item).expect("item watcher");
+        let attachment = StatusNotifierAttachment {
+            owner: ":1.100".into(),
+            control: Arc::clone(&control),
+        };
+        drop(attachment);
+        assert!(control.cancel_receiver.try_recv().is_ok());
+        assert!(item_cancel.try_recv().is_ok());
+        assert!(control.items.lock().expect("items").is_empty());
+    }
+
+    #[test]
+    fn direct_replacement_tears_down_a_before_b() {
+        let a = control();
+        let a_cancel = a.cancel_receiver.clone();
+        let old = StatusNotifierAttachment {
+            owner: "A".into(),
+            control: Arc::clone(&a),
+        };
+        drop(old);
+        assert!(a_cancel.try_recv().is_ok());
+
+        let b = control();
+        assert!(b.start_item(&endpoint()).is_some());
+        assert_eq!(b.items.lock().expect("items").len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_and_signal_share_one_item_watcher() {
+        let control = control();
+        let item = endpoint();
+        assert!(control.start_item(&item).is_some());
+        assert!(control.start_item(&item).is_none());
+        assert_eq!(control.items.lock().expect("items").len(), 1);
+    }
+
+    #[test]
+    fn attachment_cancel_reaches_signal_and_every_item_watcher() {
+        let control = control();
+        let (_, first) = control.start_item(&endpoint()).expect("first watcher");
+        let second_endpoint = StatusNotifierEndpoint {
+            service: ":1.10".into(),
+            object_path: "/StatusNotifierItem".into(),
+        };
+        let (_, second) = control
+            .start_item(&second_endpoint)
+            .expect("second watcher");
+        let signal = control.cancel_receiver.clone();
+        let attachment = StatusNotifierAttachment {
+            owner: "A".into(),
+            control: Arc::clone(&control),
+        };
+        drop(attachment);
+        assert!(!control.is_active());
+        assert!(signal.try_recv().is_ok());
+        assert!(first.try_recv().is_ok());
+        assert!(second.try_recv().is_ok());
+    }
+
+    #[test]
+    fn old_item_generation_cannot_claim_re_registration() {
+        let control = control();
+        let item = endpoint();
+        let (old_id, _) = control.start_item(&item).expect("old watcher");
+        control.stop_item(&item);
+        let (new_id, _) = control.start_item(&item).expect("new watcher");
+        assert_ne!(old_id, new_id);
+        assert!(!control.is_current_item(&item, old_id));
+        assert!(control.is_current_item(&item, new_id));
+    }
+
+    #[test]
+    fn stop_item_orders_before_stale_publication() {
+        let control = control();
+        let item = endpoint();
+        let (old_id, _) = control.start_item(&item).expect("old watcher");
+        control.stop_item(&item);
+        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let (reader, writer) = UnixStream::pair().expect("wake pair");
+        drop(reader);
+        let wake = Arc::new(Mutex::new(writer));
+        assert!(!control.publish_item(
+            &item,
+            old_id,
+            &events,
+            &wake,
+            Event::StatusNotifierItemUpdated(StatusNotifierItem {
+                endpoint: item.clone(),
+                status: StatusNotifierStatus::Passive,
+                icon: None,
+                icon_name: None,
+                attention_icon_name: None,
+                item_is_menu: false,
+                menu: None,
+            }),
+        ));
+        assert!(events.lock().expect("events").is_empty());
+    }
+
+    #[test]
+    fn start_item_cannot_reopen_cancelled_attachment() {
+        let control = control();
+        control.cancel();
+        assert!(control.start_item(&endpoint()).is_none());
+    }
+
+    #[test]
+    fn unregister_then_reregister_has_one_live_generation() {
+        let control = control();
+        let item = endpoint();
+        let (old_id, _) = control.start_item(&item).expect("old watcher");
+        control.stop_item(&item);
+        let (new_id, _) = control.start_item(&item).expect("new watcher");
+        assert!(!control.is_current_item(&item, old_id));
+        assert!(control.is_current_item(&item, new_id));
+        assert_eq!(control.items.lock().expect("items").len(), 1);
+    }
+
+    #[test]
+    fn closed_item_cancel_is_terminal() {
+        let control = control();
+        let item = endpoint();
+        let (_, receiver) = control.start_item(&item).expect("watcher");
+        control.stop_item(&item);
+        assert!(receiver.try_recv().is_ok());
+        drop(receiver);
+        assert!(item_wake_is_terminal(ItemWake::ItemCancelled));
+        assert!(item_wake_is_terminal(ItemWake::PropertyStreamEnded));
+        assert!(!item_wake_is_terminal(ItemWake::PropertyChanged));
+    }
+
+    #[test]
+    fn cancelled_attachment_cannot_publish_after_teardown() {
+        let control = control();
+        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let (reader, writer) = UnixStream::pair().expect("wake pair");
+        drop(reader);
+        let wake = Arc::new(Mutex::new(writer));
+        let attachment = StatusNotifierAttachment {
+            owner: "A".into(),
+            control: Arc::clone(&control),
+        };
+        drop(attachment);
+        assert!(!control.publish(&events, &wake, Event::StatusNotifierHostRegistered));
+        assert!(events.lock().expect("events").is_empty());
+    }
+
+    #[test]
+    fn companion_path_is_resolved_beside_xbar_executable() {
+        assert_eq!(
+            sibling_sni_watcher_path(Path::new("/opt/xbar/bin/xbar")),
+            Some(PathBuf::from("/opt/xbar/bin/xbar-sni-watcher"))
+        );
+    }
+
+    #[test]
+    fn snapshot_item_then_queued_unregistered_stays_removed() {
+        let control = control();
+        let item = endpoint();
+        apply_ordered(&control, OrderedWatcherEvent::Registered(item.clone()));
+        apply_ordered(&control, OrderedWatcherEvent::Unregistered(item));
+        assert!(control.items.lock().expect("items").is_empty());
+    }
+
+    #[test]
+    fn snapshot_item_then_queued_registered_has_one_generation() {
+        let control = control();
+        let item = endpoint();
+        apply_ordered(&control, OrderedWatcherEvent::Registered(item.clone()));
+        apply_ordered(&control, OrderedWatcherEvent::Registered(item));
+        assert_eq!(control.items.lock().expect("items").len(), 1);
+    }
+
+    #[test]
+    fn excluded_snapshot_then_queued_registered_has_one_live_item() {
+        let control = control();
+        apply_ordered(&control, OrderedWatcherEvent::Registered(endpoint()));
+        assert_eq!(control.items.lock().expect("items").len(), 1);
+    }
+
+    #[test]
+    fn queued_registered_then_unregistered_is_absent_in_order() {
+        let control = control();
+        let item = endpoint();
+        apply_ordered(&control, OrderedWatcherEvent::Registered(item.clone()));
+        apply_ordered(&control, OrderedWatcherEvent::Unregistered(item));
+        assert!(control.items.lock().expect("items").is_empty());
+    }
+
+    #[test]
+    fn queued_unregistered_then_registered_is_a_new_generation() {
+        let control = control();
+        let item = endpoint();
+        apply_ordered(&control, OrderedWatcherEvent::Unregistered(item.clone()));
+        apply_ordered(&control, OrderedWatcherEvent::Registered(item.clone()));
+        let (id, _) = control
+            .items
+            .lock()
+            .expect("items")
+            .get(&item)
+            .cloned()
+            .expect("new generation");
+        assert!(control.is_current_item(&item, id));
+    }
+
+    #[test]
+    fn ordered_primitive_does_not_have_a_member_subscription_gap() {
+        let control = control();
+        let item = endpoint();
+        apply_ordered(&control, OrderedWatcherEvent::Unregistered(item.clone()));
+        apply_ordered(&control, OrderedWatcherEvent::Registered(item.clone()));
+        apply_ordered(&control, OrderedWatcherEvent::Unregistered(item.clone()));
+        apply_ordered(&control, OrderedWatcherEvent::Registered(item));
+        assert_eq!(control.items.lock().expect("items").len(), 1);
+    }
+
+    #[test]
+    fn pending_item_phase_is_interrupted_by_cancellation() {
+        let (sender, receiver) = async_channel::bounded(1);
+        sender.try_send(()).expect("cancel pending phase");
+        let result = zbus::block_on(await_item_phase(
+            futures_lite::future::pending::<u8>(),
+            &receiver,
+        ));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn setup_failure_keeps_live_owner_until_disappearance_then_recovers() {
+        let mut owner = None;
+        retain_sni_owner_on_setup_failure(&mut owner, ":1.40");
+        assert_eq!(owner.as_deref(), Some(":1.40"));
+
+        if owner.as_deref() == Some(":1.40") {
+            owner = None;
+        }
+        assert!(owner.is_none());
+        retain_sni_owner_on_setup_failure(&mut owner, ":1.41");
+        assert_eq!(owner.as_deref(), Some(":1.41"));
     }
 }
 

@@ -281,6 +281,47 @@ mod tests {
     }
 
     #[test]
+    fn revision_eight_preserves_tools_and_view_children() {
+        let submenu = |id, label, children| {
+            node(
+                id,
+                &[("label", s(label)), ("children-display", s("submenu"))],
+                children,
+            )
+        };
+        let model = convert_layout(
+            8,
+            node(
+                0,
+                &[],
+                vec![
+                    submenu(
+                        8,
+                        "_Tools",
+                        vec![
+                            node(16, &[("label", s("Settings"))], vec![]),
+                            node(17, &[("label", s("Reload"))], vec![]),
+                        ],
+                    ),
+                    submenu(
+                        9,
+                        "_View",
+                        vec![
+                            node(18, &[("label", s("show/hide Menu"))], vec![]),
+                            node(19, &[("label", s("Zoom +"))], vec![]),
+                            node(20, &[("label", s("Zoom -"))], vec![]),
+                        ],
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(model.revision, 8);
+        assert_eq!(model.root.children[0].children.len(), 2);
+        assert_eq!(model.root.children[1].children.len(), 3);
+    }
+
+    #[test]
     fn preserves_flags_unknown_type_and_optional_properties() {
         let root = node(
             0,
