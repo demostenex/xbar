@@ -492,6 +492,14 @@ const fn effect_owner_property_value(dock: u32) -> [u32; 1] {
     [dock]
 }
 
+fn with_default_border_pixel(attributes: xproto::CreateWindowAux) -> xproto::CreateWindowAux {
+    if attributes.border_pixel.is_none() && attributes.border_pixmap.is_none() {
+        attributes.border_pixel(0)
+    } else {
+        attributes
+    }
+}
+
 impl X11Platform {
     fn create_surface_window(
         &self,
@@ -502,6 +510,9 @@ impl X11Platform {
         background: style::Rgba,
         attributes: xproto::CreateWindowAux,
     ) -> Result<(), Box<dyn Error>> {
+        let attributes = with_default_border_pixel(attributes)
+            .colormap(surface.colormap)
+            .background_pixel(surface.background_pixel(background));
         self.conn
             .create_window(
                 surface.depth,
@@ -514,9 +525,7 @@ impl X11Platform {
                 geometry.border_width,
                 WindowClass::INPUT_OUTPUT,
                 surface.visual,
-                &attributes
-                    .colormap(surface.colormap)
-                    .background_pixel(surface.background_pixel(background)),
+                &attributes,
             )?
             .check()?;
         self.apply_surface_effect(surface, role, window, geometry)?;
@@ -3770,7 +3779,8 @@ mod tests {
     use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
     use crate::ui::{layout::MenuRect, view::TrayIconRenderMode, view::TrayVisualItem};
     use x11rb::errors::ReplyError;
-    use x11rb::protocol::ErrorKind;
+    use x11rb::protocol::xproto::EventMask;
+    use x11rb::protocol::{xproto, ErrorKind};
     use x11rb::x11_utils::X11Error;
 
     fn x11_error(kind: ErrorKind, bad_value: u32) -> ReplyError {
@@ -3808,6 +3818,29 @@ mod tests {
             }),
             [0, 0, 517, 93]
         );
+    }
+
+    #[test]
+    fn surface_window_default_border_pixel_is_injected_only_when_unspecified() {
+        let default_attributes = super::with_default_border_pixel(
+            xproto::CreateWindowAux::new()
+                .background_pixel(0x1122_3344)
+                .event_mask(EventMask::EXPOSURE)
+                .colormap(0x55),
+        );
+        assert_eq!(default_attributes.border_pixel, Some(0));
+        assert_eq!(default_attributes.border_pixmap, None);
+
+        let explicit_pixel = super::with_default_border_pixel(
+            xproto::CreateWindowAux::new().border_pixel(0x1234_5678),
+        );
+        assert_eq!(explicit_pixel.border_pixel, Some(0x1234_5678));
+        assert_eq!(explicit_pixel.border_pixmap, None);
+
+        let explicit_pixmap =
+            super::with_default_border_pixel(xproto::CreateWindowAux::new().border_pixmap(0x77));
+        assert_eq!(explicit_pixmap.border_pixel, None);
+        assert_eq!(explicit_pixmap.border_pixmap, Some(0x77));
     }
 
     #[test]
