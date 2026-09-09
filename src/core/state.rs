@@ -335,6 +335,7 @@ pub struct MenuInteractionState {
     pub hovered_path: Vec<super::MenuItemId>,
     pub about_to_show_item: Option<super::MenuItemId>,
     pub pending_about_to_show: Option<AboutToShowPending>,
+    pub pending_lazy_root: Option<LazyRootOpenPending>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -343,6 +344,19 @@ pub struct AboutToShowPending {
     pub endpoint: MenuSource,
     pub item_id: super::MenuItemId,
     pub request_id: u64,
+    pub lazy_root: bool,
+    pub intent_id: Option<u64>,
+    pub watcher_generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LazyRootOpenPending {
+    pub window_id: WindowId,
+    pub endpoint: MenuSource,
+    pub item_id: super::MenuItemId,
+    pub intent_id: u64,
+    pub watcher_generation: u64,
+    pub layout_request_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -354,6 +368,8 @@ pub struct State {
     pub focused_app_name: Option<String>,
     pub menu: MenuState,
     pub global_menu_model: Option<(WindowId, MenuSource, MenuModel)>,
+    pub watcher_generations: HashMap<MenuSource, u64>,
+    pub next_lazy_root_intent: u64,
     pub menu_interaction: MenuInteractionState,
     pub clock: Option<ClockState>,
     pub audio: AudioState,
@@ -440,3 +456,4 @@ impl State {
         }
     }
 }
+use std::collections::HashMap;

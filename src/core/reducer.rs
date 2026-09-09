@@ -1,4 +1,4 @@
-use super::state::MenuInteractionState;
+use super::state::{LazyRootOpenPending, MenuInteractionState};
 use super::{Event, MenuItemId, MenuRegistry, MenuSource, MenuState, State};
 
 fn item(model: &super::MenuModel, id: MenuItemId) -> Option<&super::MenuItem> {
@@ -277,7 +277,13 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             removed
         }
         Event::MenuUnregistered { window_id } => {
-            let removed = registry.unregister(window_id).is_some();
+            let previous = registry.unregister(window_id);
+            let removed = previous.is_some();
+            if let Some(endpoint) = previous {
+                state
+                    .watcher_generations
+                    .remove(&MenuSource::DbusMenu(endpoint));
+            }
             if removed && state.focused_window == Some(window_id) {
                 state.menu = MenuState::NoMenu;
                 state.menu_interaction = Default::default();
@@ -287,6 +293,9 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         }
         Event::MenuOwnerVanished { sender } => {
             let removed = registry.remove_sender(&sender);
+            state.watcher_generations.retain(|endpoint, _| {
+                !matches!(endpoint, MenuSource::DbusMenu(endpoint) if endpoint.service == sender)
+            });
             if state
                 .focused_window
                 .is_some_and(|window| removed.contains(&window))
@@ -327,6 +336,64 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 false
             }
         }
+        Event::MenuLazyRootLayoutRequested {
+            window_id,
+            endpoint,
+            request_id,
+            intent_id,
+            watcher_generation,
+        } => {
+            let valid = state
+                .menu_interaction
+                .pending_lazy_root
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.window_id == window_id
+                        && pending.endpoint == endpoint
+                        && pending.intent_id == intent_id
+                        && pending.watcher_generation == watcher_generation
+                        && state.watcher_generations.get(&endpoint) == Some(&watcher_generation)
+                })
+                && (state.focused_window == Some(window_id)
+                    && registry.source_matches(window_id, &endpoint));
+            if !valid {
+                return false;
+            }
+            state
+                .menu_interaction
+                .pending_lazy_root
+                .as_mut()
+                .expect("validated lazy root intent")
+                .layout_request_id = Some(request_id);
+            state.menu = MenuState::Loading {
+                window_id,
+                endpoint,
+                request_id,
+            };
+            true
+        }
+        Event::MenuLazyRootLoadConvergence {
+            window_id,
+            endpoint,
+            request_id,
+            follow_up_request_id,
+        } => {
+            let Some(pending) = state.menu_interaction.pending_lazy_root.as_mut() else {
+                return false;
+            };
+            if pending.window_id != window_id
+                || pending.endpoint != endpoint
+                || pending.layout_request_id != Some(request_id)
+            {
+                return false;
+            }
+            if let Some(next_request_id) = follow_up_request_id {
+                pending.layout_request_id = Some(next_request_id);
+            } else {
+                state.menu_interaction.pending_lazy_root = None;
+            }
+            true
+        }
         Event::MenuLoaded {
             window_id,
             endpoint,
@@ -339,6 +406,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                     && ((matches!(endpoint, MenuSource::Tray(_)) && window_id == super::WindowId(u32::MAX))
                         || (state.focused_window == Some(window_id) && registry.source_matches(window_id, &endpoint))));
             if accepted {
+                let pending_lazy_root = state.menu_interaction.pending_lazy_root.clone();
                 state.menu = MenuState::Loaded {
                     window_id,
                     endpoint: endpoint.clone(),
@@ -357,6 +425,32 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                     state.menu_interaction.open_path = vec![MenuItemId(0)];
                 }
                 normalize_interaction(state);
+                if let Some(pending) = pending_lazy_root {
+                    if pending.endpoint == endpoint
+                        && pending.window_id == window_id
+                        && pending.layout_request_id == Some(request_id)
+                        && state.watcher_generations.get(&endpoint)
+                            == Some(&pending.watcher_generation)
+                    {
+                        let can_open = state.active_menu_model().is_some_and(|model| {
+                            model.root.children.iter().any(|item| {
+                                item.id == pending.item_id
+                                    && item.visible
+                                    && item.enabled
+                                    && item.children_display
+                                        == Some(super::ChildrenDisplay::Submenu)
+                                    && !item.children.is_empty()
+                            })
+                        });
+                        if can_open {
+                            state.menu_interaction.open_root = Some(pending.item_id);
+                            state.menu_interaction.open_path = vec![pending.item_id];
+                            state.menu_interaction.pending_lazy_root = None;
+                        } else {
+                            state.menu_interaction.pending_lazy_root = Some(pending);
+                        }
+                    }
+                }
             }
             accepted
         }
@@ -417,7 +511,27 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 false
             }
         }
-        Event::MenuWatcherReady { .. } | Event::MenuLayoutInvalidated { .. } => false,
+        Event::MenuWatcherReady {
+            endpoint,
+            watcher_generation,
+            ..
+        } => {
+            let previous = state
+                .watcher_generations
+                .insert(endpoint.clone(), watcher_generation);
+            if previous.is_some_and(|old| old != watcher_generation)
+                && state
+                    .menu_interaction
+                    .pending_lazy_root
+                    .as_ref()
+                    .is_some_and(|pending| pending.endpoint == endpoint)
+            {
+                state.menu_interaction.pending_lazy_root = None;
+                state.menu_interaction.pending_about_to_show = None;
+            }
+            false
+        }
+        Event::MenuLayoutInvalidated { .. } => false,
         Event::MenuPropertiesUpdated {
             endpoint, updates, ..
         } => {
@@ -474,6 +588,37 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             if !menu_item.visible || !menu_item.enabled {
                 return false;
             }
+            if menu_item.children_display == Some(super::ChildrenDisplay::Submenu)
+                && menu_item.children.is_empty()
+            {
+                if let MenuState::Loaded {
+                    window_id,
+                    endpoint: MenuSource::DbusMenu(endpoint),
+                    ..
+                } = &state.menu
+                {
+                    let watcher_generation = state
+                        .watcher_generations
+                        .get(&MenuSource::DbusMenu(endpoint.clone()))
+                        .copied();
+                    let Some(watcher_generation) = watcher_generation else {
+                        return false;
+                    };
+                    state.next_lazy_root_intent = state.next_lazy_root_intent.wrapping_add(1);
+                    state.menu_interaction.pending_lazy_root = Some(LazyRootOpenPending {
+                        window_id: *window_id,
+                        endpoint: MenuSource::DbusMenu(endpoint.clone()),
+                        item_id: id,
+                        intent_id: state.next_lazy_root_intent,
+                        watcher_generation,
+                        layout_request_id: None,
+                    });
+                    state.menu_interaction.pending_about_to_show = None;
+                    state.menu_interaction.open_root = None;
+                    state.menu_interaction.open_path.clear();
+                    return true;
+                }
+            }
             if menu_item.children_display.is_none() || menu_item.children.is_empty() {
                 if state.menu_interaction.open_root.is_some() {
                     state.menu_interaction = Default::default();
@@ -484,6 +629,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             if state.menu_interaction.open_root == Some(id) {
                 state.menu_interaction = Default::default();
             } else {
+                state.menu_interaction.pending_lazy_root = None;
                 state.menu_interaction.open_root = Some(id);
                 state.menu_interaction.open_path = vec![id];
                 state.menu_interaction.hovered_path.clear();
@@ -584,7 +730,35 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             endpoint,
             item_id,
             request_id,
+            lazy_root,
+            intent_id,
+            watcher_generation,
         } => {
+            let lazy_root_match = state
+                .menu_interaction
+                .pending_lazy_root
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.window_id == window_id
+                        && pending.endpoint == endpoint
+                        && pending.item_id == item_id
+                });
+            let lazy_authority = if lazy_root {
+                state
+                    .menu_interaction
+                    .pending_lazy_root
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        Some(pending.intent_id) == intent_id
+                            && Some(pending.watcher_generation) == watcher_generation
+                            && pending.window_id == window_id
+                            && pending.endpoint == endpoint
+                            && state.watcher_generations.get(&endpoint)
+                                == watcher_generation.as_ref()
+                    })
+            } else {
+                false
+            };
             let valid = ((matches!(endpoint, MenuSource::Tray(_))
                 && window_id == super::WindowId(u32::MAX))
                 || (state.focused_window == Some(window_id)
@@ -592,14 +766,18 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 && (matches!(&state.menu, MenuState::Loaded { endpoint: current, .. } if current == &endpoint)
                     || matches!(&state.menu, MenuState::TrayLoaded { endpoint: current, .. }
                         if MenuSource::Tray(current.clone()) == endpoint))
-                && state.menu_interaction.open_root.is_some()
-                && state.menu_interaction.hovered_path.last() == Some(&item_id);
+                && ((state.menu_interaction.open_root.is_some()
+                    && state.menu_interaction.hovered_path.last() == Some(&item_id))
+                    || (lazy_root && lazy_root_match && lazy_authority));
             if valid {
                 state.menu_interaction.pending_about_to_show = Some(super::AboutToShowPending {
                     window_id,
                     endpoint,
                     item_id,
                     request_id,
+                    lazy_root,
+                    intent_id,
+                    watcher_generation,
                 });
                 state.menu_interaction.about_to_show_item = Some(item_id);
                 true
@@ -612,22 +790,45 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             endpoint,
             item_id,
             request_id,
+            lazy_root,
+            intent_id,
+            watcher_generation,
             need_update,
             model,
             error,
         } => {
             let accepted = matches!(&state.menu_interaction.pending_about_to_show,
-                Some(p) if p.window_id == window_id && p.endpoint == endpoint && p.item_id == item_id && p.request_id == request_id)
+                Some(p) if p.window_id == window_id && p.endpoint == endpoint && p.item_id == item_id && p.request_id == request_id && p.lazy_root == lazy_root && p.intent_id == intent_id && p.watcher_generation == watcher_generation)
                 && ((matches!(endpoint, MenuSource::Tray(_))
                     && window_id == super::WindowId(u32::MAX))
                     || (state.focused_window == Some(window_id)
                         && registry.source_matches(window_id, &endpoint)))
-                && state.menu_interaction.hovered_path.last() == Some(&item_id);
+                && ((lazy_root
+                    && state
+                        .menu_interaction
+                        .pending_lazy_root
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.window_id == window_id
+                                && pending.endpoint == endpoint
+                                && pending.item_id == item_id
+                                && pending.intent_id == intent_id.unwrap_or_default()
+                                && pending.watcher_generation
+                                    == watcher_generation.unwrap_or_default()
+                        }))
+                    || (!lazy_root
+                        && state.menu_interaction.hovered_path.last() == Some(&item_id)));
             if !accepted {
                 return false;
             }
             state.menu_interaction.pending_about_to_show = None;
             if error.is_some() {
+                if lazy_root {
+                    state.menu_interaction.pending_lazy_root = None;
+                }
+                return true;
+            }
+            if lazy_root {
                 return true;
             }
             if need_update {
@@ -2793,7 +2994,10 @@ mod tests {
                 window_id: WindowId(7),
                 endpoint: MenuSource::DbusMenu(ep()),
                 item_id: MenuItemId(2),
-                request_id: 41
+                request_id: 41,
+                lazy_root: false,
+                intent_id: None,
+                watcher_generation: None
             },
             &mut registry
         ));
@@ -2804,6 +3008,9 @@ mod tests {
                 endpoint: MenuSource::DbusMenu(ep()),
                 item_id: MenuItemId(2),
                 request_id: 40,
+                lazy_root: false,
+                intent_id: None,
+                watcher_generation: None,
                 need_update: false,
                 model: None,
                 error: None
@@ -2818,6 +3025,9 @@ mod tests {
                 endpoint: MenuSource::DbusMenu(ep()),
                 item_id: MenuItemId(2),
                 request_id: 41,
+                lazy_root: false,
+                intent_id: None,
+                watcher_generation: None,
                 need_update: false,
                 model: None,
                 error: None
@@ -2875,6 +3085,9 @@ mod tests {
                 endpoint: MenuSource::DbusMenu(ep()),
                 item_id: MenuItemId(2),
                 request_id: 50,
+                lazy_root: false,
+                intent_id: None,
+                watcher_generation: None,
             },
             &mut registry,
         ));
@@ -2885,6 +3098,9 @@ mod tests {
                 endpoint: MenuSource::DbusMenu(ep()),
                 item_id: MenuItemId(2),
                 request_id: 50,
+                lazy_root: false,
+                intent_id: None,
+                watcher_generation: None,
                 need_update: false,
                 model: None,
                 error: None,
@@ -2900,6 +3116,9 @@ mod tests {
                 endpoint: MenuSource::DbusMenu(ep()),
                 item_id: MenuItemId(2),
                 request_id: 51,
+                lazy_root: false,
+                intent_id: None,
+                watcher_generation: None,
             },
             &mut registry,
         ));
@@ -2910,6 +3129,9 @@ mod tests {
                 endpoint: MenuSource::DbusMenu(ep()),
                 item_id: MenuItemId(2),
                 request_id: 51,
+                lazy_root: false,
+                intent_id: None,
+                watcher_generation: None,
                 need_update: true,
                 model: Some(interactive_model()),
                 error: None,
@@ -2920,6 +3142,441 @@ mod tests {
             state.menu_interaction.open_path,
             vec![MenuItemId(1), MenuItemId(2)]
         );
+    }
+
+    fn lazy_root_state() -> (State, MenuRegistry) {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        registry.register(WindowId(7), ep().service.clone(), ep().object_path.clone());
+        state.focused_window = Some(WindowId(7));
+        let mut model = interactive_model();
+        model.root.children[0].children.clear();
+        let mut second_root = model.root.children[0].clone();
+        second_root.id = MenuItemId(4);
+        second_root.label = Some("View".into());
+        model.root.children.push(second_root);
+        state.menu = MenuState::Loaded {
+            window_id: WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+            model,
+        };
+        state
+            .watcher_generations
+            .insert(MenuSource::DbusMenu(ep()), 10);
+        (state, registry)
+    }
+
+    fn click_lazy_root(state: &mut State, registry: &mut MenuRegistry) {
+        assert!(reduce(
+            state,
+            Event::MenuRootClicked(MenuItemId(1)),
+            registry
+        ));
+    }
+
+    fn request_lazy_root(state: &mut State, registry: &mut MenuRegistry, request_id: u64) {
+        let pending = state.menu_interaction.pending_lazy_root.clone().unwrap();
+        assert!(reduce(
+            state,
+            Event::MenuAboutToShowRequested {
+                window_id: WindowId(7),
+                endpoint: MenuSource::DbusMenu(ep()),
+                item_id: MenuItemId(1),
+                request_id,
+                lazy_root: true,
+                intent_id: Some(pending.intent_id),
+                watcher_generation: Some(pending.watcher_generation),
+            },
+            registry,
+        ));
+    }
+
+    fn complete_lazy_root(
+        state: &mut State,
+        registry: &mut MenuRegistry,
+        request_id: u64,
+        model: Option<super::super::MenuModel>,
+        need_update: bool,
+    ) {
+        let pending = state
+            .menu_interaction
+            .pending_about_to_show
+            .clone()
+            .unwrap();
+        assert!(reduce(
+            state,
+            Event::MenuAboutToShowCompleted {
+                window_id: WindowId(7),
+                endpoint: MenuSource::DbusMenu(ep()),
+                item_id: MenuItemId(1),
+                request_id,
+                lazy_root: true,
+                intent_id: pending.intent_id,
+                watcher_generation: pending.watcher_generation,
+                need_update,
+                model: model.clone(),
+                error: None,
+            },
+            registry,
+        ));
+        if let Some(model) = model {
+            let pending = state.menu_interaction.pending_lazy_root.clone().unwrap();
+            let layout_request_id = request_id + 1000;
+            assert!(reduce(
+                state,
+                Event::MenuLazyRootLayoutRequested {
+                    window_id: pending.window_id,
+                    endpoint: pending.endpoint.clone(),
+                    request_id: layout_request_id,
+                    intent_id: pending.intent_id,
+                    watcher_generation: pending.watcher_generation,
+                },
+                registry,
+            ));
+            assert!(reduce(
+                state,
+                Event::MenuLoaded {
+                    window_id: pending.window_id,
+                    endpoint: pending.endpoint,
+                    request_id: layout_request_id,
+                    model: model.clone(),
+                },
+                registry,
+            ));
+        }
+    }
+
+    #[test]
+    fn lazy_root_click_creates_intent_without_empty_popup() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        assert!(state.menu_interaction.open_root.is_none());
+        assert_eq!(
+            state
+                .menu_interaction
+                .pending_lazy_root
+                .as_ref()
+                .unwrap()
+                .item_id,
+            MenuItemId(1)
+        );
+    }
+
+    #[test]
+    fn lazy_root_click_accepts_about_to_show_request() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 80);
+        assert!(state.menu_interaction.pending_about_to_show.is_some());
+    }
+
+    #[test]
+    fn lazy_root_about_false_keeps_popup_closed_and_cleans_attempt() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 81);
+        complete_lazy_root(&mut state, &mut registry, 81, None, false);
+        assert!(state.menu_interaction.open_root.is_none());
+        assert!(state.menu_interaction.pending_lazy_root.is_some());
+    }
+
+    #[test]
+    fn lazy_root_about_true_opens_after_single_fresh_model() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 82);
+        complete_lazy_root(
+            &mut state,
+            &mut registry,
+            82,
+            Some(interactive_model()),
+            true,
+        );
+        assert_eq!(state.menu_interaction.open_path, vec![MenuItemId(1)]);
+    }
+
+    #[test]
+    fn lazy_root_later_model_with_children_opens_automatically() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 83);
+        complete_lazy_root(
+            &mut state,
+            &mut registry,
+            83,
+            Some(interactive_model()),
+            true,
+        );
+        assert_eq!(state.menu_interaction.open_root, Some(MenuItemId(1)));
+    }
+
+    #[test]
+    fn lazy_root_still_empty_never_opens_popup() {
+        let (mut state, mut registry) = lazy_root_state();
+        let empty = match &state.menu {
+            MenuState::Loaded { model, .. } => model.clone(),
+            _ => unreachable!(),
+        };
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 84);
+        complete_lazy_root(&mut state, &mut registry, 84, Some(empty), true);
+        assert!(state.menu_interaction.open_root.is_none());
+    }
+
+    #[test]
+    fn lazy_root_second_click_replaces_first_intent() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        assert!(reduce(
+            &mut state,
+            Event::MenuRootClicked(MenuItemId(4)),
+            &mut registry
+        ));
+        assert_eq!(
+            state
+                .menu_interaction
+                .pending_lazy_root
+                .as_ref()
+                .unwrap()
+                .item_id,
+            MenuItemId(4)
+        );
+    }
+
+    #[test]
+    fn lazy_root_focus_change_clears_intent() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry,
+        );
+        assert!(state.menu_interaction.pending_lazy_root.is_none());
+    }
+
+    #[test]
+    fn lazy_root_unregister_clears_intent() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        reduce(
+            &mut state,
+            Event::MenuUnregistered {
+                window_id: WindowId(7),
+            },
+            &mut registry,
+        );
+        assert!(state.menu_interaction.pending_lazy_root.is_none());
+    }
+
+    #[test]
+    fn lazy_root_owner_vanish_clears_intent() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        reduce(
+            &mut state,
+            Event::MenuOwnerVanished {
+                sender: ep().service,
+            },
+            &mut registry,
+        );
+        assert!(state.menu_interaction.pending_lazy_root.is_none());
+    }
+
+    #[test]
+    fn lazy_root_stale_about_completion_is_rejected() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 85);
+        assert!(!reduce(
+            &mut state,
+            Event::MenuAboutToShowCompleted {
+                window_id: WindowId(7),
+                endpoint: MenuSource::DbusMenu(ep()),
+                item_id: MenuItemId(1),
+                request_id: 84,
+                lazy_root: true,
+                intent_id: None,
+                watcher_generation: None,
+                need_update: true,
+                model: Some(interactive_model()),
+                error: None,
+            },
+            &mut registry
+        ));
+        assert!(state.menu_interaction.open_root.is_none());
+    }
+
+    #[test]
+    fn lazy_root_old_intent_cannot_open_after_new_intent() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 86);
+        click_lazy_root(&mut state, &mut registry);
+        assert!(!reduce(
+            &mut state,
+            Event::MenuAboutToShowCompleted {
+                window_id: WindowId(7),
+                endpoint: MenuSource::DbusMenu(ep()),
+                item_id: MenuItemId(1),
+                request_id: 86,
+                lazy_root: true,
+                intent_id: None,
+                watcher_generation: None,
+                need_update: true,
+                model: Some(interactive_model()),
+                error: None,
+            },
+            &mut registry
+        ));
+    }
+
+    #[test]
+    fn populated_root_still_opens_immediately() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction = MenuInteractionState::default();
+        assert!(reduce(
+            &mut state,
+            Event::MenuRootClicked(MenuItemId(1)),
+            &mut registry
+        ));
+        assert_eq!(state.menu_interaction.open_root, Some(MenuItemId(1)));
+    }
+
+    #[test]
+    fn non_submenu_empty_root_is_not_lazy() {
+        let (mut state, mut registry) = lazy_root_state();
+        if let MenuState::Loaded { model, .. } = &mut state.menu {
+            model.root.children[0].children_display = None;
+        }
+        assert!(!reduce(
+            &mut state,
+            Event::MenuRootClicked(MenuItemId(1)),
+            &mut registry
+        ));
+        assert!(state.menu_interaction.pending_lazy_root.is_none());
+    }
+
+    #[test]
+    fn nested_lazy_submenu_flow_remains_supported() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction.hovered_path = vec![MenuItemId(1), MenuItemId(2)];
+        assert!(reduce(
+            &mut state,
+            Event::MenuAboutToShowRequested {
+                window_id: WindowId(7),
+                endpoint: MenuSource::DbusMenu(ep()),
+                item_id: MenuItemId(2),
+                request_id: 87,
+                lazy_root: false,
+                intent_id: None,
+                watcher_generation: None,
+            },
+            &mut registry
+        ));
+        assert!(state.menu_interaction.pending_about_to_show.is_some());
+    }
+
+    #[test]
+    fn lazy_root_endpoint_identity_is_required() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        assert!(!reduce(
+            &mut state,
+            Event::MenuAboutToShowRequested {
+                window_id: WindowId(7),
+                endpoint: MenuSource::DbusMenu(MenuEndpoint {
+                    service: ":1.other".into(),
+                    object_path: ep().object_path
+                }),
+                item_id: MenuItemId(1),
+                request_id: 88,
+                lazy_root: true,
+                intent_id: None,
+                watcher_generation: None,
+            },
+            &mut registry
+        ));
+    }
+
+    #[test]
+    fn lazy_root_window_identity_is_required() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        assert!(!reduce(
+            &mut state,
+            Event::MenuAboutToShowRequested {
+                window_id: WindowId(8),
+                endpoint: MenuSource::DbusMenu(ep()),
+                item_id: MenuItemId(1),
+                request_id: 89,
+                lazy_root: true,
+                intent_id: None,
+                watcher_generation: None,
+            },
+            &mut registry
+        ));
+    }
+
+    #[test]
+    fn lazy_root_error_clears_intent() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 90);
+        let pending = state
+            .menu_interaction
+            .pending_about_to_show
+            .clone()
+            .unwrap();
+        assert!(reduce(
+            &mut state,
+            Event::MenuAboutToShowCompleted {
+                window_id: WindowId(7),
+                endpoint: MenuSource::DbusMenu(ep()),
+                item_id: MenuItemId(1),
+                request_id: 90,
+                lazy_root: true,
+                intent_id: pending.intent_id,
+                watcher_generation: pending.watcher_generation,
+                need_update: false,
+                model: None,
+                error: Some("failed".into()),
+            },
+            &mut registry
+        ));
+        assert!(state.menu_interaction.pending_lazy_root.is_none());
+    }
+
+    #[test]
+    fn lazy_root_completion_does_not_open_leaf_model() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 91);
+        let mut leaf = interactive_model();
+        leaf.root.children[0].children_display = None;
+        complete_lazy_root(&mut state, &mut registry, 91, Some(leaf), true);
+        assert!(state.menu_interaction.open_root.is_none());
+    }
+
+    #[test]
+    fn lazy_root_completion_reuses_current_endpoint_model() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 92);
+        complete_lazy_root(
+            &mut state,
+            &mut registry,
+            92,
+            Some(interactive_model()),
+            true,
+        );
+        assert!(matches!(
+            state.menu,
+            MenuState::Loaded {
+                window_id: WindowId(7),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3884,5 +4541,371 @@ mod tests {
         );
         assert_eq!(left.ai_usage, right.ai_usage);
         assert_eq!(left.plugin_zone.plugins, right.plugin_zone.plugins);
+    }
+
+    #[test]
+    fn lazy_root_canonical_layout_request_binds_intent() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 120);
+        let pending = state.menu_interaction.pending_lazy_root.clone().unwrap();
+        assert!(reduce(
+            &mut state,
+            Event::MenuLazyRootLayoutRequested {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint,
+                request_id: 121,
+                intent_id: pending.intent_id,
+                watcher_generation: pending.watcher_generation,
+            },
+            &mut registry,
+        ));
+        assert_eq!(
+            state
+                .menu_interaction
+                .pending_lazy_root
+                .unwrap()
+                .layout_request_id,
+            Some(121)
+        );
+    }
+
+    #[test]
+    fn stale_canonical_layout_cannot_open_lazy_root() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 122);
+        let pending = state.menu_interaction.pending_lazy_root.clone().unwrap();
+        reduce(
+            &mut state,
+            Event::MenuLazyRootLayoutRequested {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint.clone(),
+                request_id: 123,
+                intent_id: pending.intent_id,
+                watcher_generation: pending.watcher_generation,
+            },
+            &mut registry,
+        );
+        assert!(!reduce(
+            &mut state,
+            Event::MenuLoaded {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint,
+                request_id: 122,
+                model: interactive_model(),
+            },
+            &mut registry
+        ));
+        assert!(state.menu_interaction.open_root.is_none());
+    }
+
+    #[test]
+    fn lazy_root_watcher_replacement_invalidates_intent() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        assert!(state.menu_interaction.pending_lazy_root.is_some());
+        reduce(
+            &mut state,
+            Event::MenuWatcherReady {
+                endpoint: MenuSource::DbusMenu(ep()),
+                watcher_generation: 11,
+                request_id: 124,
+            },
+            &mut registry,
+        );
+        assert!(state.menu_interaction.pending_lazy_root.is_none());
+    }
+
+    #[test]
+    fn lazy_root_does_not_enter_loading_before_about_completion() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 125);
+        assert!(matches!(state.menu, MenuState::Loaded { .. }));
+    }
+
+    #[test]
+    fn lazy_root_about_error_leaves_layout_authority_unarmed() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 126);
+        let pending = state
+            .menu_interaction
+            .pending_about_to_show
+            .clone()
+            .unwrap();
+        reduce(
+            &mut state,
+            Event::MenuAboutToShowCompleted {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint,
+                item_id: pending.item_id,
+                request_id: pending.request_id,
+                lazy_root: true,
+                intent_id: pending.intent_id,
+                watcher_generation: pending.watcher_generation,
+                need_update: false,
+                model: None,
+                error: Some("failure".into()),
+            },
+            &mut registry,
+        );
+        assert!(matches!(state.menu, MenuState::Loaded { .. }));
+        assert!(state.menu_interaction.pending_lazy_root.is_none());
+    }
+
+    #[test]
+    fn lazy_root_same_generation_ready_keeps_intent() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        reduce(
+            &mut state,
+            Event::MenuWatcherReady {
+                endpoint: MenuSource::DbusMenu(ep()),
+                watcher_generation: 10,
+                request_id: 127,
+            },
+            &mut registry,
+        );
+        assert!(state.menu_interaction.pending_lazy_root.is_some());
+    }
+
+    #[test]
+    fn lazy_root_layout_request_is_single_canonical_transition() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 128);
+        let pending = state.menu_interaction.pending_lazy_root.clone().unwrap();
+        assert!(reduce(
+            &mut state,
+            Event::MenuLazyRootLayoutRequested {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint,
+                request_id: 129,
+                intent_id: pending.intent_id,
+                watcher_generation: pending.watcher_generation,
+            },
+            &mut registry
+        ));
+        assert!(matches!(
+            state.menu,
+            MenuState::Loading {
+                request_id: 129,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lazy_root_empty_snapshot_can_finish_attempt_without_opening() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 130);
+        let pending = state.menu_interaction.pending_lazy_root.clone().unwrap();
+        let empty = match &state.menu {
+            MenuState::Loaded { model, .. } => model.clone(),
+            _ => unreachable!(),
+        };
+        reduce(
+            &mut state,
+            Event::MenuLazyRootLayoutRequested {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint.clone(),
+                request_id: 131,
+                intent_id: pending.intent_id,
+                watcher_generation: pending.watcher_generation,
+            },
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::MenuLoaded {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint.clone(),
+                request_id: 131,
+                model: empty,
+            },
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::MenuLazyRootLoadConvergence {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint,
+                request_id: 131,
+                follow_up_request_id: None,
+            },
+            &mut registry,
+        );
+        assert!(state.menu_interaction.pending_lazy_root.is_none());
+        assert!(state.menu_interaction.open_root.is_none());
+    }
+
+    #[test]
+    fn lazy_root_empty_snapshot_rebinds_follow_up_without_new_intent() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 132);
+        let pending = state.menu_interaction.pending_lazy_root.clone().unwrap();
+        let empty = match &state.menu {
+            MenuState::Loaded { model, .. } => model.clone(),
+            _ => unreachable!(),
+        };
+        reduce(
+            &mut state,
+            Event::MenuLazyRootLayoutRequested {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint.clone(),
+                request_id: 133,
+                intent_id: pending.intent_id,
+                watcher_generation: pending.watcher_generation,
+            },
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::MenuLoaded {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint.clone(),
+                request_id: 133,
+                model: empty,
+            },
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::MenuLazyRootLoadConvergence {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint,
+                request_id: 133,
+                follow_up_request_id: Some(134),
+            },
+            &mut registry,
+        );
+        let rebound = state.menu_interaction.pending_lazy_root.unwrap();
+        assert_eq!(rebound.intent_id, pending.intent_id);
+        assert_eq!(rebound.layout_request_id, Some(134));
+    }
+
+    #[test]
+    fn lazy_root_tools_view_tools_rejects_both_older_about_completions() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        let first = state.menu_interaction.pending_lazy_root.clone().unwrap();
+        request_lazy_root(&mut state, &mut registry, 140);
+        assert!(reduce(
+            &mut state,
+            Event::MenuRootClicked(MenuItemId(4)),
+            &mut registry
+        ));
+        assert!(state.menu_interaction.pending_lazy_root.is_some());
+        let middle = state.menu_interaction.pending_lazy_root.clone().unwrap();
+        assert!(reduce(
+            &mut state,
+            Event::MenuAboutToShowRequested {
+                window_id: middle.window_id,
+                endpoint: middle.endpoint.clone(),
+                item_id: middle.item_id,
+                request_id: 141,
+                lazy_root: true,
+                intent_id: Some(middle.intent_id),
+                watcher_generation: Some(middle.watcher_generation),
+            },
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::MenuRootClicked(MenuItemId(1)),
+            &mut registry
+        ));
+        let second = state.menu_interaction.pending_lazy_root.clone().unwrap();
+        assert_ne!(first.intent_id, middle.intent_id);
+        assert_ne!(middle.intent_id, second.intent_id);
+        assert!(!reduce(
+            &mut state,
+            Event::MenuAboutToShowCompleted {
+                window_id: first.window_id,
+                endpoint: first.endpoint.clone(),
+                item_id: first.item_id,
+                request_id: 140,
+                lazy_root: true,
+                intent_id: Some(first.intent_id),
+                watcher_generation: Some(first.watcher_generation),
+                need_update: false,
+                model: None,
+                error: None,
+            },
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::MenuAboutToShowRequested {
+                window_id: second.window_id,
+                endpoint: second.endpoint.clone(),
+                item_id: second.item_id,
+                request_id: 142,
+                lazy_root: true,
+                intent_id: Some(second.intent_id),
+                watcher_generation: Some(second.watcher_generation),
+            },
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::MenuAboutToShowCompleted {
+                window_id: second.window_id,
+                endpoint: second.endpoint,
+                item_id: second.item_id,
+                request_id: 142,
+                lazy_root: true,
+                intent_id: Some(second.intent_id),
+                watcher_generation: Some(second.watcher_generation),
+                need_update: false,
+                model: None,
+                error: None,
+            },
+            &mut registry
+        ));
+    }
+
+    #[test]
+    fn lazy_root_error_then_invalidation_keeps_normal_model_authority_available() {
+        let (mut state, mut registry) = lazy_root_state();
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 142);
+        let pending = state
+            .menu_interaction
+            .pending_about_to_show
+            .clone()
+            .unwrap();
+        assert!(reduce(
+            &mut state,
+            Event::MenuAboutToShowCompleted {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint.clone(),
+                item_id: pending.item_id,
+                request_id: pending.request_id,
+                lazy_root: true,
+                intent_id: pending.intent_id,
+                watcher_generation: pending.watcher_generation,
+                need_update: false,
+                model: None,
+                error: Some("failed".into()),
+            },
+            &mut registry
+        ));
+        assert!(state.menu_interaction.pending_about_to_show.is_none());
+        assert!(state.menu_interaction.pending_lazy_root.is_none());
+        assert!(matches!(state.menu, MenuState::Loaded { .. }));
+        assert!(!reduce(
+            &mut state,
+            Event::MenuLayoutInvalidated {
+                endpoint: pending.endpoint,
+                watcher_generation: Some(10),
+                revision: Some(9),
+            },
+            &mut registry
+        ));
     }
 }

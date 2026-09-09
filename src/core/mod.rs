@@ -15,10 +15,11 @@ pub use reducer::reduce;
 pub use state::{
     wifi_band, wifi_device_state_label, AboutToShowPending, AccountIdentity, ActiveAgentUsage,
     AudioDevice, AudioState, BluetoothDevice, BluetoothPendingAction, BluetoothState, ClockState,
-    MenuState, NetworkAccessPoint, NetworkConnectivity, NetworkLinkKind, NetworkPendingAction,
-    NetworkState, NetworkStatus, NetworkWifiTarget, Notification, NotificationId,
-    NotificationSource, OutputId, OutputState, PluginId, PluginStatus, PluginSummary, State,
-    UsageMeter, UsageStatus, UsageSummary, UsageValue, WifiDevice, WindowId, WorkspaceState,
+    LazyRootOpenPending, MenuState, NetworkAccessPoint, NetworkConnectivity, NetworkLinkKind,
+    NetworkPendingAction, NetworkState, NetworkStatus, NetworkWifiTarget, Notification,
+    NotificationId, NotificationSource, OutputId, OutputState, PluginId, PluginStatus,
+    PluginSummary, State, UsageMeter, UsageStatus, UsageSummary, UsageValue, WifiDevice, WindowId,
+    WorkspaceState,
 };
 pub use status_notifier::{
     parse_notifier_item_id, StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierIcon,

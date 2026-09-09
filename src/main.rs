@@ -16,6 +16,18 @@ use std::error::Error;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
+fn should_schedule_invalidation(
+    stale_layout: bool,
+    accepted_layout_invalidation: bool,
+    layout_in_flight: bool,
+    lazy_about_to_show_pending: bool,
+) -> bool {
+    !stale_layout
+        && accepted_layout_invalidation
+        && !layout_in_flight
+        && !lazy_about_to_show_pending
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut x11 = X11Platform::connect()?;
     if !x11.acquire_instance()? {
@@ -716,9 +728,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                         | Event::GtkMenuRemoved { .. }
                         | Event::MenuUnregistered { .. }
                         | Event::MenuOwnerVanished { .. }
-                ) || (accepted_layout_invalidation && !layout_in_flight)
-                    || (matches!(&translated, Event::MenuRootClicked(_))
-                        && matches!(state.menu, core::MenuState::TrayLoaded { .. })));
+                ) || should_schedule_invalidation(
+                    stale_layout,
+                    accepted_layout_invalidation,
+                    layout_in_flight,
+                    state
+                        .menu_interaction
+                        .pending_about_to_show
+                        .as_ref()
+                        .is_some_and(|pending| pending.lazy_root),
+                ) || (matches!(&translated, Event::MenuRootClicked(_))
+                    && matches!(state.menu, core::MenuState::TrayLoaded { .. })));
             if trace {
                 match &translated {
                     Event::WindowFocused(new_window) => eprintln!(
@@ -796,15 +816,122 @@ fn main() -> Result<(), Box<dyn Error>> {
                     _ => "other",
                 });
             }
+            if reduced && matches!(&translated, Event::MenuRootClicked(_)) {
+                if let Some(pending) = state.menu_interaction.pending_lazy_root.clone() {
+                    let request_id = next_menu_request_id;
+                    next_menu_request_id += 1;
+                    let about = Event::MenuAboutToShowRequested {
+                        window_id: pending.window_id,
+                        endpoint: pending.endpoint.clone(),
+                        item_id: pending.item_id,
+                        request_id,
+                        lazy_root: true,
+                        intent_id: Some(pending.intent_id),
+                        watcher_generation: Some(pending.watcher_generation),
+                    };
+                    if core::reduce(
+                        &mut state,
+                        about,
+                        &mut registry.lock().expect("registry poisoned"),
+                    ) {
+                        dirty = true;
+                        render_target = Some(RenderTarget::DockContext);
+                        if let MenuSource::DbusMenu(endpoint) = pending.endpoint {
+                            dbus.request_about_to_show(
+                                pending.window_id,
+                                endpoint,
+                                pending.item_id,
+                                request_id,
+                                true,
+                                Some(pending.intent_id),
+                                Some(pending.watcher_generation),
+                            );
+                        }
+                    }
+                }
+            }
             if let Event::MenuLoaded {
+                window_id,
                 endpoint,
                 request_id,
                 model,
                 ..
             } = &translated
             {
-                if menu_layout_reloads.complete_load(endpoint, *request_id, model.revision) {
+                let follow_up =
+                    menu_layout_reloads.complete_load(endpoint, *request_id, model.revision);
+                if follow_up
+                    || state
+                        .menu_interaction
+                        .pending_lazy_root
+                        .as_ref()
+                        .is_some_and(|pending| pending.layout_request_id == Some(*request_id))
+                {
+                    let next_request_id = if follow_up {
+                        let id = next_menu_request_id;
+                        next_menu_request_id += 1;
+                        Some(id)
+                    } else {
+                        None
+                    };
+                    let convergence = Event::MenuLazyRootLoadConvergence {
+                        window_id: *window_id,
+                        endpoint: endpoint.clone(),
+                        request_id: *request_id,
+                        follow_up_request_id: next_request_id,
+                    };
+                    core::reduce(
+                        &mut state,
+                        convergence,
+                        &mut registry.lock().expect("registry poisoned"),
+                    );
+                }
+                if follow_up {
                     request_menu = true;
+                }
+            }
+            if reduced
+                && matches!(
+                    &translated,
+                    Event::MenuAboutToShowCompleted {
+                        lazy_root: true,
+                        error: None,
+                        intent_id: Some(_),
+                        watcher_generation: Some(_),
+                        ..
+                    }
+                )
+            {
+                if let Event::MenuAboutToShowCompleted {
+                    window_id,
+                    endpoint: MenuSource::DbusMenu(endpoint),
+                    item_id: _,
+                    request_id: _,
+                    intent_id: Some(intent_id),
+                    watcher_generation: Some(watcher_generation),
+                    ..
+                } = &translated
+                {
+                    let layout_request_id = next_menu_request_id;
+                    next_menu_request_id += 1;
+                    let layout_event = Event::MenuLazyRootLayoutRequested {
+                        window_id: *window_id,
+                        endpoint: MenuSource::DbusMenu(endpoint.clone()),
+                        request_id: layout_request_id,
+                        intent_id: *intent_id,
+                        watcher_generation: *watcher_generation,
+                    };
+                    if core::reduce(
+                        &mut state,
+                        layout_event,
+                        &mut registry.lock().expect("registry poisoned"),
+                    ) {
+                        dirty = true;
+                        render_target = Some(RenderTarget::DockContext);
+                        let source = MenuSource::DbusMenu(endpoint.clone());
+                        menu_layout_reloads.begin_load(source, layout_request_id);
+                        dbus.request_layout(*window_id, endpoint.clone(), layout_request_id);
+                    }
                 }
             }
             if trace && matches!(translated, Event::ActiveAiUsageChanged(_)) {
@@ -1118,6 +1245,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 endpoint: endpoint.clone(),
                                 item_id,
                                 request_id,
+                                lazy_root: false,
+                                intent_id: None,
+                                watcher_generation: None,
                             };
                             if core::reduce(
                                 &mut state,
@@ -1140,7 +1270,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                                     endpoint
                                 {
                                     dbus.request_about_to_show(
-                                        window_id, endpoint, item_id, request_id,
+                                        window_id, endpoint, item_id, request_id, false, None, None,
                                     );
                                 }
                                 if trace {
@@ -1165,8 +1295,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                     state.focused_window,
                     state.active_menu_endpoint(&registry_guard),
                 ) {
-                    let request_id = next_menu_request_id;
-                    next_menu_request_id += 1;
+                    let request_id = state
+                        .menu_interaction
+                        .pending_lazy_root
+                        .as_ref()
+                        .filter(|pending| {
+                            pending.window_id == window_id && pending.endpoint == endpoint
+                        })
+                        .and_then(|pending| pending.layout_request_id)
+                        .unwrap_or_else(|| {
+                            let id = next_menu_request_id;
+                            next_menu_request_id += 1;
+                            id
+                        });
                     let request_event = Event::MenuLoadRequested {
                         window_id,
                         endpoint: endpoint.clone(),
@@ -1254,6 +1395,8 @@ fn render_target_for(
         | Event::MenuUnregistered { .. }
         | Event::MenuOwnerVanished { .. }
         | Event::MenuLoadRequested { .. }
+        | Event::MenuLazyRootLayoutRequested { .. }
+        | Event::MenuLazyRootLoadConvergence { .. }
         | Event::MenuLoaded { .. }
         | Event::MenuLoadFailed { .. }
         | Event::MenuLayoutInvalidated { .. }
@@ -1369,4 +1512,29 @@ fn tray_action_event(
             root_y: *root_y,
         })
         .unwrap_or_else(|| event.clone())
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::should_schedule_invalidation;
+
+    #[test]
+    fn lazy_about_to_show_suppresses_invalidation_load() {
+        assert!(!should_schedule_invalidation(false, true, false, true));
+    }
+
+    #[test]
+    fn completed_lazy_about_to_show_allows_one_canonical_load() {
+        assert!(should_schedule_invalidation(false, true, false, false));
+    }
+
+    #[test]
+    fn in_flight_load_blocks_parallel_invalidation_load() {
+        assert!(!should_schedule_invalidation(false, true, true, false));
+    }
+
+    #[test]
+    fn stale_invalidation_never_schedules_a_load() {
+        assert!(!should_schedule_invalidation(true, true, false, false));
+    }
 }

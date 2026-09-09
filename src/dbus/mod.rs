@@ -150,6 +150,9 @@ struct AboutRequest {
     endpoint: crate::core::MenuEndpoint,
     item_id: crate::core::MenuItemId,
     request_id: u64,
+    lazy_root: bool,
+    intent_id: Option<u64>,
+    watcher_generation: Option<u64>,
 }
 #[derive(Clone, Debug)]
 struct ActivateRequest {
@@ -486,18 +489,25 @@ impl DbusBridge {
     pub fn end_menu_watcher(&self, endpoint: MenuEndpoint) {
         let _ = self.requests.try_send(Request::EndMenuWatcher(endpoint));
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn request_about_to_show(
         &self,
         window_id: crate::core::WindowId,
         endpoint: crate::core::MenuEndpoint,
         item_id: crate::core::MenuItemId,
         request_id: u64,
+        lazy_root: bool,
+        intent_id: Option<u64>,
+        watcher_generation: Option<u64>,
     ) {
         let _ = self.requests.try_send(Request::About(AboutRequest {
             window_id,
             endpoint,
             item_id,
             request_id,
+            lazy_root,
+            intent_id,
+            watcher_generation,
         }));
     }
 
@@ -1941,6 +1951,9 @@ async fn run(
                         endpoint: MenuSource::DbusMenu(request.endpoint),
                         item_id: request.item_id,
                         request_id: request.request_id,
+                        lazy_root: request.lazy_root,
+                        intent_id: request.intent_id,
+                        watcher_generation: request.watcher_generation,
                         need_update,
                         model,
                         error,
@@ -2333,16 +2346,7 @@ async fn about_to_show(
         .call("AboutToShow", &(request.item_id.0,))
         .await
         .map_err(|e| e.to_string())?;
-    if need_update {
-        let layout_request = LayoutRequest {
-            window_id: request.window_id,
-            endpoint: request.endpoint.clone(),
-            request_id: request.request_id,
-        };
-        Ok((true, Some(load_layout(connection, &layout_request).await?)))
-    } else {
-        Ok((false, None))
-    }
+    Ok((need_update, None))
 }
 
 async fn load_layout(
