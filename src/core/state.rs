@@ -359,6 +359,16 @@ pub struct LazyRootOpenPending {
     pub layout_request_id: Option<u64>,
 }
 
+/// Identifies the remote source currently allowed to present and update the
+/// canonical global-menu model.  It is deliberately independent from real
+/// X11 focus: K0 still follows focus, while a later interaction session can
+/// retain this identity without freezing `focused_window`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MenuPresentation {
+    pub window_id: WindowId,
+    pub endpoint: MenuSource,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct State {
     pub outputs: Vec<OutputState>,
@@ -366,6 +376,7 @@ pub struct State {
     pub focused_workspace: Option<String>,
     pub focused_window: Option<WindowId>,
     pub focused_app_name: Option<String>,
+    pub menu_presentation: Option<MenuPresentation>,
     pub menu: MenuState,
     pub global_menu_model: Option<(WindowId, MenuSource, MenuModel)>,
     pub watcher_generations: HashMap<MenuSource, u64>,
@@ -441,7 +452,26 @@ impl State {
     }
 
     pub fn active_menu_endpoint(&self, registry: &super::MenuRegistry) -> Option<MenuSource> {
-        registry.active(self.focused_window)
+        self.menu_presentation
+            .as_ref()
+            .map(|presentation| presentation.endpoint.clone())
+            .or_else(|| registry.active(self.focused_window))
+    }
+
+    pub fn menu_presentation_matches(&self, window_id: WindowId, endpoint: &MenuSource) -> bool {
+        self.menu_presentation.as_ref().map_or_else(
+            || self.focused_window == Some(window_id),
+            |presentation| {
+                presentation.window_id == window_id && presentation.endpoint == *endpoint
+            },
+        )
+    }
+
+    pub fn menu_presentation_window(&self) -> Option<WindowId> {
+        self.menu_presentation
+            .as_ref()
+            .map(|presentation| presentation.window_id)
+            .or(self.focused_window)
     }
 
     pub fn current_menu_source(&self, registry: &super::MenuRegistry) -> Option<MenuSource> {

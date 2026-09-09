@@ -370,7 +370,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         MenuSource::Tray(endpoint) => {
                             (core::WindowId(u32::MAX), MenuSource::Tray(endpoint))
                         }
-                        endpoint => (state.focused_window?, endpoint),
+                        endpoint => (state.menu_presentation_window()?, endpoint),
                     };
                     let menu_item = state
                         .active_menu_model()
@@ -1229,7 +1229,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                             if matches!(source, MenuSource::Tray(_)) {
                                 Some(core::WindowId(u32::MAX))
                             } else {
-                                state.focused_window
+                                state.menu_presentation_window()
                             }
                         });
                         if trace {
@@ -1307,7 +1307,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             if request_menu {
                 let mut registry_guard = registry.lock().expect("registry poisoned");
                 if let (Some(window_id), Some(endpoint)) = (
-                    state.focused_window,
+                    state.menu_presentation_window(),
                     state.active_menu_endpoint(&registry_guard),
                 ) {
                     let request_id = state

@@ -1,4 +1,4 @@
-use super::state::{LazyRootOpenPending, MenuInteractionState};
+use super::state::{LazyRootOpenPending, MenuInteractionState, MenuPresentation};
 use super::{Event, MenuItemId, MenuRegistry, MenuSource, MenuState, State};
 
 fn item(model: &super::MenuModel, id: MenuItemId) -> Option<&super::MenuItem> {
@@ -88,6 +88,30 @@ fn dismiss_menu_presentation(state: &mut State) -> bool {
     let changed = state.menu_interaction != MenuInteractionState::default();
     state.menu_interaction = Default::default();
     changed
+}
+
+fn reconcile_menu_presentation_to_focus(state: &mut State, registry: &MenuRegistry) {
+    state.menu_presentation = state.focused_window.and_then(|window_id| {
+        registry
+            .active(Some(window_id))
+            .map(|endpoint| MenuPresentation {
+                window_id,
+                endpoint,
+            })
+    });
+    state.menu = MenuState::NoMenu;
+    state.menu_interaction = Default::default();
+    state.global_menu_model = None;
+}
+
+fn presentation_matches_registry(
+    state: &State,
+    registry: &MenuRegistry,
+    window_id: super::WindowId,
+    endpoint: &MenuSource,
+) -> bool {
+    state.menu_presentation_matches(window_id, endpoint)
+        && registry.source_matches(window_id, endpoint)
 }
 
 fn patch_item(node: &mut super::MenuItem, update: &super::MenuItemPropertiesUpdate) -> bool {
@@ -204,9 +228,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             }
             state.focused_window = window;
             state.focused_app_name = None;
-            state.menu = MenuState::NoMenu;
-            state.menu_interaction = Default::default();
-            state.global_menu_model = None;
+            reconcile_menu_presentation_to_focus(state, registry);
             state.audio_popup_open = false;
             state.audio_dragging = false;
             state.audio_drag_input = false;
@@ -222,9 +244,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             }
             state.focused_window = window;
             state.focused_app_name = app_name;
-            state.menu = MenuState::NoMenu;
-            state.menu_interaction = Default::default();
-            state.global_menu_model = None;
+            reconcile_menu_presentation_to_focus(state, registry);
             state.audio_popup_open = false;
             state.audio_dragging = false;
             state.audio_drag_input = false;
@@ -242,9 +262,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             };
             registry.register(window_id, endpoint.service, endpoint.object_path);
             if state.focused_window == Some(window_id) {
-                state.menu = MenuState::NoMenu;
-                state.menu_interaction = Default::default();
-                state.global_menu_model = None;
+                reconcile_menu_presentation_to_focus(state, registry);
             }
             true
         }
@@ -255,9 +273,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             let changed = registry.gtk(window_id) != Some(&endpoint);
             registry.register_gtk(window_id, endpoint);
             if changed && state.focused_window == Some(window_id) {
-                state.menu = MenuState::NoMenu;
-                state.menu_interaction = Default::default();
-                state.global_menu_model = None;
+                reconcile_menu_presentation_to_focus(state, registry);
             }
             changed
         }
@@ -267,12 +283,13 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         } => {
             let removed = registry.remove_gtk_if_matches(window_id, &endpoint);
             if removed
-                && state.focused_window == Some(window_id)
+                && state.menu_presentation_window() == Some(window_id)
                 && registry.get(window_id).is_none()
             {
                 state.menu = MenuState::NoMenu;
                 state.menu_interaction = Default::default();
                 state.global_menu_model = None;
+                state.menu_presentation = None;
             }
             removed
         }
@@ -284,10 +301,11 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                     .watcher_generations
                     .remove(&MenuSource::DbusMenu(endpoint));
             }
-            if removed && state.focused_window == Some(window_id) {
+            if removed && state.menu_presentation_window() == Some(window_id) {
                 state.menu = MenuState::NoMenu;
                 state.menu_interaction = Default::default();
                 state.global_menu_model = None;
+                state.menu_presentation = None;
             }
             removed
         }
@@ -297,12 +315,13 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 !matches!(endpoint, MenuSource::DbusMenu(endpoint) if endpoint.service == sender)
             });
             if state
-                .focused_window
+                .menu_presentation_window()
                 .is_some_and(|window| removed.contains(&window))
             {
                 state.menu = MenuState::NoMenu;
                 state.menu_interaction = Default::default();
                 state.global_menu_model = None;
+                state.menu_presentation = None;
             }
             !removed.is_empty()
         }
@@ -312,8 +331,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             request_id,
         } => {
             if (matches!(endpoint, MenuSource::Tray(_)) && window_id == super::WindowId(u32::MAX))
-                || (state.focused_window == Some(window_id)
-                    && registry.source_matches(window_id, &endpoint))
+                || presentation_matches_registry(state, registry, window_id, &endpoint)
             {
                 state.audio_popup_open = false;
                 state.audio_dragging = false;
@@ -354,8 +372,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                         && pending.watcher_generation == watcher_generation
                         && state.watcher_generations.get(&endpoint) == Some(&watcher_generation)
                 })
-                && (state.focused_window == Some(window_id)
-                    && registry.source_matches(window_id, &endpoint));
+                && presentation_matches_registry(state, registry, window_id, &endpoint);
             if !valid {
                 return false;
             }
@@ -404,7 +421,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 MenuState::Loading { window_id: w, endpoint: e, request_id: r }
                 if *w == window_id && *e == endpoint && *r == request_id
                     && ((matches!(endpoint, MenuSource::Tray(_)) && window_id == super::WindowId(u32::MAX))
-                        || (state.focused_window == Some(window_id) && registry.source_matches(window_id, &endpoint))));
+                        || presentation_matches_registry(state, registry, window_id, &endpoint)));
             if accepted {
                 let pending_lazy_root = state.menu_interaction.pending_lazy_root.clone();
                 state.menu = MenuState::Loaded {
@@ -464,7 +481,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 MenuState::Loading { window_id: w, endpoint: e, request_id: r }
                 if *w == window_id && *e == endpoint && *r == request_id
                     && ((matches!(endpoint, MenuSource::Tray(_)) && window_id == super::WindowId(u32::MAX))
-                        || (state.focused_window == Some(window_id) && registry.source_matches(window_id, &endpoint))));
+                        || presentation_matches_registry(state, registry, window_id, &endpoint)));
             if accepted {
                 state.menu = MenuState::Error {
                     window_id,
@@ -536,9 +553,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             endpoint, updates, ..
         } => {
             if !matches!(&state.menu, MenuState::Loaded { endpoint: current, .. } if current == &endpoint)
-                || !state
-                    .focused_window
-                    .is_some_and(|window| registry.source_matches(window, &endpoint))
+                || state.active_menu_endpoint(registry).as_ref() != Some(&endpoint)
             {
                 return false;
             }
@@ -646,8 +661,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         } => {
             let valid_context = ((matches!(endpoint, MenuSource::Tray(_))
                 && window_id == super::WindowId(u32::MAX))
-                || (state.focused_window == Some(window_id)
-                    && registry.source_matches(window_id, &endpoint)))
+                || presentation_matches_registry(state, registry, window_id, &endpoint))
                 && (matches!(&state.menu, MenuState::Loaded { window_id: current_window, endpoint: current_endpoint, .. }
                     if *current_window == window_id && *current_endpoint == endpoint)
                     || matches!(&state.menu, MenuState::TrayLoaded { endpoint: current_endpoint, .. }
@@ -761,8 +775,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             };
             let valid = ((matches!(endpoint, MenuSource::Tray(_))
                 && window_id == super::WindowId(u32::MAX))
-                || (state.focused_window == Some(window_id)
-                    && registry.source_matches(window_id, &endpoint)))
+                || presentation_matches_registry(state, registry, window_id, &endpoint))
                 && (matches!(&state.menu, MenuState::Loaded { endpoint: current, .. } if current == &endpoint)
                     || matches!(&state.menu, MenuState::TrayLoaded { endpoint: current, .. }
                         if MenuSource::Tray(current.clone()) == endpoint))
@@ -801,8 +814,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 Some(p) if p.window_id == window_id && p.endpoint == endpoint && p.item_id == item_id && p.request_id == request_id && p.lazy_root == lazy_root && p.intent_id == intent_id && p.watcher_generation == watcher_generation)
                 && ((matches!(endpoint, MenuSource::Tray(_))
                     && window_id == super::WindowId(u32::MAX))
-                    || (state.focused_window == Some(window_id)
-                        && registry.source_matches(window_id, &endpoint)))
+                    || presentation_matches_registry(state, registry, window_id, &endpoint))
                 && ((lazy_root
                     && state
                         .menu_interaction
@@ -2524,6 +2536,357 @@ mod tests {
     }
 
     #[test]
+    fn presentation_identity_can_remain_a_while_real_focus_is_b() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let source_a = MenuSource::DbusMenu(ep());
+        let source_b = MenuSource::DbusMenu(MenuEndpoint {
+            service: ":1.10".into(),
+            object_path: "/menu-b".into(),
+        });
+        reduce(
+            &mut state,
+            Event::MenuRegistered {
+                window_id: WindowId(7),
+                endpoint: source_a.clone(),
+            },
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::MenuRegistered {
+                window_id: WindowId(8),
+                endpoint: source_b,
+            },
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(7))),
+            &mut registry,
+        );
+        let presented_model = model();
+        state.menu = MenuState::Loaded {
+            window_id: WindowId(7),
+            endpoint: source_a.clone(),
+            model: presented_model.clone(),
+        };
+
+        state.focused_window = Some(WindowId(8));
+
+        assert_eq!(state.menu_presentation_window(), Some(WindowId(7)));
+        assert_eq!(state.active_menu_endpoint(&registry), Some(source_a));
+        assert_eq!(state.active_menu_model(), Some(&presented_model));
+    }
+
+    #[test]
+    fn endpoint_scoped_properties_update_the_current_presentation_not_focus() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let source = MenuSource::DbusMenu(ep());
+        for window_id in [WindowId(7), WindowId(8)] {
+            reduce(
+                &mut state,
+                Event::MenuRegistered {
+                    window_id,
+                    endpoint: source.clone(),
+                },
+                &mut registry,
+            );
+        }
+        reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(7))),
+            &mut registry,
+        );
+        state.menu = MenuState::Loaded {
+            window_id: WindowId(7),
+            endpoint: source.clone(),
+            model: model(),
+        };
+        state.focused_window = Some(WindowId(8));
+
+        assert!(reduce(
+            &mut state,
+            Event::MenuPropertiesUpdated {
+                endpoint: source.clone(),
+                watcher_generation: None,
+                updates: vec![super::super::MenuItemPropertiesUpdate {
+                    item_id: MenuItemId(0),
+                    properties: vec![super::super::MenuPropertyUpdate::Label(Some(
+                        "updated".into(),
+                    ))],
+                }],
+            },
+            &mut registry,
+        ));
+        assert!(!reduce(
+            &mut state,
+            Event::MenuPropertiesUpdated {
+                endpoint: MenuSource::DbusMenu(MenuEndpoint {
+                    service: ":1.other".into(),
+                    object_path: "/other".into(),
+                }),
+                watcher_generation: None,
+                updates: Vec::new(),
+            },
+            &mut registry,
+        ));
+    }
+
+    #[test]
+    fn endpoint_invalidation_reloads_the_presentation_window_not_real_focus() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let source = MenuSource::DbusMenu(ep());
+        for window_id in [WindowId(7), WindowId(8)] {
+            reduce(
+                &mut state,
+                Event::MenuRegistered {
+                    window_id,
+                    endpoint: source.clone(),
+                },
+                &mut registry,
+            );
+        }
+        reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(7))),
+            &mut registry,
+        );
+        state.focused_window = Some(WindowId(8));
+
+        assert_eq!(state.active_menu_endpoint(&registry), Some(source.clone()));
+        assert_eq!(state.menu_presentation_window(), Some(WindowId(7)));
+        assert!(reduce(
+            &mut state,
+            Event::MenuLoadRequested {
+                window_id: WindowId(7),
+                endpoint: source.clone(),
+                request_id: 71,
+            },
+            &mut registry,
+        ));
+        assert!(matches!(
+            state.menu,
+            MenuState::Loading {
+                window_id: WindowId(7),
+                endpoint: ref current,
+                request_id: 71,
+            } if current == &source
+        ));
+    }
+
+    #[test]
+    fn presentation_rejects_same_endpoint_load_for_non_presented_window() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let source = MenuSource::DbusMenu(ep());
+        for window_id in [WindowId(7), WindowId(8)] {
+            reduce(
+                &mut state,
+                Event::MenuRegistered {
+                    window_id,
+                    endpoint: source.clone(),
+                },
+                &mut registry,
+            );
+        }
+        reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(7))),
+            &mut registry,
+        );
+        state.focused_window = Some(WindowId(8));
+
+        assert!(!reduce(
+            &mut state,
+            Event::MenuLoadRequested {
+                window_id: WindowId(8),
+                endpoint: source,
+                request_id: 72,
+            },
+            &mut registry,
+        ));
+    }
+
+    #[test]
+    fn pinned_presentation_accepts_only_its_fenced_load_result() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let source = MenuSource::DbusMenu(ep());
+        reduce(
+            &mut state,
+            Event::MenuRegistered {
+                window_id: WindowId(7),
+                endpoint: source.clone(),
+            },
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(7))),
+            &mut registry,
+        );
+        assert!(reduce(
+            &mut state,
+            Event::MenuLoadRequested {
+                window_id: WindowId(7),
+                endpoint: source.clone(),
+                request_id: 73,
+            },
+            &mut registry,
+        ));
+        state.focused_window = Some(WindowId(8));
+
+        assert!(!reduce(
+            &mut state,
+            Event::MenuLoaded {
+                window_id: WindowId(7),
+                endpoint: source.clone(),
+                request_id: 74,
+                model: model(),
+            },
+            &mut registry,
+        ));
+        assert!(!reduce(
+            &mut state,
+            Event::MenuLoaded {
+                window_id: WindowId(8),
+                endpoint: source.clone(),
+                request_id: 73,
+                model: model(),
+            },
+            &mut registry,
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::MenuLoaded {
+                window_id: WindowId(7),
+                endpoint: source,
+                request_id: 73,
+                model: model(),
+            },
+            &mut registry,
+        ));
+    }
+
+    #[test]
+    fn follow_focus_replaces_presentation_and_no_menu_clears_it() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let source_a = MenuSource::DbusMenu(ep());
+        let source_b = MenuSource::DbusMenu(MenuEndpoint {
+            service: ":1.10".into(),
+            object_path: "/menu-b".into(),
+        });
+        for (window_id, endpoint) in [
+            (WindowId(7), source_a.clone()),
+            (WindowId(8), source_b.clone()),
+        ] {
+            reduce(
+                &mut state,
+                Event::MenuRegistered {
+                    window_id,
+                    endpoint,
+                },
+                &mut registry,
+            );
+        }
+        reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(7))),
+            &mut registry,
+        );
+        assert_eq!(state.active_menu_endpoint(&registry), Some(source_a));
+        reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry,
+        );
+        assert_eq!(state.active_menu_endpoint(&registry), Some(source_b));
+        reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(9))),
+            &mut registry,
+        );
+        assert!(state.menu_presentation.is_none());
+        assert!(matches!(state.menu, MenuState::NoMenu));
+    }
+
+    #[test]
+    fn presentation_lifecycle_is_scoped_to_the_presented_window() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let source_a = MenuSource::DbusMenu(ep());
+        let source_b = MenuSource::DbusMenu(MenuEndpoint {
+            service: ":1.10".into(),
+            object_path: "/menu-b".into(),
+        });
+        for (window_id, endpoint) in [(WindowId(7), source_a.clone()), (WindowId(8), source_b)] {
+            reduce(
+                &mut state,
+                Event::MenuRegistered {
+                    window_id,
+                    endpoint,
+                },
+                &mut registry,
+            );
+        }
+        reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(7))),
+            &mut registry,
+        );
+        state.focused_window = Some(WindowId(8));
+
+        assert!(reduce(
+            &mut state,
+            Event::MenuUnregistered {
+                window_id: WindowId(8),
+            },
+            &mut registry,
+        ));
+        assert_eq!(
+            state.active_menu_endpoint(&registry),
+            Some(source_a.clone())
+        );
+        assert!(reduce(
+            &mut state,
+            Event::MenuUnregistered {
+                window_id: WindowId(7),
+            },
+            &mut registry,
+        ));
+        assert!(state.menu_presentation.is_none());
+    }
+
+    #[test]
+    fn reconciliation_reads_current_focus_when_it_is_invoked_later() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let source_a = MenuSource::DbusMenu(ep());
+        let source_b = MenuSource::DbusMenu(MenuEndpoint {
+            service: ":1.10".into(),
+            object_path: "/menu-b".into(),
+        });
+        for (window_id, endpoint) in [(WindowId(7), source_a), (WindowId(8), source_b.clone())] {
+            reduce(
+                &mut state,
+                Event::MenuRegistered {
+                    window_id,
+                    endpoint,
+                },
+                &mut registry,
+            );
+        }
+        state.focused_window = Some(WindowId(8));
+        reconcile_menu_presentation_to_focus(&mut state, &registry);
+        assert_eq!(state.menu_presentation_window(), Some(WindowId(8)));
+        assert_eq!(state.active_menu_endpoint(&registry), Some(source_b));
+    }
+
+    #[test]
     fn owner_vanishing_removes_registrations() {
         let mut state = State::default();
         let mut registry = MenuRegistry::default();
@@ -3244,6 +3607,29 @@ mod tests {
                 registry,
             ));
         }
+    }
+
+    #[test]
+    fn lazy_root_flow_accepts_presented_a_while_real_focus_is_b() {
+        let (mut state, mut registry) = lazy_root_state();
+        state.menu_presentation = Some(super::super::state::MenuPresentation {
+            window_id: WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
+        state.focused_window = Some(WindowId(8));
+
+        click_lazy_root(&mut state, &mut registry);
+        request_lazy_root(&mut state, &mut registry, 91);
+        complete_lazy_root(
+            &mut state,
+            &mut registry,
+            91,
+            Some(interactive_model()),
+            true,
+        );
+
+        assert_eq!(state.menu_presentation_window(), Some(WindowId(7)));
+        assert!(state.menu_interaction.open_root.is_some());
     }
 
     #[test]
