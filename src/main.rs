@@ -3,6 +3,7 @@ mod clock;
 mod core;
 mod dbus;
 mod i3;
+mod logging;
 mod notifications;
 mod platform;
 mod ui;
@@ -28,7 +29,21 @@ fn should_schedule_invalidation(
         && !lazy_about_to_show_pending
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
+    logging::init();
+    logging::install_panic_hook();
+    logging::info("START", &format!("pid={}", std::process::id()));
+    match run() {
+        Ok(()) => logging::info("EXIT", "normal"),
+        Err(error) => {
+            logging::error("ERROR", &format!("{error:?}"));
+            eprintln!("Error: {error:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     let mut x11 = X11Platform::connect()?;
     if !x11.acquire_instance()? {
         eprintln!("xbar: another instance already owns _XBAR_INSTANCE");
