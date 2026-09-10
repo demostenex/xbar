@@ -277,6 +277,7 @@ pub struct X11Platform {
     windows: Vec<BarWindow>,
     popups: Vec<PopupWindow>,
     audio_popup: Option<AudioPopupWindow>,
+    audio_backing: Option<PopupBacking>,
     bluetooth_popup: Option<BluetoothPopupWindow>,
     network_popup: Option<NetworkPopupWindow>,
     popup_hover: Option<PopupHover>,
@@ -379,6 +380,21 @@ struct AudioPopupWindow {
     input_mute: layout::MenuRect,
     output_devices: Vec<layout::AudioDeviceRow>,
     input_devices: Vec<layout::AudioDeviceRow>,
+}
+
+#[derive(Clone, Copy)]
+struct PopupBacking {
+    pixmap: u32,
+    gc: u32,
+    width: u16,
+    height: u16,
+    depth: u8,
+}
+
+fn backing_matches(backing: Option<PopupBacking>, width: u16, height: u16, depth: u8) -> bool {
+    backing.is_some_and(|backing| {
+        backing.width == width && backing.height == height && backing.depth == depth
+    })
 }
 struct BluetoothPopupWindow {
     window: u32,
@@ -1097,6 +1113,7 @@ impl X11Platform {
             windows: Vec::new(),
             popups: Vec::new(),
             audio_popup: None,
+            audio_backing: None,
             bluetooth_popup: None,
             network_popup: None,
             popup_hover: None,
@@ -2678,6 +2695,11 @@ impl X11Platform {
             self.text.release_drawable(popup.window);
             trace_x11_resource("WINDOW_DESTROY", "audio-popup", popup.window);
             self.conn.destroy_window(popup.window)?.check()?;
+            if let Some(backing) = self.audio_backing.take() {
+                self.text.release_drawable(backing.pixmap);
+                self.conn.free_gc(backing.gc)?.check()?;
+                self.conn.free_pixmap(backing.pixmap)?.check()?;
+            }
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!("xbar trace: audio popup destroyed xid={}", popup.window);
             }
@@ -2868,6 +2890,69 @@ impl X11Platform {
                 input_devices: input_devices.clone(),
             });
         }
+        let backing_replaced = !backing_matches(
+            self.audio_backing,
+            rect.width,
+            rect.height,
+            self.glass_surface.depth,
+        );
+        if backing_replaced {
+            let pixmap = self.conn.generate_id()?;
+            let create_result = self
+                .conn
+                .create_pixmap(
+                    self.glass_surface.depth,
+                    pixmap,
+                    self.root,
+                    rect.width,
+                    rect.height,
+                )?
+                .check();
+            if let Err(error) = create_result {
+                if matches!(
+                    error,
+                    x11rb::errors::ReplyError::X11Error(ref error)
+                        if error.error_kind == x11rb::protocol::ErrorKind::Alloc
+                ) {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+            let gc = self.conn.generate_id()?;
+            let gc_result = self
+                .conn
+                .create_gc(
+                    gc,
+                    pixmap,
+                    &xproto::CreateGCAux::new().foreground(
+                        self.glass_surface
+                            .background_pixel(POPUP_STYLE.material.background),
+                    ),
+                )?
+                .check();
+            if let Err(error) = gc_result {
+                self.conn.free_pixmap(pixmap)?.check()?;
+                if matches!(
+                    error,
+                    x11rb::errors::ReplyError::X11Error(ref error)
+                        if error.error_kind == x11rb::protocol::ErrorKind::Alloc
+                ) {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+            if let Some(old) = self.audio_backing.replace(PopupBacking {
+                pixmap,
+                gc,
+                width: rect.width,
+                height: rect.height,
+                depth: self.glass_surface.depth,
+            }) {
+                self.conn.free_gc(old.gc)?.check()?;
+                self.conn.free_pixmap(old.pixmap)?.check()?;
+            }
+        }
+        let backing = self.audio_backing.expect("audio backing created");
         if self.audio_popup.is_some() && needs_resize {
             self.conn
                 .configure_window(
@@ -2891,31 +2976,19 @@ impl X11Platform {
             )?;
         }
         self.text
-            .prepare_drawable("audio-popup", window, self.glass_surface)?;
-        let gc = self.conn.generate_id()?;
-        self.conn
-            .create_gc(
-                gc,
-                window,
-                &xproto::CreateGCAux::new().foreground(
-                    self.glass_surface
-                        .background_pixel(POPUP_STYLE.material.background),
-                ),
-            )?
-            .check()?;
-        if !self.should_skip_popup_clear_for_hover() {
-            self.fill_glass_background(window, gc, rect.width, rect.height)?;
-            self.draw_popup_frame(window, gc, rect.width, rect.height)?;
-        }
+            .prepare_drawable("audio-popup", backing.pixmap, self.glass_surface)?;
+        let gc = backing.gc;
+        self.fill_glass_background(backing.pixmap, gc, rect.width, rect.height)?;
+        self.draw_popup_frame(backing.pixmap, gc, rect.width, rect.height)?;
         for card in [master_card, input_control_card, output_card, input_card] {
-            self.draw_popup_card(window, gc, rect, card)?;
+            self.draw_popup_card(backing.pixmap, gc, rect, card)?;
         }
         for device in &output_devices {
             if matches!(
                 self.popup_hover,
                 Some(PopupHover::AudioOutputDevice(ref name)) if name == &device.name
             ) {
-                self.draw_popup_hover(window, gc, rect, device.rect)?;
+                self.draw_popup_hover(backing.pixmap, gc, rect, device.rect)?;
             }
         }
         for device in &input_devices {
@@ -2923,9 +2996,11 @@ impl X11Platform {
                 self.popup_hover,
                 Some(PopupHover::AudioInputDevice(ref name)) if name == &device.name
             ) {
-                self.draw_popup_hover(window, gc, rect, device.rect)?;
+                self.draw_popup_hover(backing.pixmap, gc, rect, device.rect)?;
             }
         }
+        self.conn.flush()?;
+        self.conn.get_input_focus()?.reply()?;
         self.text.draw_popup_utf8(
             "Som",
             audio_content_x as i32,
@@ -2990,7 +3065,7 @@ impl X11Platform {
                 BAR_STYLE.material.foreground,
             )?;
         }
-        self.draw_audio_slider(window, gc, track, state.audio.volume_percent)?;
+        self.draw_audio_slider(backing.pixmap, gc, track, state.audio.volume_percent)?;
         self.text.draw_popup_utf8(
             "Mudo",
             audio_content_x as i32,
@@ -3013,14 +3088,27 @@ impl X11Platform {
             (input_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 40) as i32,
             BAR_STYLE.material.foreground,
         )?;
-        self.draw_audio_slider(window, gc, input_track, state.audio.input_volume_percent)?;
+        self.draw_audio_slider(backing.pixmap, gc, input_track, state.audio.input_volume_percent)?;
         self.text.draw_popup_utf8(
             "Mudo",
             audio_content_x as i32,
             (input_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 82) as i32,
             BAR_STYLE.material.foreground,
         )?;
-        self.conn.free_gc(gc)?.check()?;
+        self.text.release_drawable(backing.pixmap);
+        self.conn
+            .copy_area(
+                backing.pixmap,
+                window,
+                gc,
+                0,
+                0,
+                0,
+                0,
+                rect.width,
+                rect.height,
+            )?
+            .check()?;
         if !self.pointer_grabbed {
             let grab = self
                 .conn
@@ -4246,7 +4334,7 @@ mod tests {
         network_primary_row_label, popup_effect_owner, popup_hover_for, popup_hover_transition,
         preserve_color_pixel, template_icon_pixel, tray_draw_size, tray_hit, AttentionPropertyRead,
         BarWindow, GlobalPinShortcut, HitTarget, PopupHover, RenderTarget, SurfaceWindowGeometry,
-        X11Event,
+        PopupBacking, X11Event, backing_matches,
     };
     use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
     use crate::ui::{layout::MenuRect, view::TrayIconRenderMode, view::TrayVisualItem};
@@ -5040,5 +5128,21 @@ mod tests {
             network_primary_row_label("Guest 5 GHz", true),
             "● Guest 5 GHz"
         );
+    }
+
+    #[test]
+    fn audio_backing_reuses_only_matching_geometry_and_depth() {
+        let backing = Some(PopupBacking {
+            pixmap: 1,
+            gc: 2,
+            width: 340,
+            height: 400,
+            depth: 32,
+        });
+        assert!(backing_matches(backing, 340, 400, 32));
+        assert!(!backing_matches(backing, 341, 400, 32));
+        assert!(!backing_matches(backing, 340, 401, 32));
+        assert!(!backing_matches(backing, 340, 400, 24));
+        assert!(!backing_matches(None, 340, 400, 32));
     }
 }
