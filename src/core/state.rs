@@ -370,6 +370,32 @@ pub struct MenuPresentation {
     pub endpoint: MenuSource,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum MenuPresentationPolicy {
+    #[default]
+    FollowFocus,
+    Pinned {
+        workspace: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum KeyboardGrabState {
+    #[default]
+    Requested,
+    Active,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MenuNavigationSession {
+    pub id: u64,
+    pub source_window: WindowId,
+    pub endpoint: MenuSource,
+    pub selected_path: Option<Vec<super::MenuItemId>>,
+    pub grab_state: KeyboardGrabState,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct State {
     pub outputs: Vec<OutputState>,
@@ -378,6 +404,10 @@ pub struct State {
     pub focused_window: Option<WindowId>,
     pub focused_app_name: Option<String>,
     pub menu_presentation: Option<MenuPresentation>,
+    pub menu_presentation_policy: MenuPresentationPolicy,
+    pub menu_presentation_needs_focus_reconciliation: bool,
+    pub menu_navigation: Option<MenuNavigationSession>,
+    pub next_menu_navigation_session: u64,
     pub menu: MenuState,
     pub global_menu_model: Option<(WindowId, MenuSource, MenuModel)>,
     pub watcher_generations: HashMap<MenuSource, u64>,

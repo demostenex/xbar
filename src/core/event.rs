@@ -82,6 +82,23 @@ pub enum Event {
         path: Vec<MenuItemId>,
     },
     MenuClickedOutside,
+    PinCurrentMenuPresentation,
+    UnpinMenuPresentation,
+    #[allow(dead_code)] // Reserved for the future native global shortcut.
+    ToggleMenuPresentationPin,
+    MenuNavigationStarted,
+    MenuNavigateLeft,
+    MenuNavigateRight,
+    MenuNavigateUp,
+    MenuNavigateDown,
+    MenuNavigateEnter,
+    MenuNavigateEscape,
+    KeyboardGrabAcquired {
+        session_id: u64,
+    },
+    KeyboardGrabFailed {
+        session_id: u64,
+    },
     TrayMenuOpenRequested {
         endpoint: super::MenuEndpoint,
     },

@@ -29,6 +29,29 @@ fn should_schedule_invalidation(
         && !lazy_about_to_show_pending
 }
 
+fn same_lazy_root_request(
+    left: &core::LazyRootOpenPending,
+    right: &core::LazyRootOpenPending,
+) -> bool {
+    left.window_id == right.window_id
+        && left.endpoint == right.endpoint
+        && left.item_id == right.item_id
+        && left.intent_id == right.intent_id
+        && left.watcher_generation == right.watcher_generation
+}
+
+fn pending_lazy_root_to_schedule<'a>(
+    before: Option<&core::LazyRootOpenPending>,
+    after: Option<&'a core::LazyRootOpenPending>,
+) -> Option<&'a core::LazyRootOpenPending> {
+    let after = after?;
+    if before.is_some_and(|before| same_lazy_root_request(before, after)) {
+        None
+    } else {
+        Some(after)
+    }
+}
+
 fn main() {
     logging::init();
     logging::install_panic_hook();
@@ -393,6 +416,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                 _ => None,
             };
             let translated = match (&event, mouse_target.as_ref()) {
+                (Event::X11(x11_event @ platform::x11::X11Event::KeyPress { .. }), _) => x11
+                    .global_pin_shortcut_event(x11_event)
+                    .or_else(|| x11.global_navigation_shortcut_event(x11_event))
+                    .unwrap_or(keyboard_event(
+                        &event,
+                        &state,
+                        &registry.lock().expect("registry poisoned"),
+                        &x11,
+                    )?),
+                (Event::X11(x11_event @ platform::x11::X11Event::KeyRelease { .. }), _) => {
+                    let _ = x11.global_pin_shortcut_event(x11_event);
+                    let _ = x11.global_navigation_shortcut_event(x11_event);
+                    event.clone()
+                }
                 (Event::X11(platform::x11::X11Event::ButtonRelease { button: 1, .. }), _)
                     if state.audio_dragging =>
                 {
@@ -734,7 +771,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         == Some(current.clone())
             );
             let mut request_menu = !stale_layout
-                && (matches!(
+                && ((matches!(
                     &translated,
                     Event::WindowFocused(_)
                         | Event::WindowFocusedWithApp { .. }
@@ -743,17 +780,32 @@ fn run() -> Result<(), Box<dyn Error>> {
                         | Event::GtkMenuRemoved { .. }
                         | Event::MenuUnregistered { .. }
                         | Event::MenuOwnerVanished { .. }
-                ) || should_schedule_invalidation(
-                    stale_layout,
-                    accepted_layout_invalidation,
-                    layout_in_flight,
-                    state
-                        .menu_interaction
-                        .pending_about_to_show
-                        .as_ref()
-                        .is_some_and(|pending| pending.lazy_root),
-                ) || (matches!(&translated, Event::MenuRootClicked(_))
-                    && matches!(state.menu, core::MenuState::TrayLoaded { .. })));
+                ) && state.menu_navigation.is_none()
+                    && matches!(
+                        state.menu_presentation_policy,
+                        core::MenuPresentationPolicy::FollowFocus
+                    ))
+                    || should_schedule_invalidation(
+                        stale_layout,
+                        accepted_layout_invalidation,
+                        layout_in_flight,
+                        state
+                            .menu_interaction
+                            .pending_about_to_show
+                            .as_ref()
+                            .is_some_and(|pending| pending.lazy_root),
+                    )
+                    || (matches!(
+                        &translated,
+                        Event::MenuNavigateEscape
+                            | Event::MenuItemActivateRequested { .. }
+                            | Event::MenuClickedOutside
+                    ) && matches!(
+                        state.menu_presentation_policy,
+                        core::MenuPresentationPolicy::FollowFocus
+                    ))
+                    || (matches!(&translated, Event::MenuRootClicked(_))
+                        && matches!(state.menu, core::MenuState::TrayLoaded { .. })));
             if trace {
                 match &translated {
                     Event::WindowFocused(new_window) => eprintln!(
@@ -813,6 +865,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                     state.plugin_zone.plugins.len()
                 );
             }
+            let presentation_before = state.menu_presentation.clone();
+            let workspace_event = matches!(
+                translated,
+                Event::WorkspaceFocused { .. } | Event::WorkspacesSnapshot(_)
+            );
+            let explicit_pin_before = matches!(
+                state.menu_presentation_policy,
+                core::MenuPresentationPolicy::Pinned { .. }
+            );
+            let pending_lazy_root_before = state.menu_interaction.pending_lazy_root.clone();
             let reduced = core::reduce(
                 &mut state,
                 translated.clone(),
@@ -831,8 +893,56 @@ fn run() -> Result<(), Box<dyn Error>> {
                     _ => "other",
                 });
             }
-            if reduced && matches!(&translated, Event::MenuRootClicked(_)) {
-                if let Some(pending) = state.menu_interaction.pending_lazy_root.clone() {
+            if workspace_event
+                && explicit_pin_before
+                && matches!(
+                    state.menu_presentation_policy,
+                    core::MenuPresentationPolicy::FollowFocus
+                )
+            {
+                i3.request_focused_window()?;
+            }
+            if reduced
+                && state.menu_navigation.is_none()
+                && state.menu_presentation != presentation_before
+                && state.focused_window.is_some()
+                && !workspace_event
+            {
+                request_menu = true;
+            }
+            let requested_grab = state
+                .menu_navigation
+                .as_ref()
+                .filter(|session| session.grab_state == core::KeyboardGrabState::Requested)
+                .map(|session| session.id);
+            if let Some(session_id) = requested_grab {
+                let acquired = x11.acquire_keyboard_grab(session_id)?;
+                core::reduce(
+                    &mut state,
+                    if acquired {
+                        Event::KeyboardGrabAcquired { session_id }
+                    } else {
+                        Event::KeyboardGrabFailed { session_id }
+                    },
+                    &mut registry.lock().expect("registry poisoned"),
+                );
+                dirty = true;
+            }
+            if x11.keyboard_grab_session().is_some_and(|session_id| {
+                state
+                    .menu_navigation
+                    .as_ref()
+                    .is_none_or(|session| session.id != session_id)
+            }) {
+                x11.release_keyboard_grab(None)?;
+            }
+            if reduced {
+                if let Some(pending) = pending_lazy_root_to_schedule(
+                    pending_lazy_root_before.as_ref(),
+                    state.menu_interaction.pending_lazy_root.as_ref(),
+                )
+                .cloned()
+                {
                     let request_id = next_menu_request_id;
                     next_menu_request_id += 1;
                     let about = Event::MenuAboutToShowRequested {
@@ -1529,9 +1639,87 @@ fn tray_action_event(
         .unwrap_or_else(|| event.clone())
 }
 
+fn keyboard_event(
+    event: &Event,
+    state: &State,
+    registry: &core::MenuRegistry,
+    x11: &platform::x11::X11Platform,
+) -> Result<Event, Box<dyn Error>> {
+    let semantic = x11
+        .navigation_event(match event {
+            Event::X11(event) => event,
+            _ => return Ok(event.clone()),
+        })?
+        .unwrap_or_else(|| event.clone());
+    if !matches!(semantic, Event::MenuNavigateEnter) {
+        return Ok(semantic);
+    }
+    let Some(item_id) = state
+        .menu_navigation
+        .as_ref()
+        .and_then(|session| session.selected_path.as_ref())
+        .and_then(|path| path.last())
+        .copied()
+    else {
+        return Ok(semantic);
+    };
+    let Some(model) = state.active_menu_model() else {
+        return Ok(semantic);
+    };
+    let Some(menu_item) = ui::layout::find_item(&model.root, item_id) else {
+        return Ok(semantic);
+    };
+    if !menu_item.visible
+        || !menu_item.enabled
+        || !matches!(menu_item.item_type, core::MenuItemType::Standard)
+        || menu_item.children_display.is_some()
+    {
+        return Ok(semantic);
+    }
+    let Some(presentation) = state.menu_presentation.as_ref() else {
+        return Ok(semantic);
+    };
+    let timestamp = match event {
+        Event::X11(platform::x11::X11Event::KeyPress { timestamp, .. }) => *timestamp,
+        _ => 0,
+    };
+    let endpoint = presentation.endpoint.clone();
+    if !registry.source_matches(presentation.window_id, &endpoint) {
+        return Ok(semantic);
+    }
+    Ok(Event::MenuItemActivateRequested {
+        window_id: presentation.window_id,
+        endpoint,
+        item_id,
+        timestamp,
+    })
+}
+
 #[cfg(test)]
 mod scheduler_tests {
-    use super::should_schedule_invalidation;
+    use super::{pending_lazy_root_to_schedule, should_schedule_invalidation};
+    use crate::core::{LazyRootOpenPending, MenuEndpoint, MenuItemId, MenuSource, WindowId};
+
+    fn pending(
+        window_id: u32,
+        service: &str,
+        item_id: i32,
+        intent_id: u64,
+        watcher_generation: u64,
+        layout_request_id: Option<u64>,
+    ) -> LazyRootOpenPending {
+        LazyRootOpenPending {
+            window_id: WindowId(window_id),
+            endpoint: MenuSource::DbusMenu(MenuEndpoint {
+                service: service.into(),
+                object_path: "/Menu".into(),
+            }),
+            item_id: MenuItemId(item_id),
+            intent_id,
+            watcher_generation,
+            layout_request_id,
+        }
+    }
 
     #[test]
     fn lazy_about_to_show_suppresses_invalidation_load() {
@@ -1551,5 +1739,50 @@ mod scheduler_tests {
     #[test]
     fn stale_invalidation_never_schedules_a_load() {
         assert!(!should_schedule_invalidation(true, true, false, false));
+    }
+
+    #[test]
+    fn new_lazy_pending_request_is_scheduled_once() {
+        let pending = pending(7, ":1.7", 1, 10, 20, None);
+        assert_eq!(
+            pending_lazy_root_to_schedule(None, Some(&pending)),
+            Some(&pending)
+        );
+    }
+
+    #[test]
+    fn unchanged_lazy_pending_request_is_not_rescheduled() {
+        let before = pending(7, ":1.7", 1, 10, 20, None);
+        let after = pending(7, ":1.7", 1, 10, 20, Some(30));
+        assert_eq!(
+            pending_lazy_root_to_schedule(Some(&before), Some(&after)),
+            None
+        );
+    }
+
+    #[test]
+    fn replaced_lazy_pending_request_is_scheduled_once() {
+        let before = pending(7, ":1.7", 1, 10, 20, None);
+        let after = pending(7, ":1.7", 2, 11, 20, None);
+        assert_eq!(
+            pending_lazy_root_to_schedule(Some(&before), Some(&after)),
+            Some(&after)
+        );
+    }
+
+    #[test]
+    fn cleared_lazy_pending_request_is_not_scheduled() {
+        let before = pending(7, ":1.7", 1, 10, 20, None);
+        assert_eq!(pending_lazy_root_to_schedule(Some(&before), None), None);
+    }
+
+    #[test]
+    fn same_numeric_root_from_a_different_endpoint_is_new_request() {
+        let before = pending(7, ":1.7", 1, 10, 20, None);
+        let after = pending(7, ":1.8", 1, 10, 20, None);
+        assert_eq!(
+            pending_lazy_root_to_schedule(Some(&before), Some(&after)),
+            Some(&after)
+        );
     }
 }

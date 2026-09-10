@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error;
-use std::ffi::{c_int, CString};
+use std::ffi::{c_int, c_uint, CString};
 use std::fmt::Arguments;
 use std::io::Write;
 use std::os::fd::RawFd;
@@ -106,6 +106,31 @@ impl X11Text {
 
     pub fn raw_fd(&self) -> RawFd {
         unsafe { xlib::XConnectionNumber(self.display) }
+    }
+
+    /// Resolve an X11 key event through the server's active XKB layout,
+    /// including group, level, Shift, and lock state.
+    pub fn lookup_keysym(&self, keycode: u8, state: u16) -> Option<u32> {
+        let mut consumed_modifiers = 0_u32;
+        let mut keysym = 0_u64;
+        let resolved = unsafe {
+            xlib::XkbLookupKeySym(
+                self.display,
+                keycode,
+                state as c_uint,
+                &mut consumed_modifiers,
+                &mut keysym,
+            )
+        };
+        (resolved != 0).then_some(keysym as u32)
+    }
+
+    /// Resolve a logical X11 keysym to the server's current physical keycode.
+    /// Passive grabs require a keycode, so this deliberately uses Xlib's
+    /// keyboard-map-aware lookup instead of a machine-specific constant.
+    pub fn keycode_for_keysym(&self, keysym: u32) -> Option<u8> {
+        let keycode = unsafe { xlib::XKeysymToKeycode(self.display, keysym.into()) };
+        (keycode != 0).then_some(keycode)
     }
 
     pub fn font_name(&self) -> &str {

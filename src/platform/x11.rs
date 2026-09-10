@@ -12,7 +12,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::randr::{self, ConnectionExt as RandrExt};
 use x11rb::protocol::render::{self, ConnectionExt as RenderExt};
 use x11rb::protocol::xproto::{
-    self, Atom, AtomEnum, ConnectionExt as XprotoExt, EventMask, WindowClass,
+    self, Atom, AtomEnum, ConnectionExt as XprotoExt, EventMask, ModMask, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as WrapperExt;
@@ -98,6 +98,124 @@ impl TextMeasurer for PopupMeasurer<'_> {
 }
 
 const BAR_HEIGHT: u16 = 26;
+const XK_G: u32 = 0x0067;
+const XK_M: u32 = 0x006d;
+const XK_NUM_LOCK: u32 = 0xff7f;
+
+/// The process-global passive shortcut is intentionally platform-owned.  It
+/// has no relationship to the temporary active keyboard grab used by menu
+/// navigation.
+#[derive(Clone, Debug)]
+struct GlobalPinShortcut {
+    keycode: u8,
+    num_lock_mask: Option<ModMask>,
+    grab_modifiers: Vec<ModMask>,
+    event: crate::core::Event,
+    down: bool,
+    pending_release_timestamp: Option<u32>,
+}
+
+impl GlobalPinShortcut {
+    fn from_keycode(keycode: Option<u8>, num_lock_mask: Option<ModMask>) -> Option<Self> {
+        keycode.map(|keycode| Self::new(keycode, num_lock_mask))
+    }
+
+    fn new(keycode: u8, num_lock_mask: Option<ModMask>) -> Self {
+        Self::for_event(
+            keycode,
+            num_lock_mask,
+            crate::core::Event::ToggleMenuPresentationPin,
+        )
+    }
+
+    fn for_event(keycode: u8, num_lock_mask: Option<ModMask>, event: crate::core::Event) -> Self {
+        let base = ModMask::M4 | ModMask::SHIFT;
+        let mut variants = vec![base, base | ModMask::LOCK];
+        if let Some(num_lock_mask) = num_lock_mask {
+            variants.push(base | num_lock_mask);
+            variants.push(base | ModMask::LOCK | num_lock_mask);
+        }
+        variants.sort();
+        variants.dedup();
+        Self {
+            keycode,
+            num_lock_mask,
+            grab_modifiers: variants,
+            event,
+            down: false,
+            pending_release_timestamp: None,
+        }
+    }
+
+    fn modifier_variants(&self) -> &[ModMask] {
+        &self.grab_modifiers
+    }
+
+    fn matches_press(&self, keycode: u8, state: u16) -> bool {
+        if keycode != self.keycode {
+            return false;
+        }
+        let required = u16::from(ModMask::M4 | ModMask::SHIFT);
+        let ignored = u16::from(ModMask::LOCK) | self.num_lock_mask.map(u16::from).unwrap_or(0);
+        state & required == required && state & !(required | ignored) == 0
+    }
+
+    fn event(&mut self, event: &X11Event) -> Option<crate::core::Event> {
+        // Traditional X11 autorepeat is represented as a KeyRelease followed
+        // by a KeyPress for the same keycode and timestamp.  Defer rearming
+        // until the next event so that synthetic release does not toggle a
+        // second time while the physical key is still held.
+        if let Some(timestamp) = self.pending_release_timestamp.take() {
+            if matches!(
+                event,
+                X11Event::KeyPress {
+                    keycode,
+                    timestamp: next_timestamp,
+                    ..
+                } if *keycode == self.keycode && *next_timestamp == timestamp
+            ) {
+                return None;
+            }
+            self.down = false;
+        }
+        match event {
+            X11Event::KeyPress { keycode, state, .. } if self.matches_press(*keycode, *state) => {
+                if self.down {
+                    None
+                } else {
+                    self.down = true;
+                    Some(self.event.clone())
+                }
+            }
+            X11Event::KeyRelease {
+                keycode, timestamp, ..
+            } if *keycode == self.keycode && self.down => {
+                self.pending_release_timestamp = Some(*timestamp);
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+fn install_passive_grabs<E>(
+    modifiers: &[ModMask],
+    mut grab: impl FnMut(ModMask) -> Result<(), E>,
+    mut ungrab: impl FnMut(ModMask),
+) -> Result<Vec<ModMask>, E> {
+    let mut installed = Vec::with_capacity(modifiers.len());
+    for modifier in modifiers.iter().copied() {
+        if let Err(error) = grab(modifier) {
+            for installed_modifier in installed.iter().copied() {
+                ungrab(installed_modifier);
+            }
+            return Err(error);
+        }
+        installed.push(modifier);
+    }
+    Ok(installed)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum X11Event {
     RandrChanged,
@@ -117,6 +235,16 @@ pub enum X11Event {
         x: i16,
         y: i16,
         button: u8,
+    },
+    KeyPress {
+        keycode: u8,
+        state: u16,
+        timestamp: u32,
+    },
+    KeyRelease {
+        keycode: u8,
+        state: u16,
+        timestamp: u32,
     },
     MotionNotify {
         window: u32,
@@ -156,6 +284,9 @@ pub struct X11Platform {
     hover_repaint_active: bool,
     notification: Option<NotificationWindow>,
     pointer_grabbed: bool,
+    keyboard_grab_session: Option<u64>,
+    global_pin_shortcut: Option<GlobalPinShortcut>,
+    global_navigation_shortcut: Option<GlobalPinShortcut>,
     bar_hits: Vec<BarHitMap>,
     previous_contexts: HashMap<u32, view::ContextView>,
 }
@@ -926,7 +1057,7 @@ impl X11Platform {
                 | randr::NotifyMask::OUTPUT_CHANGE,
         )?
         .check()?;
-        Ok(Self {
+        let mut platform = Self {
             conn,
             root,
             default_surface,
@@ -944,9 +1075,15 @@ impl X11Platform {
             hover_repaint_active: false,
             notification: None,
             pointer_grabbed: false,
+            keyboard_grab_session: None,
+            global_pin_shortcut: None,
+            global_navigation_shortcut: None,
             bar_hits: Vec::new(),
             previous_contexts: HashMap::new(),
-        })
+        };
+        platform.install_global_pin_shortcut();
+        platform.install_global_navigation_shortcut();
+        Ok(platform)
     }
     pub fn connection(&self) -> &XCBConnection {
         &self.conn
@@ -959,6 +1096,214 @@ impl X11Platform {
     }
     pub fn pointer_grabbed(&self) -> bool {
         self.pointer_grabbed
+    }
+
+    pub fn acquire_keyboard_grab(&mut self, session_id: u64) -> Result<bool, Box<dyn Error>> {
+        if self.keyboard_grab_session == Some(session_id) {
+            return Ok(true);
+        }
+        if self.keyboard_grab_session.is_some() {
+            self.conn.ungrab_keyboard(x11rb::CURRENT_TIME)?.check()?;
+            self.keyboard_grab_session = None;
+        }
+        let reply = self
+            .conn
+            .grab_keyboard(
+                false,
+                self.root,
+                x11rb::CURRENT_TIME,
+                xproto::GrabMode::ASYNC,
+                xproto::GrabMode::ASYNC,
+            )?
+            .reply()?;
+        if reply.status == xproto::GrabStatus::SUCCESS {
+            self.keyboard_grab_session = Some(session_id);
+            self.conn.flush()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn release_keyboard_grab(&mut self, session_id: Option<u64>) -> Result<(), Box<dyn Error>> {
+        if session_id.is_none() || self.keyboard_grab_session == session_id {
+            if self.keyboard_grab_session.is_some() {
+                self.conn.ungrab_keyboard(x11rb::CURRENT_TIME)?.check()?;
+                self.conn.flush()?;
+            }
+            self.keyboard_grab_session = None;
+        }
+        Ok(())
+    }
+
+    pub fn keyboard_grab_session(&self) -> Option<u64> {
+        self.keyboard_grab_session
+    }
+
+    fn num_lock_mask(&self) -> Result<Option<ModMask>, Box<dyn Error>> {
+        let mapping = self.conn.get_modifier_mapping()?.reply()?;
+        let keycodes_per_modifier = mapping.keycodes.len() / 8;
+        for modifier_index in 0..8 {
+            let start = modifier_index * keycodes_per_modifier;
+            let end = start + keycodes_per_modifier;
+            if mapping.keycodes[start..end]
+                .iter()
+                .copied()
+                .any(|keycode| self.text.lookup_keysym(keycode, 0) == Some(XK_NUM_LOCK))
+            {
+                return Ok(Some(ModMask::from(1_u8 << modifier_index)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn unregister_global_pin_shortcut(&self, shortcut: &GlobalPinShortcut) {
+        for modifiers in shortcut.modifier_variants().iter().copied() {
+            let _ = self.conn.ungrab_key(shortcut.keycode, self.root, modifiers);
+        }
+        let _ = self.conn.flush();
+    }
+
+    fn install_global_pin_shortcut(&mut self) {
+        if self.global_pin_shortcut.is_some() {
+            return;
+        }
+        let result = (|| -> Result<GlobalPinShortcut, Box<dyn Error>> {
+            let keycode = self.text.keycode_for_keysym(XK_M);
+            let shortcut = GlobalPinShortcut::from_keycode(keycode, self.num_lock_mask()?)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "the current X11 keyboard map has no M keysym",
+                    )
+                })?;
+            let installed = install_passive_grabs(
+                shortcut.modifier_variants(),
+                |modifiers| {
+                    self.conn
+                        .grab_key(
+                            false,
+                            self.root,
+                            modifiers,
+                            shortcut.keycode,
+                            xproto::GrabMode::ASYNC,
+                            xproto::GrabMode::ASYNC,
+                        )?
+                        .check()?;
+                    Ok::<_, Box<dyn Error>>(())
+                },
+                |modifiers| {
+                    let _ = self.conn.ungrab_key(shortcut.keycode, self.root, modifiers);
+                },
+            )?;
+            if let Err(error) = self.conn.flush() {
+                for modifiers in installed {
+                    let _ = self.conn.ungrab_key(shortcut.keycode, self.root, modifiers);
+                }
+                let _ = self.conn.flush();
+                return Err(Box::new(error));
+            }
+            Ok(shortcut)
+        })();
+        match result {
+            Ok(shortcut) => self.global_pin_shortcut = Some(shortcut),
+            Err(error) => eprintln!("xbar: global menu pin shortcut unavailable: {error}"),
+        }
+    }
+
+    fn install_global_navigation_shortcut(&mut self) {
+        if self.global_navigation_shortcut.is_some() {
+            return;
+        }
+        let result = (|| -> Result<GlobalPinShortcut, Box<dyn Error>> {
+            let num_lock_mask = self.num_lock_mask()?;
+            let keycode = self.text.keycode_for_keysym(XK_G);
+            let shortcut = keycode
+                .map(|keycode| {
+                    GlobalPinShortcut::for_event(
+                        keycode,
+                        num_lock_mask,
+                        crate::core::Event::MenuNavigationStarted,
+                    )
+                })
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "the current X11 keyboard map has no G keysym",
+                    )
+                })?;
+            let installed = install_passive_grabs(
+                shortcut.modifier_variants(),
+                |modifiers| {
+                    self.conn
+                        .grab_key(
+                            false,
+                            self.root,
+                            modifiers,
+                            shortcut.keycode,
+                            xproto::GrabMode::ASYNC,
+                            xproto::GrabMode::ASYNC,
+                        )?
+                        .check()?;
+                    Ok::<_, Box<dyn Error>>(())
+                },
+                |modifiers| {
+                    let _ = self.conn.ungrab_key(shortcut.keycode, self.root, modifiers);
+                },
+            )?;
+            if let Err(error) = self.conn.flush() {
+                for modifiers in installed {
+                    let _ = self.conn.ungrab_key(shortcut.keycode, self.root, modifiers);
+                }
+                let _ = self.conn.flush();
+                return Err(Box::new(error));
+            }
+            Ok(shortcut)
+        })();
+        match result {
+            Ok(shortcut) => self.global_navigation_shortcut = Some(shortcut),
+            Err(error) => eprintln!("xbar: global menu keyboard shortcut unavailable: {error}"),
+        }
+    }
+
+    /// Translate the passive Super+Shift+M grab before navigation filtering.
+    /// Repeated KeyPress events are latched until the matching KeyRelease.
+    pub fn global_pin_shortcut_event(&mut self, event: &X11Event) -> Option<crate::core::Event> {
+        self.global_pin_shortcut.as_mut()?.event(event)
+    }
+
+    /// Translate the passive Super+Shift+G grab before navigation filtering.
+    /// Repeated KeyPress events are latched until the matching KeyRelease.
+    pub fn global_navigation_shortcut_event(
+        &mut self,
+        event: &X11Event,
+    ) -> Option<crate::core::Event> {
+        self.global_navigation_shortcut.as_mut()?.event(event)
+    }
+
+    pub fn navigation_event(
+        &self,
+        event: &X11Event,
+    ) -> Result<Option<crate::core::Event>, Box<dyn Error>> {
+        let X11Event::KeyPress { keycode, state, .. } = event else {
+            return Ok(None);
+        };
+        let Some(keysym) = self.text.lookup_keysym(*keycode, *state) else {
+            return Ok(None);
+        };
+        Ok(Self::navigation_event_for_keysym(keysym))
+    }
+
+    pub(crate) fn navigation_event_for_keysym(keysym: u32) -> Option<crate::core::Event> {
+        Some(match keysym {
+            0xff51 => crate::core::Event::MenuNavigateLeft,
+            0xff52 => crate::core::Event::MenuNavigateUp,
+            0xff53 => crate::core::Event::MenuNavigateRight,
+            0xff54 => crate::core::Event::MenuNavigateDown,
+            0xff0d | 0xff8d => crate::core::Event::MenuNavigateEnter,
+            0xff1b => crate::core::Event::MenuNavigateEscape,
+            _ => return None,
+        })
     }
 
     /// Hover is renderer-local presentation state. It never changes a domain
@@ -1145,6 +1490,16 @@ impl X11Platform {
                 x: e.event_x,
                 y: e.event_y,
                 button: e.detail,
+            }),
+            Some(Event::KeyPress(e)) => Some(X11Event::KeyPress {
+                keycode: e.detail,
+                state: e.state.bits(),
+                timestamp: e.time,
+            }),
+            Some(Event::KeyRelease(e)) => Some(X11Event::KeyRelease {
+                keycode: e.detail,
+                state: e.state.bits(),
+                timestamp: e.time,
             }),
             Some(Event::SelectionClear(_)) => Some(X11Event::InstanceLost),
             Some(Event::CreateNotify(event)) => {
@@ -3704,6 +4059,16 @@ fn popup_hover_transition(
 
 impl Drop for X11Platform {
     fn drop(&mut self) {
+        if let Some(shortcut) = self.global_navigation_shortcut.take() {
+            self.unregister_global_pin_shortcut(&shortcut);
+        }
+        if let Some(shortcut) = self.global_pin_shortcut.take() {
+            self.unregister_global_pin_shortcut(&shortcut);
+        }
+        if self.keyboard_grab_session.is_some() {
+            let _ = self.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+            self.keyboard_grab_session = None;
+        }
         self.text.release_active_drawable();
 
         for popup in self.popups.drain(..) {
@@ -3771,15 +4136,15 @@ fn is_xbar_owned_window(
 mod tests {
     use super::{
         blur_behind_rect, classify_attention_property_reply, effect_owner_property_value,
-        is_xbar_owned_window, network_primary_row_label, popup_effect_owner, popup_hover_for,
-        popup_hover_transition, preserve_color_pixel, template_icon_pixel, tray_draw_size,
-        tray_hit, AttentionPropertyRead, BarWindow, HitTarget, PopupHover, RenderTarget,
-        SurfaceWindowGeometry,
+        install_passive_grabs, is_xbar_owned_window, network_primary_row_label, popup_effect_owner,
+        popup_hover_for, popup_hover_transition, preserve_color_pixel, template_icon_pixel,
+        tray_draw_size, tray_hit, AttentionPropertyRead, BarWindow, GlobalPinShortcut, HitTarget,
+        PopupHover, RenderTarget, SurfaceWindowGeometry, X11Event,
     };
     use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
     use crate::ui::{layout::MenuRect, view::TrayIconRenderMode, view::TrayVisualItem};
     use x11rb::errors::ReplyError;
-    use x11rb::protocol::xproto::EventMask;
+    use x11rb::protocol::xproto::{EventMask, ModMask};
     use x11rb::protocol::{xproto, ErrorKind};
     use x11rb::x11_utils::X11Error;
 
@@ -3794,6 +4159,245 @@ mod tests {
             extension_name: None,
             request_name: Some("GetProperty"),
         })
+    }
+
+    #[test]
+    fn navigation_keysyms_map_only_the_supported_navigation_keys() {
+        assert!(matches!(
+            super::X11Platform::navigation_event_for_keysym(0xff51),
+            Some(crate::core::Event::MenuNavigateLeft)
+        ));
+        assert!(matches!(
+            super::X11Platform::navigation_event_for_keysym(0xff52),
+            Some(crate::core::Event::MenuNavigateUp)
+        ));
+        assert!(matches!(
+            super::X11Platform::navigation_event_for_keysym(0xff53),
+            Some(crate::core::Event::MenuNavigateRight)
+        ));
+        assert!(matches!(
+            super::X11Platform::navigation_event_for_keysym(0xff54),
+            Some(crate::core::Event::MenuNavigateDown)
+        ));
+        assert!(matches!(
+            super::X11Platform::navigation_event_for_keysym(0xff1b),
+            Some(crate::core::Event::MenuNavigateEscape)
+        ));
+        assert!(matches!(
+            super::X11Platform::navigation_event_for_keysym(0xff0d),
+            Some(crate::core::Event::MenuNavigateEnter)
+        ));
+        assert!(matches!(
+            super::X11Platform::navigation_event_for_keysym(0xff8d),
+            Some(crate::core::Event::MenuNavigateEnter)
+        ));
+        assert_eq!(super::X11Platform::navigation_event_for_keysym(0), None);
+        assert_eq!(super::X11Platform::navigation_event_for_keysym(0x61), None);
+    }
+
+    #[test]
+    fn global_pin_shortcut_handles_lock_variants_and_latches_repeat_until_release() {
+        let base = u16::from(ModMask::M4 | ModMask::SHIFT);
+        let num_lock = ModMask::M2;
+        let mut shortcut = GlobalPinShortcut::new(58, Some(num_lock));
+        assert_eq!(shortcut.modifier_variants().len(), 4);
+
+        for state in [
+            base,
+            base | u16::from(ModMask::LOCK),
+            base | u16::from(num_lock),
+            base | u16::from(ModMask::LOCK) | u16::from(num_lock),
+        ] {
+            shortcut.down = false;
+            let press = X11Event::KeyPress {
+                keycode: 58,
+                state,
+                timestamp: 1,
+            };
+            assert!(matches!(
+                shortcut.event(&press),
+                Some(crate::core::Event::ToggleMenuPresentationPin)
+            ));
+            assert_eq!(shortcut.event(&press), None, "repeat state={state}");
+            assert_eq!(
+                shortcut.event(&X11Event::KeyRelease {
+                    keycode: 58,
+                    state,
+                    timestamp: 2,
+                }),
+                None
+            );
+            assert!(matches!(
+                shortcut.event(&press),
+                Some(crate::core::Event::ToggleMenuPresentationPin)
+            ));
+        }
+    }
+
+    #[test]
+    fn global_navigation_shortcut_has_independent_repeat_state_and_event() {
+        let base = u16::from(ModMask::M4 | ModMask::SHIFT);
+        let mut pin = GlobalPinShortcut::new(58, Some(ModMask::M2));
+        let mut navigation = GlobalPinShortcut::for_event(
+            42,
+            Some(ModMask::M2),
+            crate::core::Event::MenuNavigationStarted,
+        );
+        let press_g = X11Event::KeyPress {
+            keycode: 42,
+            state: base,
+            timestamp: 10,
+        };
+        assert_eq!(pin.event(&press_g), None);
+        assert!(matches!(
+            navigation.event(&press_g),
+            Some(crate::core::Event::MenuNavigationStarted)
+        ));
+        assert_eq!(navigation.event(&press_g), None);
+        assert_eq!(
+            navigation.event(&X11Event::KeyRelease {
+                keycode: 42,
+                state: base,
+                timestamp: 20,
+            }),
+            None
+        );
+        assert_eq!(
+            navigation.event(&X11Event::KeyPress {
+                keycode: 42,
+                state: base,
+                timestamp: 20,
+            }),
+            None
+        );
+        assert!(matches!(
+            pin.event(&X11Event::KeyPress {
+                keycode: 58,
+                state: base,
+                timestamp: 30,
+            }),
+            Some(crate::core::Event::ToggleMenuPresentationPin)
+        ));
+    }
+
+    #[test]
+    fn global_pin_shortcut_rejects_unrelated_key_or_modifier() {
+        let mut shortcut = GlobalPinShortcut::new(58, Some(ModMask::M2));
+        let base = u16::from(ModMask::M4 | ModMask::SHIFT);
+        assert_eq!(
+            shortcut.event(&X11Event::KeyPress {
+                keycode: 57,
+                state: base,
+                timestamp: 1,
+            }),
+            None
+        );
+        assert_eq!(
+            shortcut.event(&X11Event::KeyPress {
+                keycode: 58,
+                state: base | u16::from(ModMask::CONTROL),
+                timestamp: 1,
+            }),
+            None
+        );
+        assert!(!shortcut.down);
+    }
+
+    #[test]
+    fn global_pin_shortcut_ignores_legacy_autorepeat_release_press_pairs() {
+        let base = u16::from(ModMask::M4 | ModMask::SHIFT);
+        let mut shortcut = GlobalPinShortcut::new(58, Some(ModMask::M2));
+        let press = X11Event::KeyPress {
+            keycode: 58,
+            state: base,
+            timestamp: 10,
+        };
+        assert!(matches!(
+            shortcut.event(&press),
+            Some(crate::core::Event::ToggleMenuPresentationPin)
+        ));
+        assert_eq!(
+            shortcut.event(&X11Event::KeyRelease {
+                keycode: 58,
+                state: base,
+                timestamp: 20,
+            }),
+            None
+        );
+        assert_eq!(
+            shortcut.event(&X11Event::KeyPress {
+                keycode: 58,
+                state: base,
+                timestamp: 20,
+            }),
+            None
+        );
+        assert!(shortcut.down);
+        assert_eq!(
+            shortcut.event(&X11Event::KeyRelease {
+                keycode: 58,
+                state: 0,
+                timestamp: 30,
+            }),
+            None
+        );
+        assert!(matches!(
+            shortcut.event(&X11Event::KeyPress {
+                keycode: 58,
+                state: base,
+                timestamp: 40,
+            }),
+            Some(crate::core::Event::ToggleMenuPresentationPin)
+        ));
+    }
+
+    #[test]
+    fn passive_grab_installation_rolls_back_exactly_the_variants_already_owned() {
+        let variants = [
+            ModMask::M4 | ModMask::SHIFT,
+            ModMask::M4 | ModMask::LOCK,
+            ModMask::M2,
+        ];
+        let mut attempted = Vec::new();
+        let mut rolled_back = Vec::new();
+        let result = install_passive_grabs(
+            &variants,
+            |modifier| {
+                attempted.push(modifier);
+                (modifier != ModMask::M2).then_some(()).ok_or("BadAccess")
+            },
+            |modifier| rolled_back.push(modifier),
+        );
+        assert_eq!(result, Err("BadAccess"));
+        assert_eq!(attempted, variants);
+        assert_eq!(rolled_back, variants[..2]);
+    }
+
+    #[test]
+    fn passive_grab_first_failure_is_non_owning_and_a_missing_keycode_cannot_be_grabbed() {
+        let variants = [ModMask::M4 | ModMask::SHIFT];
+        let mut rolled_back = Vec::new();
+        let result = install_passive_grabs(
+            &variants,
+            |_| Err::<(), _>("BadAccess"),
+            |modifier| rolled_back.push(modifier),
+        );
+        assert_eq!(result, Err("BadAccess"));
+        assert!(rolled_back.is_empty());
+        assert!(GlobalPinShortcut::from_keycode(None, Some(ModMask::M2)).is_none());
+    }
+
+    #[test]
+    fn passive_grab_installation_records_every_variant_only_after_full_success() {
+        let variants = [ModMask::M4 | ModMask::SHIFT, ModMask::M4 | ModMask::LOCK];
+        let mut rolled_back = Vec::new();
+        let result = install_passive_grabs(
+            &variants,
+            |_| Ok::<_, ()>(()),
+            |modifier| rolled_back.push(modifier),
+        );
+        assert_eq!(result, Ok(variants.to_vec()));
+        assert!(rolled_back.is_empty());
     }
 
     #[test]

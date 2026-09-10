@@ -1,4 +1,7 @@
-use super::state::{LazyRootOpenPending, MenuInteractionState, MenuPresentation};
+use super::state::{
+    KeyboardGrabState, LazyRootOpenPending, MenuInteractionState, MenuNavigationSession,
+    MenuPresentation, MenuPresentationPolicy,
+};
 use super::{Event, MenuItemId, MenuRegistry, MenuSource, MenuState, State};
 
 fn item(model: &super::MenuModel, id: MenuItemId) -> Option<&super::MenuItem> {
@@ -9,6 +12,233 @@ fn item(model: &super::MenuModel, id: MenuItemId) -> Option<&super::MenuItem> {
         node.children.iter().find_map(|child| walk(child, id))
     }
     walk(&model.root, id)
+}
+
+fn selectable(item: &super::MenuItem) -> bool {
+    item.visible && item.enabled && !matches!(item.item_type, super::MenuItemType::Separator)
+}
+
+fn selectable_children(item: &super::MenuItem) -> Vec<MenuItemId> {
+    item.children
+        .iter()
+        .filter(|child| selectable(child))
+        .map(|child| child.id)
+        .collect()
+}
+
+fn source_presentation(state: &State) -> Option<(super::WindowId, MenuSource)> {
+    state
+        .menu_presentation
+        .as_ref()
+        .map(|presentation| (presentation.window_id, presentation.endpoint.clone()))
+}
+
+fn current_presentation_model(state: &State) -> Option<&super::MenuModel> {
+    let presentation = state.menu_presentation.as_ref()?;
+    match &state.menu {
+        MenuState::Loaded {
+            window_id,
+            endpoint,
+            model,
+        } if *window_id == presentation.window_id && *endpoint == presentation.endpoint => {
+            Some(model)
+        }
+        _ => None,
+    }
+}
+
+fn eligible_root(model: &super::MenuModel, id: MenuItemId) -> bool {
+    model.root.children.iter().any(|item| {
+        item.id == id
+            && selectable(item)
+            && item.children_display == Some(super::ChildrenDisplay::Submenu)
+    })
+}
+
+fn first_eligible_root(state: &State) -> Option<MenuItemId> {
+    current_presentation_model(state)?
+        .root
+        .children
+        .iter()
+        .find(|item| {
+            selectable(item) && item.children_display == Some(super::ChildrenDisplay::Submenu)
+        })
+        .map(|item| item.id)
+}
+
+fn current_pending_lazy_root_matches(state: &State, item_id: MenuItemId) -> bool {
+    let Some(pending) = state.menu_interaction.pending_lazy_root.as_ref() else {
+        return false;
+    };
+    pending.item_id == item_id
+        && matches!(
+            &state.menu,
+            MenuState::Loaded {
+                window_id,
+                endpoint,
+                ..
+            } if *window_id == pending.window_id && *endpoint == pending.endpoint
+        )
+        && state.watcher_generations.get(&pending.endpoint) == Some(&pending.watcher_generation)
+}
+
+fn start_navigation_session(state: &mut State, root: MenuItemId) -> bool {
+    let Some((source_window, endpoint)) = source_presentation(state) else {
+        return false;
+    };
+    if !current_presentation_model(state).is_some_and(|model| eligible_root(model, root)) {
+        return false;
+    }
+    state.next_menu_navigation_session = state.next_menu_navigation_session.wrapping_add(1);
+    let id = state.next_menu_navigation_session;
+    state.menu_navigation = Some(MenuNavigationSession {
+        id,
+        source_window,
+        endpoint,
+        selected_path: Some(vec![root]),
+        grab_state: KeyboardGrabState::Requested,
+    });
+    true
+}
+
+fn teardown_navigation_waiting_for_lazy_root(
+    state: &mut State,
+    registry: &MenuRegistry,
+    item_id: MenuItemId,
+) {
+    let waiting_for_item = state.menu_navigation.as_ref().is_some_and(|session| {
+        session.selected_path.as_ref().and_then(|path| path.last()) == Some(&item_id)
+    });
+    if waiting_for_item && state.menu_interaction.open_root.is_none() {
+        teardown_navigation(state, registry);
+    }
+}
+
+fn teardown_navigation(state: &mut State, registry: &MenuRegistry) {
+    state.menu_navigation = None;
+    if matches!(
+        state.menu_presentation_policy,
+        MenuPresentationPolicy::Pinned { .. }
+    ) {
+        state.menu_interaction = Default::default();
+        return;
+    }
+    let still_current = state
+        .focused_window
+        .zip(state.menu_presentation.as_ref())
+        .is_some_and(|(window, presentation)| {
+            window == presentation.window_id
+                && registry.active(Some(window)).as_ref() == Some(&presentation.endpoint)
+        });
+    if !still_current {
+        reconcile_menu_presentation_to_focus(state, registry);
+    } else {
+        state.menu_interaction = Default::default();
+    }
+}
+
+fn normalize_keyboard_selection(state: &mut State) {
+    let Some(model) = state.active_menu_model().cloned() else {
+        if let Some(session) = &mut state.menu_navigation {
+            session.selected_path = None;
+        }
+        return;
+    };
+    let Some(session) = &mut state.menu_navigation else {
+        return;
+    };
+    let valid = session.selected_path.as_ref().is_some_and(|path| {
+        !path.is_empty()
+            && path.starts_with(&state.menu_interaction.open_path)
+            && path.windows(2).all(|pair| {
+                item(&model, pair[0]).is_some_and(|parent| {
+                    parent
+                        .children
+                        .iter()
+                        .any(|child| child.id == pair[1] && selectable(child))
+                })
+            })
+            && path
+                .last()
+                .and_then(|id| item(&model, *id))
+                .is_some_and(selectable)
+    });
+    if !valid {
+        session.selected_path = None;
+    }
+    state.menu_interaction.hovered_path = session.selected_path.clone().unwrap_or_default();
+}
+
+fn navigate_list(state: &mut State, direction: i32) -> bool {
+    let Some(model) = state.active_menu_model() else {
+        return false;
+    };
+    let Some(root) = state.menu_interaction.open_root else {
+        return false;
+    };
+    let parent_id = state
+        .menu_interaction
+        .open_path
+        .last()
+        .copied()
+        .unwrap_or(root);
+    let Some(parent) = item(model, parent_id) else {
+        return false;
+    };
+    let children = selectable_children(parent);
+    if children.is_empty() {
+        return false;
+    }
+    let current = state
+        .menu_navigation
+        .as_ref()
+        .and_then(|session| session.selected_path.as_ref())
+        .and_then(|path| path.last().copied());
+    let index = current.and_then(|id| children.iter().position(|candidate| *candidate == id));
+    let next = match (index, direction) {
+        (None, 1) => children[0],
+        (None, -1) => *children.last().unwrap(),
+        (Some(index), 1) => children.get(index + 1).copied().unwrap_or(children[index]),
+        (Some(index), -1) => index
+            .checked_sub(1)
+            .map_or(children[index], |i| children[i]),
+        _ => return false,
+    };
+    let mut path = state.menu_interaction.open_path.clone();
+    path.push(next);
+    let Some(session) = &mut state.menu_navigation else {
+        return false;
+    };
+    let changed = session.selected_path.as_deref() != Some(path.as_slice());
+    session.selected_path = Some(path.clone());
+    state.menu_interaction.hovered_path = path;
+    changed
+}
+
+fn navigate_root(state: &mut State, direction: i32) -> bool {
+    let Some(model) = state.active_menu_model() else {
+        return false;
+    };
+    let roots = selectable_children(&model.root);
+    let Some(current) = state.menu_interaction.open_root else {
+        return false;
+    };
+    let Some(index) = roots.iter().position(|id| *id == current) else {
+        return false;
+    };
+    let next = if direction < 0 {
+        index.checked_sub(1).map(|i| roots[i])
+    } else {
+        roots.get(index + 1).copied()
+    };
+    let Some(next) = next else { return false };
+    state.menu_interaction.open_root = Some(next);
+    state.menu_interaction.open_path = vec![next];
+    state.menu_interaction.hovered_path.clear();
+    if let Some(session) = &mut state.menu_navigation {
+        session.selected_path = Some(vec![next]);
+    }
+    true
 }
 
 fn begin_bluetooth_action(state: &mut State, action: super::BluetoothPendingAction) -> bool {
@@ -78,6 +308,7 @@ fn normalize_interaction(state: &mut State) {
             .open_path
             .push(state.menu_interaction.open_root.unwrap());
     }
+    normalize_keyboard_selection(state);
 }
 
 /// Interactive popup ownership is separate from the focused application's
@@ -102,6 +333,37 @@ fn reconcile_menu_presentation_to_focus(state: &mut State, registry: &MenuRegist
     state.menu = MenuState::NoMenu;
     state.menu_interaction = Default::default();
     state.global_menu_model = None;
+    state.menu_presentation_needs_focus_reconciliation = false;
+}
+
+fn presentation_follows_focus(state: &State) -> bool {
+    matches!(
+        state.menu_presentation_policy,
+        MenuPresentationPolicy::FollowFocus
+    )
+}
+
+fn end_pinned_presentation(state: &mut State, registry: &MenuRegistry) {
+    state.menu_navigation = None;
+    state.menu_presentation_policy = MenuPresentationPolicy::FollowFocus;
+    reconcile_menu_presentation_to_focus(state, registry);
+}
+
+fn end_pinned_presentation_for_workspace_change(state: &mut State) {
+    state.menu_navigation = None;
+    state.menu_presentation_policy = MenuPresentationPolicy::FollowFocus;
+    state.menu_presentation = None;
+    state.menu = MenuState::NoMenu;
+    state.menu_interaction = Default::default();
+    state.global_menu_model = None;
+    state.menu_presentation_needs_focus_reconciliation = true;
+}
+
+fn pinned_workspace(state: &State) -> Option<&str> {
+    match &state.menu_presentation_policy {
+        MenuPresentationPolicy::FollowFocus => None,
+        MenuPresentationPolicy::Pinned { workspace } => Some(workspace),
+    }
 }
 
 fn presentation_matches_registry(
@@ -187,11 +449,19 @@ fn patch_item(node: &mut super::MenuItem, update: &super::MenuItemPropertiesUpda
 pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> bool {
     match event {
         Event::WorkspacesSnapshot(workspaces) => {
-            state.focused_workspace = workspaces
+            let focused_workspace = workspaces
                 .iter()
                 .find(|w| w.focused)
                 .map(|w| w.name.clone());
+            let workspace_changed = state.focused_workspace != focused_workspace;
+            state.focused_workspace = focused_workspace;
             state.workspaces = workspaces;
+            if workspace_changed
+                && !presentation_follows_focus(state)
+                && pinned_workspace(state) != state.focused_workspace.as_deref()
+            {
+                end_pinned_presentation_for_workspace_change(state);
+            }
             true
         }
         Event::WorkspaceFocused { name } => {
@@ -220,15 +490,26 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             for workspace in &mut state.workspaces {
                 workspace.focused = Some(&workspace.name) == name.as_ref();
             }
+            if pinned_workspace(state) != state.focused_workspace.as_deref()
+                && !presentation_follows_focus(state)
+            {
+                end_pinned_presentation_for_workspace_change(state);
+            }
             true
         }
         Event::WindowFocused(window) => {
-            if state.focused_window == window {
+            if state.focused_window == window
+                && !(presentation_follows_focus(state)
+                    && state.menu_navigation.is_none()
+                    && state.menu_presentation_needs_focus_reconciliation)
+            {
                 return false;
             }
             state.focused_window = window;
             state.focused_app_name = None;
-            reconcile_menu_presentation_to_focus(state, registry);
+            if presentation_follows_focus(state) && state.menu_navigation.is_none() {
+                reconcile_menu_presentation_to_focus(state, registry);
+            }
             state.audio_popup_open = false;
             state.audio_dragging = false;
             state.audio_drag_input = false;
@@ -239,12 +520,19 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             true
         }
         Event::WindowFocusedWithApp { window, app_name } => {
-            if state.focused_window == window && state.focused_app_name == app_name {
+            if state.focused_window == window
+                && state.focused_app_name == app_name
+                && !(presentation_follows_focus(state)
+                    && state.menu_navigation.is_none()
+                    && state.menu_presentation_needs_focus_reconciliation)
+            {
                 return false;
             }
             state.focused_window = window;
             state.focused_app_name = app_name;
-            reconcile_menu_presentation_to_focus(state, registry);
+            if presentation_follows_focus(state) && state.menu_navigation.is_none() {
+                reconcile_menu_presentation_to_focus(state, registry);
+            }
             state.audio_popup_open = false;
             state.audio_dragging = false;
             state.audio_drag_input = false;
@@ -252,6 +540,51 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.network_popup_open = false;
             state.network_popup_open_pending = false;
             true
+        }
+        Event::PinCurrentMenuPresentation => {
+            let Some(presentation) = state.menu_presentation.clone() else {
+                return false;
+            };
+            if !registry.source_matches(presentation.window_id, &presentation.endpoint) {
+                return false;
+            }
+            let Some(workspace) = state
+                .focused_workspace
+                .clone()
+                .filter(|workspace| !workspace.is_empty())
+            else {
+                return false;
+            };
+            if matches!(
+                state.menu_presentation_policy,
+                MenuPresentationPolicy::Pinned { .. }
+            ) {
+                return false;
+            }
+            state.menu_presentation_policy = MenuPresentationPolicy::Pinned { workspace };
+            true
+        }
+        Event::UnpinMenuPresentation => {
+            if !matches!(
+                state.menu_presentation_policy,
+                MenuPresentationPolicy::Pinned { .. }
+            ) {
+                return false;
+            }
+            // A global unpin may arrive while navigation owns XGrabKeyboard.
+            // End that session first; the platform observes the missing
+            // session and releases its physical grab exactly once.
+            teardown_navigation(state, registry);
+            state.menu_presentation_policy = MenuPresentationPolicy::FollowFocus;
+            reconcile_menu_presentation_to_focus(state, registry);
+            true
+        }
+        Event::ToggleMenuPresentationPin => {
+            if presentation_follows_focus(state) {
+                reduce(state, Event::PinCurrentMenuPresentation, registry)
+            } else {
+                reduce(state, Event::UnpinMenuPresentation, registry)
+            }
         }
         Event::MenuRegistered {
             window_id,
@@ -261,7 +594,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 return false;
             };
             registry.register(window_id, endpoint.service, endpoint.object_path);
-            if state.focused_window == Some(window_id) {
+            if presentation_follows_focus(state) && state.focused_window == Some(window_id) {
                 reconcile_menu_presentation_to_focus(state, registry);
             }
             true
@@ -272,7 +605,10 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         } => {
             let changed = registry.gtk(window_id) != Some(&endpoint);
             registry.register_gtk(window_id, endpoint);
-            if changed && state.focused_window == Some(window_id) {
+            if changed
+                && presentation_follows_focus(state)
+                && state.focused_window == Some(window_id)
+            {
                 reconcile_menu_presentation_to_focus(state, registry);
             }
             changed
@@ -286,10 +622,18 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 && state.menu_presentation_window() == Some(window_id)
                 && registry.get(window_id).is_none()
             {
-                state.menu = MenuState::NoMenu;
-                state.menu_interaction = Default::default();
-                state.global_menu_model = None;
-                state.menu_presentation = None;
+                if matches!(
+                    state.menu_presentation_policy,
+                    MenuPresentationPolicy::Pinned { .. }
+                ) {
+                    end_pinned_presentation(state, registry);
+                } else {
+                    state.menu_navigation = None;
+                    state.menu = MenuState::NoMenu;
+                    state.menu_interaction = Default::default();
+                    state.global_menu_model = None;
+                    state.menu_presentation = None;
+                }
             }
             removed
         }
@@ -302,10 +646,18 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                     .remove(&MenuSource::DbusMenu(endpoint));
             }
             if removed && state.menu_presentation_window() == Some(window_id) {
-                state.menu = MenuState::NoMenu;
-                state.menu_interaction = Default::default();
-                state.global_menu_model = None;
-                state.menu_presentation = None;
+                if matches!(
+                    state.menu_presentation_policy,
+                    MenuPresentationPolicy::Pinned { .. }
+                ) {
+                    end_pinned_presentation(state, registry);
+                } else {
+                    state.menu_navigation = None;
+                    state.menu = MenuState::NoMenu;
+                    state.menu_interaction = Default::default();
+                    state.global_menu_model = None;
+                    state.menu_presentation = None;
+                }
             }
             removed
         }
@@ -318,10 +670,18 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 .menu_presentation_window()
                 .is_some_and(|window| removed.contains(&window))
             {
-                state.menu = MenuState::NoMenu;
-                state.menu_interaction = Default::default();
-                state.global_menu_model = None;
-                state.menu_presentation = None;
+                if matches!(
+                    state.menu_presentation_policy,
+                    MenuPresentationPolicy::Pinned { .. }
+                ) {
+                    end_pinned_presentation(state, registry);
+                } else {
+                    state.menu_navigation = None;
+                    state.menu = MenuState::NoMenu;
+                    state.menu_interaction = Default::default();
+                    state.global_menu_model = None;
+                    state.menu_presentation = None;
+                }
             }
             !removed.is_empty()
         }
@@ -407,7 +767,9 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             if let Some(next_request_id) = follow_up_request_id {
                 pending.layout_request_id = Some(next_request_id);
             } else {
+                let item_id = pending.item_id;
                 state.menu_interaction.pending_lazy_root = None;
+                teardown_navigation_waiting_for_lazy_root(state, registry, item_id);
             }
             true
         }
@@ -483,6 +845,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                     && ((matches!(endpoint, MenuSource::Tray(_)) && window_id == super::WindowId(u32::MAX))
                         || presentation_matches_registry(state, registry, window_id, &endpoint)));
             if accepted {
+                let lazy_root = state.menu_interaction.pending_lazy_root.clone();
                 state.menu = MenuState::Error {
                     window_id,
                     endpoint,
@@ -490,6 +853,9 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                     error,
                 };
                 state.menu_interaction = Default::default();
+                if let Some(pending) = lazy_root {
+                    teardown_navigation_waiting_for_lazy_root(state, registry, pending.item_id);
+                }
             }
             accepted
         }
@@ -543,8 +909,15 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                     .as_ref()
                     .is_some_and(|pending| pending.endpoint == endpoint)
             {
+                let item_id = state
+                    .menu_interaction
+                    .pending_lazy_root
+                    .as_ref()
+                    .expect("checked pending lazy root")
+                    .item_id;
                 state.menu_interaction.pending_lazy_root = None;
                 state.menu_interaction.pending_about_to_show = None;
+                teardown_navigation_waiting_for_lazy_root(state, registry, item_id);
             }
             false
         }
@@ -636,13 +1009,20 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             }
             if menu_item.children_display.is_none() || menu_item.children.is_empty() {
                 if state.menu_interaction.open_root.is_some() {
+                    if state.menu_navigation.is_some() {
+                        teardown_navigation(state, registry);
+                    }
                     state.menu_interaction = Default::default();
                     return true;
                 }
                 return false;
             }
             if state.menu_interaction.open_root == Some(id) {
-                state.menu_interaction = Default::default();
+                if state.menu_navigation.is_some() {
+                    teardown_navigation(state, registry);
+                } else {
+                    state.menu_interaction = Default::default();
+                }
             } else {
                 state.menu_interaction.pending_lazy_root = None;
                 state.menu_interaction.open_root = Some(id);
@@ -650,8 +1030,189 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.menu_interaction.hovered_path.clear();
                 state.menu_interaction.pending_about_to_show = None;
                 state.menu_interaction.about_to_show_item = None;
+                if let Some(session) = &mut state.menu_navigation {
+                    session.selected_path = Some(vec![id]);
+                }
             }
             true
+        }
+        Event::MenuNavigationStarted => {
+            if state.menu_navigation.is_some() {
+                false
+            } else {
+                let root = match state.menu_interaction.open_root {
+                    Some(root)
+                        if current_presentation_model(state)
+                            .is_some_and(|model| eligible_root(model, root)) =>
+                    {
+                        root
+                    }
+                    Some(_) => return false,
+                    None => {
+                        let Some(root) = first_eligible_root(state) else {
+                            return false;
+                        };
+                        if !reduce(state, Event::MenuRootClicked(root), registry) {
+                            return false;
+                        }
+                        root
+                    }
+                };
+                start_navigation_session(state, root)
+            }
+        }
+        Event::KeyboardGrabAcquired { session_id } => {
+            let Some(session) = &mut state.menu_navigation else {
+                return false;
+            };
+            if session.id != session_id {
+                return false;
+            }
+            session.grab_state = KeyboardGrabState::Active;
+            true
+        }
+        Event::KeyboardGrabFailed { session_id } => {
+            let Some(session) = &mut state.menu_navigation else {
+                return false;
+            };
+            if session.id != session_id {
+                return false;
+            }
+            session.grab_state = KeyboardGrabState::Failed;
+            true
+        }
+        Event::MenuNavigateLeft => {
+            let Some(session) = state.menu_navigation.as_ref() else {
+                return false;
+            };
+            if state.menu_interaction.open_path.len() > 1 {
+                state.menu_interaction.open_path.pop();
+                if let Some(session) = &mut state.menu_navigation {
+                    session.selected_path = Some(state.menu_interaction.open_path.clone());
+                }
+                state.menu_interaction.hovered_path = state.menu_interaction.open_path.clone();
+                true
+            } else {
+                let _ = session;
+                navigate_root(state, -1)
+            }
+        }
+        Event::MenuNavigateRight => {
+            let Some(session) = state.menu_navigation.as_ref() else {
+                return false;
+            };
+            let selected = session
+                .selected_path
+                .as_ref()
+                .and_then(|path| path.last())
+                .copied();
+            let Some(selected) = selected else {
+                return navigate_root(state, 1);
+            };
+            if state.menu_interaction.open_root == Some(selected) {
+                return navigate_root(state, 1);
+            };
+            let Some(model) = state.active_menu_model() else {
+                return false;
+            };
+            let Some(selected_item) = item(model, selected) else {
+                return false;
+            };
+            if selected_item.children_display == Some(super::ChildrenDisplay::Submenu) {
+                if selected_item.children.is_empty() {
+                    if let MenuState::Loaded {
+                        window_id,
+                        endpoint: MenuSource::DbusMenu(endpoint),
+                        ..
+                    } = &state.menu
+                    {
+                        let source = MenuSource::DbusMenu(endpoint.clone());
+                        if let Some(watcher_generation) =
+                            state.watcher_generations.get(&source).copied()
+                        {
+                            if current_pending_lazy_root_matches(state, selected) {
+                                return false;
+                            }
+                            state.next_lazy_root_intent =
+                                state.next_lazy_root_intent.wrapping_add(1);
+                            state.menu_interaction.pending_lazy_root = Some(LazyRootOpenPending {
+                                window_id: *window_id,
+                                endpoint: source,
+                                item_id: selected,
+                                intent_id: state.next_lazy_root_intent,
+                                watcher_generation,
+                                layout_request_id: None,
+                            });
+                            state.menu_interaction.open_root = None;
+                            state.menu_interaction.open_path.clear();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                state.menu_interaction.open_path.push(selected);
+                let path = state.menu_interaction.open_path.clone();
+                if let Some(session) = &mut state.menu_navigation {
+                    session.selected_path = Some(path.clone());
+                }
+                state.menu_interaction.hovered_path = path;
+                return true;
+            }
+            navigate_root(state, 1)
+        }
+        Event::MenuNavigateDown => navigate_list(state, 1),
+        Event::MenuNavigateUp => navigate_list(state, -1),
+        Event::MenuNavigateEnter => {
+            let Some(model) = state.active_menu_model() else {
+                return false;
+            };
+            let Some(selected) = state
+                .menu_navigation
+                .as_ref()
+                .and_then(|session| session.selected_path.as_ref())
+                .and_then(|path| path.last())
+                .copied()
+            else {
+                return false;
+            };
+            let Some(selected_item) = item(model, selected) else {
+                return false;
+            };
+            if selected_item.children_display == Some(super::ChildrenDisplay::Submenu) {
+                if state.menu_interaction.open_path.len() <= 1 {
+                    if selected_item.children.is_empty() {
+                        if current_pending_lazy_root_matches(state, selected) {
+                            return false;
+                        }
+                        // A lazy top-level root must use the existing
+                        // AboutToShow/GetLayout lifecycle.
+                        reduce(state, Event::MenuRootClicked(selected), registry)
+                    } else {
+                        // The root is already open; Enter selects its first
+                        // visible child just like Down.
+                        navigate_list(state, 1)
+                    }
+                } else {
+                    reduce(state, Event::MenuNavigateRight, registry)
+                }
+            } else {
+                false
+            }
+        }
+        Event::MenuNavigateEscape => {
+            if state.menu_interaction.open_path.len() > 1 {
+                state.menu_interaction.open_path.pop();
+                if let Some(session) = &mut state.menu_navigation {
+                    session.selected_path = Some(state.menu_interaction.open_path.clone());
+                }
+                state.menu_interaction.hovered_path = state.menu_interaction.open_path.clone();
+                true
+            } else if state.menu_navigation.is_some() {
+                teardown_navigation(state, registry);
+                true
+            } else {
+                false
+            }
         }
         Event::MenuItemActivateRequested {
             window_id,
@@ -678,7 +1239,11 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                         && menu_item.children_display.is_none()
                 });
             if valid_context && actionable {
-                state.menu_interaction = Default::default();
+                if state.menu_navigation.is_some() {
+                    teardown_navigation(state, registry);
+                } else {
+                    state.menu_interaction = Default::default();
+                }
                 true
             } else {
                 false
@@ -692,6 +1257,9 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 return false;
             }
             state.menu_interaction.hovered_path = path;
+            if let Some(session) = &mut state.menu_navigation {
+                session.selected_path = Some(state.menu_interaction.hovered_path.clone());
+            }
             if state.menu_interaction.about_to_show_item
                 != state.menu_interaction.hovered_path.last().copied()
             {
@@ -715,7 +1283,11 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 || state.bluetooth_popup_open
                 || state.network_popup_open
             {
-                state.menu_interaction = Default::default();
+                if state.menu_navigation.is_some() {
+                    teardown_navigation(state, registry);
+                } else {
+                    state.menu_interaction = Default::default();
+                }
                 state.audio_popup_open = false;
                 state.audio_dragging = false;
                 state.audio_drag_input = false;
@@ -837,6 +1409,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             if error.is_some() {
                 if lazy_root {
                     state.menu_interaction.pending_lazy_root = None;
+                    teardown_navigation_waiting_for_lazy_root(state, registry, item_id);
                 }
                 return true;
             }
@@ -1218,7 +1791,9 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         Event::X11(crate::platform::x11::X11Event::Expose(_)) => true,
         Event::X11(crate::platform::x11::X11Event::ButtonPress { .. })
         | Event::X11(crate::platform::x11::X11Event::ButtonRelease { .. })
-        | Event::X11(crate::platform::x11::X11Event::MotionNotify { .. }) => false,
+        | Event::X11(crate::platform::x11::X11Event::MotionNotify { .. })
+        | Event::X11(crate::platform::x11::X11Event::KeyPress { .. })
+        | Event::X11(crate::platform::x11::X11Event::KeyRelease { .. }) => false,
         Event::X11(crate::platform::x11::X11Event::GtkWindowChanged(_))
         | Event::X11(crate::platform::x11::X11Event::GtkWindowsChanged)
         | Event::X11(crate::platform::x11::X11Event::GtkWindowDestroyed(_))
@@ -3218,11 +3793,17 @@ mod tests {
         let mut registry = MenuRegistry::default();
         registry.register(WindowId(7), ep().service.clone(), ep().object_path.clone());
         state.focused_window = Some(WindowId(7));
+        state.focused_workspace = Some("1".into());
+        state.workspaces = vec![ws("1", true), ws("2", false)];
         state.menu = MenuState::Loaded {
             window_id: WindowId(7),
             endpoint: MenuSource::DbusMenu(ep()),
             model: interactive_model(),
         };
+        state.menu_presentation = Some(MenuPresentation {
+            window_id: super::super::WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
         state.menu_interaction = MenuInteractionState {
             open_root: Some(MenuItemId(1)),
             open_path: vec![MenuItemId(1), MenuItemId(2)],
@@ -3230,6 +3811,102 @@ mod tests {
             ..Default::default()
         };
         (state, registry)
+    }
+
+    fn open_keyboard_navigation(state: &mut State, registry: &mut MenuRegistry) {
+        assert!(reduce(
+            state,
+            Event::MenuRootClicked(MenuItemId(1)),
+            registry
+        ));
+        assert!(reduce(state, Event::MenuNavigationStarted, registry));
+    }
+
+    #[test]
+    fn keyboard_entry_from_closed_menu_opens_first_eligible_root_and_requests_grab() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction = MenuInteractionState::default();
+
+        assert!(reduce(
+            &mut state,
+            Event::MenuNavigationStarted,
+            &mut registry
+        ));
+        assert_eq!(state.menu_interaction.open_root, Some(MenuItemId(1)));
+        assert_eq!(state.menu_interaction.open_path, vec![MenuItemId(1)]);
+        let session = state.menu_navigation.as_ref().expect("navigation session");
+        assert_eq!(session.selected_path, Some(vec![MenuItemId(1)]));
+        assert_eq!(session.grab_state, KeyboardGrabState::Requested);
+    }
+
+    #[test]
+    fn keyboard_entry_from_open_root_keeps_that_root_selected() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+
+        assert!(reduce(
+            &mut state,
+            Event::MenuNavigationStarted,
+            &mut registry
+        ));
+        assert_eq!(state.menu_interaction.open_root, Some(MenuItemId(1)));
+        assert_eq!(
+            state.menu_navigation.as_ref().unwrap().selected_path,
+            Some(vec![MenuItemId(1)])
+        );
+    }
+
+    #[test]
+    fn keyboard_entry_rejects_no_menu_and_an_active_session() {
+        let mut empty = State::default();
+        assert!(!reduce(
+            &mut empty,
+            Event::MenuNavigationStarted,
+            &mut MenuRegistry::default()
+        ));
+        assert!(empty.menu_navigation.is_none());
+
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        assert!(reduce(
+            &mut state,
+            Event::MenuNavigationStarted,
+            &mut registry
+        ));
+        let session = state.menu_navigation.clone();
+        assert!(!reduce(
+            &mut state,
+            Event::MenuNavigationStarted,
+            &mut registry
+        ));
+        assert_eq!(state.menu_navigation, session);
+    }
+
+    #[test]
+    fn keyboard_entry_targets_the_pinned_presentation_not_live_focus() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        registry.register(WindowId(8), ":1.20".into(), "/menu-b".into());
+        state.menu_interaction = MenuInteractionState::default();
+        assert!(reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry
+        ));
+
+        assert!(reduce(
+            &mut state,
+            Event::MenuNavigationStarted,
+            &mut registry
+        ));
+        assert_eq!(state.focused_window, Some(WindowId(8)));
+        assert_eq!(state.menu_presentation_window(), Some(WindowId(7)));
+        assert_eq!(
+            state.menu_navigation.as_ref().unwrap().source_window,
+            WindowId(7)
+        );
     }
 
     #[test]
@@ -3331,6 +4008,10 @@ mod tests {
             endpoint: MenuSource::DbusMenu(ep()),
             model: interactive_model(),
         };
+        state.menu_presentation = Some(MenuPresentation {
+            window_id: super::super::WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
         assert!(reduce(
             &mut state,
             Event::MenuRootClicked(MenuItemId(1)),
@@ -3429,11 +4110,11 @@ mod tests {
             endpoint: MenuSource::DbusMenu(ep()),
             model: initial,
         };
-        reduce(
+        assert!(reduce(
             &mut state,
             Event::MenuRootClicked(MenuItemId(1)),
-            &mut registry,
-        );
+            &mut registry
+        ));
         reduce(
             &mut state,
             Event::MenuItemHovered {
@@ -3527,6 +4208,92 @@ mod tests {
             .watcher_generations
             .insert(MenuSource::DbusMenu(ep()), 10);
         (state, registry)
+    }
+
+    #[test]
+    fn keyboard_entry_reuses_lazy_root_about_to_show_lifecycle() {
+        let (mut state, mut registry) = lazy_root_state();
+        state.menu_presentation = Some(MenuPresentation {
+            window_id: WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
+
+        assert!(reduce(
+            &mut state,
+            Event::MenuNavigationStarted,
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_navigation.as_ref().unwrap().selected_path,
+            Some(vec![MenuItemId(1)])
+        );
+        assert!(state.menu_interaction.pending_lazy_root.is_some());
+        assert!(state.menu_interaction.open_root.is_none());
+
+        request_lazy_root(&mut state, &mut registry, 401);
+        assert!(state.menu_interaction.pending_about_to_show.is_some());
+    }
+
+    #[test]
+    fn keyboard_lazy_root_navigation_keys_keep_the_existing_pending_request() {
+        let (mut state, mut registry) = lazy_root_state();
+        state.menu_presentation = Some(MenuPresentation {
+            window_id: WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
+        assert!(reduce(
+            &mut state,
+            Event::MenuNavigationStarted,
+            &mut registry
+        ));
+        let pending = state.menu_interaction.pending_lazy_root.clone();
+        let session = state.menu_navigation.clone();
+
+        assert!(!reduce(&mut state, Event::MenuNavigateRight, &mut registry));
+        assert_eq!(state.menu_interaction.pending_lazy_root, pending);
+        assert_eq!(state.menu_navigation, session);
+
+        assert!(!reduce(&mut state, Event::MenuNavigateEnter, &mut registry));
+        assert_eq!(state.menu_interaction.pending_lazy_root, pending);
+        assert_eq!(state.menu_navigation, session);
+    }
+
+    #[test]
+    fn keyboard_entry_lazy_root_error_ends_the_pending_navigation_session() {
+        let (mut state, mut registry) = lazy_root_state();
+        state.menu_presentation = Some(MenuPresentation {
+            window_id: WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
+        assert!(reduce(
+            &mut state,
+            Event::MenuNavigationStarted,
+            &mut registry
+        ));
+        request_lazy_root(&mut state, &mut registry, 402);
+        let pending = state
+            .menu_interaction
+            .pending_about_to_show
+            .clone()
+            .unwrap();
+
+        assert!(reduce(
+            &mut state,
+            Event::MenuAboutToShowCompleted {
+                window_id: pending.window_id,
+                endpoint: pending.endpoint,
+                item_id: pending.item_id,
+                request_id: pending.request_id,
+                lazy_root: true,
+                intent_id: pending.intent_id,
+                watcher_generation: pending.watcher_generation,
+                need_update: false,
+                model: None,
+                error: Some("failed".into()),
+            },
+            &mut registry,
+        ));
+        assert!(state.menu_navigation.is_none());
     }
 
     fn click_lazy_root(state: &mut State, registry: &mut MenuRegistry) {
@@ -5293,5 +6060,796 @@ mod tests {
             },
             &mut registry
         ));
+    }
+
+    #[test]
+    fn keyboard_session_pins_presentation_and_keeps_focus_live() {
+        let (mut state, mut registry) = lazy_root_state();
+        state.menu = MenuState::Loaded {
+            window_id: super::super::WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+            model: interactive_model(),
+        };
+        state.menu_presentation = Some(MenuPresentation {
+            window_id: super::super::WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
+        open_keyboard_navigation(&mut state, &mut registry);
+        let session = state.menu_navigation.clone().unwrap();
+        assert_eq!(session.source_window, super::super::WindowId(7));
+        assert!(session.selected_path.is_some());
+        assert!(reduce(
+            &mut state,
+            Event::WindowFocused(Some(super::super::WindowId(8))),
+            &mut registry
+        ));
+        assert_eq!(state.focused_window, Some(super::super::WindowId(8)));
+        assert_eq!(
+            state.menu_presentation_window(),
+            Some(super::super::WindowId(7))
+        );
+        assert_eq!(state.menu_navigation.as_ref().unwrap().id, session.id);
+    }
+
+    #[test]
+    fn keyboard_session_ids_are_monotonic_and_grab_results_are_fenced() {
+        let (mut state, mut registry) = lazy_root_state();
+        state.menu = MenuState::Loaded {
+            window_id: super::super::WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+            model: interactive_model(),
+        };
+        state.menu_presentation = Some(MenuPresentation {
+            window_id: super::super::WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
+        open_keyboard_navigation(&mut state, &mut registry);
+        let first = state.menu_navigation.as_ref().unwrap().id;
+        assert!(reduce(
+            &mut state,
+            Event::KeyboardGrabAcquired { session_id: first },
+            &mut registry
+        ));
+        reduce(&mut state, Event::MenuNavigateEscape, &mut registry);
+        open_keyboard_navigation(&mut state, &mut registry);
+        let second = state.menu_navigation.as_ref().unwrap().id;
+        assert!(second > first);
+        assert!(!reduce(
+            &mut state,
+            Event::KeyboardGrabAcquired { session_id: first },
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_navigation.as_ref().unwrap().grab_state,
+            KeyboardGrabState::Requested
+        );
+    }
+
+    #[test]
+    fn keyboard_navigation_skips_nonselectable_items_without_wrapping() {
+        let (mut state, mut registry) = lazy_root_state();
+        state.menu = MenuState::Loaded {
+            window_id: super::super::WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+            model: interactive_model(),
+        };
+        state.menu_presentation = Some(MenuPresentation {
+            window_id: super::super::WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
+        open_keyboard_navigation(&mut state, &mut registry);
+        assert!(reduce(&mut state, Event::MenuNavigateDown, &mut registry));
+        let selected = state
+            .menu_navigation
+            .as_ref()
+            .unwrap()
+            .selected_path
+            .clone();
+        assert!(selected.is_some());
+        assert!(!reduce(&mut state, Event::MenuNavigateUp, &mut registry));
+        assert_eq!(
+            state.menu_navigation.as_ref().unwrap().selected_path,
+            Some(vec![MenuItemId(1), MenuItemId(2)])
+        );
+    }
+
+    #[test]
+    fn keyboard_escape_nested_unwinds_then_root_tears_down() {
+        let (mut state, mut registry) = lazy_root_state();
+        state.menu = MenuState::Loaded {
+            window_id: super::super::WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+            model: interactive_model(),
+        };
+        state.menu_presentation = Some(MenuPresentation {
+            window_id: super::super::WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
+        open_keyboard_navigation(&mut state, &mut registry);
+        state.menu_interaction.open_path = vec![MenuItemId(1), MenuItemId(2)];
+        state.menu_navigation.as_mut().unwrap().selected_path =
+            Some(vec![MenuItemId(1), MenuItemId(2)]);
+        assert!(reduce(&mut state, Event::MenuNavigateEscape, &mut registry));
+        assert!(state.menu_navigation.is_some());
+        assert_eq!(state.menu_interaction.open_path, vec![MenuItemId(1)]);
+        assert!(reduce(&mut state, Event::MenuNavigateEscape, &mut registry));
+        assert!(state.menu_navigation.is_none());
+    }
+
+    #[test]
+    fn keyboard_grab_failure_keeps_menu_mouse_operable() {
+        let (mut state, mut registry) = lazy_root_state();
+        state.menu = MenuState::Loaded {
+            window_id: WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+            model: interactive_model(),
+        };
+        state.menu_presentation = Some(MenuPresentation {
+            window_id: WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
+        open_keyboard_navigation(&mut state, &mut registry);
+        let session_id = state.menu_navigation.as_ref().unwrap().id;
+        assert!(reduce(
+            &mut state,
+            Event::KeyboardGrabFailed { session_id },
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_navigation.as_ref().unwrap().grab_state,
+            KeyboardGrabState::Failed
+        );
+        assert!(reduce(&mut state, Event::MenuNavigateDown, &mut registry));
+        assert!(state.menu_navigation.is_some());
+    }
+
+    #[test]
+    fn keyboard_nested_right_and_left_share_open_path() {
+        let (mut state, mut registry) = lazy_root_state();
+        state.menu = MenuState::Loaded {
+            window_id: WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+            model: interactive_model(),
+        };
+        state.menu_presentation = Some(MenuPresentation {
+            window_id: WindowId(7),
+            endpoint: MenuSource::DbusMenu(ep()),
+        });
+        open_keyboard_navigation(&mut state, &mut registry);
+        assert!(reduce(&mut state, Event::MenuNavigateDown, &mut registry));
+        assert!(!reduce(
+            &mut state,
+            Event::MenuItemHovered {
+                path: vec![MenuItemId(1), MenuItemId(2)],
+            },
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_navigation.as_ref().unwrap().selected_path,
+            Some(vec![MenuItemId(1), MenuItemId(2)])
+        );
+        assert!(reduce(&mut state, Event::MenuNavigateRight, &mut registry));
+        assert_eq!(
+            state.menu_interaction.open_path,
+            vec![MenuItemId(1), MenuItemId(2)]
+        );
+        assert!(reduce(&mut state, Event::MenuNavigateLeft, &mut registry));
+        assert_eq!(state.menu_interaction.open_path, vec![MenuItemId(1)]);
+    }
+
+    #[test]
+    fn keyboard_teardown_reconciles_to_latest_focus() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction = MenuInteractionState::default();
+        let source_c = MenuSource::DbusMenu(MenuEndpoint {
+            service: ":1.30".into(),
+            object_path: "/menu-c".into(),
+        });
+        registry.register(WindowId(9), ":1.30".into(), "/menu-c".into());
+        open_keyboard_navigation(&mut state, &mut registry);
+        assert!(reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(9))),
+            &mut registry
+        ));
+        assert_eq!(state.focused_window, Some(WindowId(9)));
+        assert!(reduce(&mut state, Event::MenuNavigateEscape, &mut registry));
+        assert!(state.menu_navigation.is_none());
+        assert_eq!(
+            state.menu_presentation,
+            Some(MenuPresentation {
+                window_id: WindowId(9),
+                endpoint: source_c,
+            })
+        );
+    }
+
+    #[test]
+    fn unrelated_window_destruction_does_not_end_pinned_session() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction = MenuInteractionState::default();
+        open_keyboard_navigation(&mut state, &mut registry);
+        assert!(!reduce(
+            &mut state,
+            Event::X11(crate::platform::x11::X11Event::GtkWindowDestroyed(
+                WindowId(9),
+            )),
+            &mut registry
+        ));
+        assert!(state.menu_navigation.is_some());
+        assert_eq!(state.menu_presentation_window(), Some(WindowId(7)));
+    }
+
+    #[test]
+    fn explicit_pin_keeps_presentation_without_navigation_and_unpins_to_current_focus() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction = MenuInteractionState::default();
+        let endpoint_b = MenuSource::DbusMenu(MenuEndpoint {
+            service: ":1.20".into(),
+            object_path: "/menu-b".into(),
+        });
+        registry.register(WindowId(8), ":1.20".into(), "/menu-b".into());
+        assert!(reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        assert!(matches!(
+            &state.menu_presentation_policy,
+            MenuPresentationPolicy::Pinned { workspace } if workspace == "1"
+        ));
+        assert!(state.menu_navigation.is_none());
+        assert!(reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry
+        ));
+        assert_eq!(state.focused_window, Some(WindowId(8)));
+        assert_eq!(state.menu_presentation_window(), Some(WindowId(7)));
+        assert!(reduce(
+            &mut state,
+            Event::UnpinMenuPresentation,
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_presentation,
+            Some(MenuPresentation {
+                window_id: WindowId(8),
+                endpoint: endpoint_b,
+            })
+        );
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+    }
+
+    #[test]
+    fn navigation_end_keeps_explicit_pin_but_reconciles_without_one() {
+        let (mut pinned, mut registry) = loaded_menu_with_open_presentation();
+        pinned.menu_interaction = MenuInteractionState::default();
+        registry.register(WindowId(8), ":1.20".into(), "/menu-b".into());
+        assert!(reduce(
+            &mut pinned,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        open_keyboard_navigation(&mut pinned, &mut registry);
+        assert!(reduce(
+            &mut pinned,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut pinned,
+            Event::MenuNavigateEscape,
+            &mut registry
+        ));
+        assert_eq!(pinned.menu_presentation_window(), Some(WindowId(7)));
+        assert!(matches!(
+            pinned.menu_presentation_policy,
+            MenuPresentationPolicy::Pinned { .. }
+        ));
+
+        let (mut temporary, mut registry) = loaded_menu_with_open_presentation();
+        temporary.menu_interaction = MenuInteractionState::default();
+        registry.register(WindowId(8), ":1.20".into(), "/menu-b".into());
+        open_keyboard_navigation(&mut temporary, &mut registry);
+        assert!(reduce(
+            &mut temporary,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut temporary,
+            Event::MenuNavigateEscape,
+            &mut registry
+        ));
+        assert_eq!(temporary.menu_presentation_window(), Some(WindowId(8)));
+        assert_eq!(
+            temporary.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+    }
+
+    #[test]
+    fn pinned_source_invalidation_unpins_but_unrelated_source_does_not() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction = MenuInteractionState::default();
+        registry.register(WindowId(8), ":1.20".into(), "/menu-b".into());
+        assert!(reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry
+        ));
+        assert!(!reduce(
+            &mut state,
+            Event::MenuUnregistered {
+                window_id: WindowId(9),
+            },
+            &mut registry
+        ));
+        assert!(matches!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::Pinned { .. }
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::MenuUnregistered {
+                window_id: WindowId(7),
+            },
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+        assert_eq!(state.menu_presentation_window(), Some(WindowId(8)));
+    }
+
+    #[test]
+    fn presentation_pin_toggle_switches_between_pin_and_follow_focus() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction = MenuInteractionState::default();
+        assert!(reduce(
+            &mut state,
+            Event::ToggleMenuPresentationPin,
+            &mut registry
+        ));
+        assert!(matches!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::Pinned { .. }
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::ToggleMenuPresentationPin,
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+    }
+
+    #[test]
+    fn pin_toggle_ends_active_navigation_only_when_disarming_an_explicit_pin() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction = MenuInteractionState::default();
+        assert!(reduce(
+            &mut state,
+            Event::ToggleMenuPresentationPin,
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::MenuRootClicked(MenuItemId(1)),
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::MenuNavigationStarted,
+            &mut registry
+        ));
+        assert!(state.menu_navigation.is_some());
+
+        assert!(reduce(
+            &mut state,
+            Event::ToggleMenuPresentationPin,
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+        assert!(state.menu_navigation.is_none());
+    }
+
+    #[test]
+    fn pin_without_a_current_presentation_is_a_noop() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+
+        assert!(!reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        assert!(!reduce(
+            &mut state,
+            Event::ToggleMenuPresentationPin,
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+        assert!(state.menu_navigation.is_none());
+    }
+
+    #[test]
+    fn pin_requires_a_named_current_workspace() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.focused_workspace = None;
+        assert!(!reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        state.focused_workspace = Some(String::new());
+        assert!(!reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+    }
+
+    #[test]
+    fn idle_pin_keeps_one_presentation_across_focus_changes() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        let presentation = state.menu_presentation.clone();
+        let model = state.active_menu_model().cloned();
+        state.menu_interaction = MenuInteractionState::default();
+
+        assert!(reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        for window_id in [WindowId(6), WindowId(8), WindowId(9)] {
+            assert!(reduce(
+                &mut state,
+                Event::WindowFocused(Some(window_id)),
+                &mut registry
+            ));
+        }
+
+        assert_eq!(state.focused_window, Some(WindowId(9)));
+        assert_eq!(state.menu_presentation, presentation);
+        assert_eq!(state.active_menu_model(), model.as_ref());
+        assert!(state.menu_navigation.is_none());
+    }
+
+    #[test]
+    fn mouse_popup_open_and_close_do_not_start_navigation_or_unpin() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction = MenuInteractionState::default();
+        assert!(reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+
+        assert!(reduce(
+            &mut state,
+            Event::MenuRootClicked(MenuItemId(1)),
+            &mut registry
+        ));
+        assert!(state.menu_interaction.open_root.is_some());
+        assert!(state.menu_navigation.is_none());
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::Pinned {
+                workspace: "1".into()
+            }
+        );
+
+        assert!(reduce(&mut state, Event::MenuClickedOutside, &mut registry));
+        assert!(state.menu_interaction.open_root.is_none());
+        assert!(state.menu_navigation.is_none());
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::Pinned {
+                workspace: "1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_pin_survives_terminal_action_and_outside_click() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction = MenuInteractionState::default();
+        assert!(reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        open_keyboard_navigation(&mut state, &mut registry);
+        state.menu_interaction.open_path = vec![MenuItemId(1), MenuItemId(2)];
+        state.menu_navigation.as_mut().unwrap().selected_path =
+            Some(vec![MenuItemId(1), MenuItemId(2), MenuItemId(3)]);
+        assert!(reduce(
+            &mut state,
+            Event::MenuItemActivateRequested {
+                window_id: WindowId(7),
+                endpoint: MenuSource::DbusMenu(ep()),
+                item_id: MenuItemId(3),
+                timestamp: 0,
+            },
+            &mut registry
+        ));
+        assert!(state.menu_navigation.is_none());
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::Pinned {
+                workspace: "1".into()
+            }
+        );
+
+        assert!(reduce(
+            &mut state,
+            Event::MenuRootClicked(MenuItemId(1)),
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::MenuNavigationStarted,
+            &mut registry
+        ));
+        assert!(reduce(&mut state, Event::MenuClickedOutside, &mut registry));
+        assert!(state.menu_navigation.is_none());
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::Pinned {
+                workspace: "1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn idle_pin_accepts_only_the_presented_source_load_result() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        state.menu_interaction = MenuInteractionState::default();
+        assert!(reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry
+        ));
+        let endpoint = MenuSource::DbusMenu(ep());
+        assert!(reduce(
+            &mut state,
+            Event::MenuLoadRequested {
+                window_id: WindowId(7),
+                endpoint: endpoint.clone(),
+                request_id: 91,
+            },
+            &mut registry
+        ));
+        assert!(!reduce(
+            &mut state,
+            Event::MenuLoaded {
+                window_id: WindowId(8),
+                endpoint: endpoint.clone(),
+                request_id: 91,
+                model: model(),
+            },
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::MenuLoaded {
+                window_id: WindowId(7),
+                endpoint,
+                request_id: 91,
+                model: interactive_model(),
+            },
+            &mut registry
+        ));
+        assert_eq!(state.menu_presentation_window(), Some(WindowId(7)));
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::Pinned {
+                workspace: "1".into()
+            }
+        );
+        assert!(state.menu_navigation.is_none());
+    }
+
+    #[test]
+    fn endpoint_owner_vanish_invalidates_only_the_explicit_pin() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        registry.register(WindowId(8), ":1.20".into(), "/menu-b".into());
+        assert!(reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::MenuOwnerVanished {
+                sender: ":1.9".into(),
+            },
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+        assert_eq!(state.menu_presentation_window(), Some(WindowId(8)));
+    }
+
+    #[test]
+    fn workspace_change_ends_idle_pin_without_reactivating_or_moving_its_source() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        let endpoint_b = MenuSource::DbusMenu(MenuEndpoint {
+            service: ":1.20".into(),
+            object_path: "/menu-b".into(),
+        });
+        registry.register(WindowId(8), ":1.20".into(), "/menu-b".into());
+        state.menu_interaction = MenuInteractionState::default();
+        assert!(reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+
+        for window_id in [WindowId(6), WindowId(8)] {
+            assert!(reduce(
+                &mut state,
+                Event::WindowFocused(Some(window_id)),
+                &mut registry
+            ));
+            assert!(matches!(
+                &state.menu_presentation_policy,
+                MenuPresentationPolicy::Pinned { workspace } if workspace == "1"
+            ));
+            assert_eq!(state.menu_presentation_window(), Some(WindowId(7)));
+        }
+
+        assert!(reduce(
+            &mut state,
+            Event::WorkspaceFocused {
+                name: Some("2".into()),
+            },
+            &mut registry
+        ));
+        assert_eq!(state.focused_workspace.as_deref(), Some("2"));
+        assert_eq!(state.focused_window, Some(WindowId(8)));
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+        assert_eq!(state.menu_presentation, None);
+        assert!(state.menu_navigation.is_none());
+        assert!(reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_presentation,
+            Some(MenuPresentation {
+                window_id: WindowId(8),
+                endpoint: endpoint_b,
+            })
+        );
+
+        assert!(reduce(
+            &mut state,
+            Event::WorkspaceFocused {
+                name: Some("1".into()),
+            },
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+    }
+
+    #[test]
+    fn workspace_change_ends_active_navigation_and_workspace_snapshot_does_the_same() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        registry.register(WindowId(8), ":1.20".into(), "/menu-b".into());
+        state.menu_interaction = MenuInteractionState::default();
+        assert!(reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+        open_keyboard_navigation(&mut state, &mut registry);
+        let session_id = state.menu_navigation.as_ref().unwrap().id;
+        assert!(reduce(
+            &mut state,
+            Event::KeyboardGrabAcquired { session_id },
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry
+        ));
+
+        assert!(reduce(
+            &mut state,
+            Event::WorkspacesSnapshot(vec![ws("1", false), ws("2", true)]),
+            &mut registry
+        ));
+        assert!(state.menu_navigation.is_none());
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+        assert_eq!(state.focused_workspace.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn workspace_event_before_focus_clears_old_presentation_then_converges_to_new_focus() {
+        let (mut state, mut registry) = loaded_menu_with_open_presentation();
+        let endpoint_b = MenuSource::DbusMenu(MenuEndpoint {
+            service: ":1.20".into(),
+            object_path: "/menu-b".into(),
+        });
+        registry.register(WindowId(8), ":1.20".into(), "/menu-b".into());
+        state.menu_interaction = MenuInteractionState::default();
+        assert!(reduce(
+            &mut state,
+            Event::PinCurrentMenuPresentation,
+            &mut registry
+        ));
+
+        assert!(reduce(
+            &mut state,
+            Event::WorkspaceFocused {
+                name: Some("2".into()),
+            },
+            &mut registry
+        ));
+        assert_eq!(state.menu_presentation, None);
+        assert_eq!(
+            state.menu_presentation_policy,
+            MenuPresentationPolicy::FollowFocus
+        );
+
+        assert!(reduce(
+            &mut state,
+            Event::WindowFocused(Some(WindowId(8))),
+            &mut registry
+        ));
+        assert_eq!(
+            state.menu_presentation,
+            Some(MenuPresentation {
+                window_id: WindowId(8),
+                endpoint: endpoint_b,
+            })
+        );
     }
 }
