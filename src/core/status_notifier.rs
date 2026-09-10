@@ -119,6 +119,7 @@ impl StatusNotifierItemRegistry {
     }
 }
 
+#[cfg(test)]
 pub fn format_notifier_item_id(endpoint: &StatusNotifierEndpoint) -> String {
     format!("{}{}", endpoint.service, endpoint.object_path)
 }
@@ -166,6 +167,9 @@ impl StatusNotifierRegistry {
             }
         });
         removed
+    }
+    pub fn is_empty(&self) -> bool {
+        self.endpoints.is_empty()
     }
     #[cfg(test)]
     pub fn len(&self) -> usize {

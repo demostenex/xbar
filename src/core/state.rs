@@ -92,6 +92,7 @@ pub struct WifiDevice {
     pub access_points: Vec<NetworkAccessPoint>,
 }
 
+#[allow(dead_code)] // Kept as a domain mapping for a future network details presentation.
 pub fn wifi_device_state_label(state: u32) -> &'static str {
     match state {
         10 => "Não gerenciada",
