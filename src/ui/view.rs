@@ -456,7 +456,8 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth_and_plugins<M: TextMea
             .map(|((id, label, enabled), rect)| MenuVisualItem {
                 id,
                 rect,
-                label,
+                label: truncate_text(&label, rect.width.saturating_sub(16), measurer)
+                    .unwrap_or_default(),
                 enabled,
             })
             .collect(),
@@ -491,15 +492,23 @@ fn right_cluster_reservation<M: TextMeasurer>(
     bluetooth: Option<&crate::core::BluetoothState>,
     measurer: &M,
 ) -> i32 {
-    let plugin_width = plugin_labels
-        .iter()
-        .map(|label| measurer.measure_width(label) as i32 + 12)
-        .sum::<i32>();
-    let plugin_gaps = plugin_labels.len().saturating_sub(1) as i32 * STATUS_ITEM_GAP as i32;
+    let plugin_width = plugin_labels.iter().fold(0_i32, |total, label| {
+        total.saturating_add(measurer.measure_width(label) as i32 + 12)
+    });
+    let plugin_count = i32::try_from(plugin_labels.len()).unwrap_or(i32::MAX);
+    let plugin_gaps = plugin_count
+        .saturating_sub(1)
+        .saturating_mul(STATUS_ITEM_GAP as i32);
     const TRAY_ITEM_WIDTH: i32 = 20;
     const TRAY_ITEM_GAP: i32 = 4;
-    let tray_width =
-        tray_count as i32 * TRAY_ITEM_WIDTH + tray_count.saturating_sub(1) as i32 * TRAY_ITEM_GAP;
+    let tray_count_i32 = i32::try_from(tray_count).unwrap_or(i32::MAX);
+    let tray_width = tray_count_i32
+        .saturating_mul(TRAY_ITEM_WIDTH)
+        .saturating_add(
+            tray_count_i32
+                .saturating_sub(1)
+                .saturating_mul(TRAY_ITEM_GAP),
+        );
     let audio_width = if audio.is_some_and(|state| state.available) {
         ["󰖁", "󰕿", "󰖀", "󰕾"]
             .iter()
@@ -516,20 +525,9 @@ fn right_cluster_reservation<M: TextMeasurer>(
     let status_count = (audio_width > 0) as i32
         + (network_width > 0) as i32
         + (bluetooth_width > 0) as i32
-        + (tray_count > 0) as i32;
+        + (tray_count_i32 > 0) as i32;
     let gaps = status_count.saturating_sub(1) * STATUS_ITEM_GAP as i32;
-    plugin_width
-        + plugin_gaps
-        + tray_width
-        + audio_width
-        + network_width
-        + bluetooth_width
-        + gaps
-        + if plugin_labels.is_empty() {
-            0
-        } else {
-            STATUS_ITEM_GAP as i32
-        }
+    plugin_width + plugin_gaps + tray_width + audio_width + network_width + bluetooth_width + gaps
 }
 
 fn truncate_text<M: TextMeasurer>(text: &str, width: u16, measurer: &M) -> Option<String> {

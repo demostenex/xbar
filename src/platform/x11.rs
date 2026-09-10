@@ -2439,7 +2439,12 @@ impl X11Platform {
                     )?
                     .check()?;
                 self.text.draw_utf8(
-                    &workspace.name,
+                    &layout::truncate_text_to_width(
+                        &workspace.name,
+                        rect.width.saturating_sub(12),
+                        &self.text,
+                    )
+                    .unwrap_or_default(),
                     x as i32 + BAR_STYLE.horizontal_padding as i32,
                     self.text.baseline(BAR_HEIGHT) as i32,
                     BAR_STYLE.workspace_foreground,
@@ -2472,7 +2477,12 @@ impl X11Platform {
                     BAR_STYLE.menu_disabled_foreground
                 };
                 self.text.draw_utf8(
-                    &item.label,
+                    &layout::truncate_text_to_width(
+                        &item.label,
+                        item.rect.width.saturating_sub(16),
+                        &self.text,
+                    )
+                    .unwrap_or_default(),
                     x as i32,
                     self.text.baseline(BAR_HEIGHT) as i32,
                     color,
@@ -2482,7 +2492,8 @@ impl X11Platform {
                 if let Some(title) = &context.app_name {
                     let x = title.rect.x.saturating_sub(output.x) as i32;
                     self.text.draw_utf8(
-                        &title.text,
+                        &layout::truncate_text_to_width(&title.text, title.rect.width, &self.text)
+                            .unwrap_or_default(),
                         x,
                         self.text.baseline(BAR_HEIGHT) as i32,
                         BAR_STYLE.material.foreground,
@@ -2597,7 +2608,12 @@ impl X11Platform {
                 }
                 let x = plugin.rect.x.saturating_sub(output.x) as i32 + 6;
                 self.text.draw_utf8(
-                    &plugin.text,
+                    &layout::truncate_text_to_width(
+                        &plugin.text,
+                        plugin.rect.width.saturating_sub(12),
+                        &self.text,
+                    )
+                    .unwrap_or_default(),
                     x,
                     self.text.baseline(BAR_HEIGHT) as i32,
                     BAR_STYLE.material.foreground,
@@ -2626,7 +2642,12 @@ impl X11Platform {
                 if draw_datetime {
                     let x = datetime.rect.x.saturating_sub(output.x).saturating_add(8);
                     self.text.draw_utf8(
-                        &datetime.text,
+                        &layout::truncate_text_to_width(
+                            &datetime.text,
+                            datetime.rect.width.saturating_sub(8),
+                            &self.text,
+                        )
+                        .unwrap_or_default(),
                         x as i32,
                         self.text.baseline(BAR_HEIGHT) as i32,
                         BAR_STYLE.material.foreground,
@@ -2703,13 +2724,14 @@ impl X11Platform {
         let output_count = state.audio.outputs.len().min(8);
         let input_count = state.audio.inputs.len().min(8);
         let content_height = 316 + output_count as u16 * 24 + input_count as u16 * 24;
+        let popup_width = 340_u16.min(output.width.max(1));
         let popup_height = content_height
             .max(280)
-            .min(output.height.saturating_sub(26).max(280));
+            .min(output.height.saturating_sub(26).max(1));
         let rect = layout::MenuRect {
-            x: output.x + output.width as i16 - 340,
+            x: (output.x as i32 + output.width as i32 - popup_width as i32) as i16,
             y: output.y + 26,
-            width: 340,
+            width: popup_width,
             height: popup_height,
         };
         let card_x = rect.x + POPUP_STYLE.outer_padding as i16;
@@ -2922,7 +2944,15 @@ impl X11Platform {
             };
             let (x, y) = device.label_position(rect);
             self.text.draw_popup_utf8(
-                &format!("{marker} {}", device.display_name),
+                &format!(
+                    "{marker} {}",
+                    layout::truncate_text_to_width(
+                        &device.display_name,
+                        device.rect.width.saturating_sub(8),
+                        &PopupMeasurer(&self.text),
+                    )
+                    .unwrap_or_default()
+                ),
                 x,
                 y,
                 BAR_STYLE.material.foreground,
@@ -3015,17 +3045,27 @@ impl X11Platform {
             .outputs
             .first()
             .ok_or("no output for bluetooth popup")?;
-        let devices: Vec<_> = state
+        let mut devices: Vec<_> = state
             .bluetooth
             .devices
             .iter()
             .filter(|d| d.connected || d.paired)
             .collect();
+        let popup_width = 330_u16.min(output.width.max(1));
+        let popup_height = (72_u32
+            .saturating_add(
+                u32::try_from(devices.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(30),
+            )
+            .min(u32::from(u16::MAX)) as u16)
+            .min(output.height.saturating_sub(26).max(1));
+        devices.truncate(usize::from(popup_height.saturating_sub(72) / 30));
         let rect = layout::MenuRect {
-            x: (output.x + output.width as i16 - 330).max(output.x),
+            x: (output.x as i32 + output.width as i32 - popup_width as i32) as i16,
             y: output.y + 26,
-            width: 330,
-            height: (72 + devices.len() as u16 * 30).min(output.height.saturating_sub(26).max(120)),
+            width: popup_width,
+            height: popup_height,
         };
         let power = layout::MenuRect {
             x: rect.x + rect.width as i16 - 82,
@@ -3168,8 +3208,20 @@ impl X11Platform {
                     _ => None,
                 })
                 .unwrap_or(if d.connected { "Connected" } else { "Paired" });
+            let status_width = self.text.measure_popup_width(status);
+            let name_width = popup_width
+                .saturating_sub(
+                    POPUP_STYLE
+                        .outer_padding
+                        .saturating_add(POPUP_STYLE.card_padding)
+                        .saturating_mul(2),
+                )
+                .saturating_sub(status_width)
+                .saturating_sub(24);
+            let name = layout::truncate_text_to_width(name, name_width, &PopupMeasurer(&self.text))
+                .unwrap_or_default();
             self.text.draw_popup_utf8(
-                &format!("{marker} {name:<20} {status}"),
+                &format!("{marker} {name} {status}"),
                 (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding - POPUP_STYLE.border_width)
                     as i32,
                 81 + i as i32 * 30,
@@ -3232,12 +3284,13 @@ impl X11Platform {
             .iter()
             .map(|(_, targets)| targets.len())
             .collect();
+        let popup_height = layout::network_popup_content_height(&interface_row_counts)
+            .min(output.height.saturating_sub(26).max(1));
         let rect = layout::MenuRect {
-            x: (output.x + output.width as i16 - popup_width as i16).max(output.x),
+            x: (output.x as i32 + output.width as i32 - popup_width as i32) as i16,
             y: output.y + 26,
             width: popup_width,
-            height: layout::network_popup_content_height(&interface_row_counts)
-                .min(output.height.saturating_sub(26).max(120)),
+            height: popup_height,
         };
         let network_layout = layout::network_popup_layout(rect, &interface_row_counts);
         let status_card = network_layout.status_card;
@@ -3388,7 +3441,12 @@ impl X11Platform {
         )?;
         for ((interface, _), card) in interface_targets.iter().zip(&network_layout.interfaces) {
             self.text.draw_popup_utf8(
-                interface,
+                &layout::truncate_text_to_width(
+                    interface,
+                    card.header.width.saturating_sub(4),
+                    &PopupMeasurer(&self.text),
+                )
+                .unwrap_or_default(),
                 (card.header.x - rect.x) as i32,
                 (card.header.y - rect.y + self.text.popup_baseline(card.header.height)) as i32,
                 POPUP_STYLE.muted_foreground,
@@ -3418,8 +3476,19 @@ impl X11Platform {
                 height: row.height.saturating_sub(8),
             };
             self.draw_popup_card(window, gc, rect, button)?;
-            self.text.draw_popup_utf8(
+            let label_width = button
+                .x
+                .saturating_sub(row.x)
+                .saturating_sub(card_padding)
+                .saturating_sub(4) as u16;
+            let label = layout::truncate_text_to_width(
                 &network_primary_row_label(&access_point.ssid, access_point.is_active),
+                label_width,
+                &PopupMeasurer(&self.text),
+            )
+            .unwrap_or_default();
+            self.text.draw_popup_utf8(
+                &label,
                 (row.x - rect.x + card_padding) as i32,
                 (row.y - rect.y + self.text.popup_baseline(row.height)) as i32,
                 BAR_STYLE.material.foreground,
