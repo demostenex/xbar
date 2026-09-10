@@ -842,10 +842,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
             let previous_audio_glyph = (state.audio.available, ui::view::audio_glyph(&state.audio));
-            let mut event_render_target = render_target_for(&translated, &mouse_target, &x11);
-            if popup_hover_changed {
-                event_render_target = Some(RenderTarget::Popup);
-            }
+            let mut semantic_render_target = render_target_for(&translated, &mouse_target, &x11);
             let tray_menu_open = match &translated {
                 Event::TrayMenuOpenRequested { endpoint } => Some(endpoint.clone()),
                 _ => None,
@@ -1094,7 +1091,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let current_audio_glyph =
                     (state.audio.available, ui::view::audio_glyph(&state.audio));
                 if previous_audio_glyph == current_audio_glyph {
-                    event_render_target = None;
+                    semantic_render_target = None;
                 }
             }
             dirty |= reduced || popup_hover_changed;
@@ -1250,13 +1247,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 dbus.request_layout(core::WindowId(u32::MAX), endpoint, request_id);
             }
-            if reduced {
-                if let Some(target) = event_render_target {
-                    render_target = Some(match render_target {
-                        Some(current) => current.merge(target),
-                        None => target,
-                    });
-                }
+            let event_render_target =
+                render_target_for_changes(reduced, semantic_render_target, popup_hover_changed);
+            if let Some(target) = event_render_target {
+                render_target = merge_render_target(render_target, Some(target));
             }
             let current_active_source =
                 state.active_menu_endpoint(&registry.lock().expect("registry poisoned"));
@@ -1530,31 +1524,12 @@ fn render_target_for(
             Some(RenderTarget::Workspaces)
         }
         Event::OutputsChanged(_) => Some(RenderTarget::Dock),
-        Event::X11(platform::x11::X11Event::MotionNotify { .. })
-        | Event::MenuItemHovered { .. } => match mouse_target {
-            Some(HitTarget::Item(_)) => Some(RenderTarget::Popup),
-            Some(HitTarget::TopLevel(_)) => Some(RenderTarget::DockContext),
-            Some(HitTarget::Outside) | None => None,
-            Some(HitTarget::Tray(_)) => None,
-            Some(HitTarget::AudioTrack) | Some(HitTarget::AudioInputTrack) => {
-                Some(RenderTarget::Popup)
-            }
-            Some(HitTarget::Audio)
-            | Some(HitTarget::AudioMute)
-            | Some(HitTarget::AudioInputMute)
-            | Some(HitTarget::AudioInside) => None,
-            Some(HitTarget::AudioOutputDevice(_)) | Some(HitTarget::AudioInputDevice(_)) => {
-                Some(RenderTarget::Popup)
-            }
-            Some(HitTarget::BluetoothDevice(_)) => Some(RenderTarget::Popup),
-            Some(HitTarget::BluetoothPower)
-            | Some(HitTarget::BluetoothInside)
-            | Some(HitTarget::Bluetooth) => None,
-            Some(HitTarget::NetworkWireless)
-            | Some(HitTarget::NetworkInside)
-            | Some(HitTarget::NetworkWifi(_))
-            | Some(HitTarget::Network) => None,
-        },
+        Event::X11(platform::x11::X11Event::MotionNotify { .. }) => {
+            hover_render_target_for(mouse_target.as_ref(), None)
+        }
+        Event::MenuItemHovered { .. } => {
+            hover_render_target_for(mouse_target.as_ref(), Some(RenderTarget::DockContext))
+        }
         Event::MenuClickedOutside => Some(RenderTarget::Popup),
         Event::MenuAboutToShowRequested { .. } => Some(RenderTarget::Popup),
         Event::MenuAboutToShowCompleted { need_update, .. } => Some(if *need_update {
@@ -1607,6 +1582,56 @@ fn render_target_for(
         Event::NotificationsSnapshot(_) => Some(RenderTarget::Notification),
         _ => Some(RenderTarget::All),
     }
+}
+
+fn hover_render_target_for(
+    mouse_target: Option<&HitTarget>,
+    outside_target: Option<RenderTarget>,
+) -> Option<RenderTarget> {
+    match mouse_target {
+        Some(HitTarget::Item(_)) => Some(RenderTarget::Popup),
+        Some(HitTarget::TopLevel(_)) => Some(RenderTarget::DockContext),
+        Some(HitTarget::Outside) | None => outside_target,
+        Some(HitTarget::Tray(_)) => None,
+        Some(HitTarget::AudioTrack) | Some(HitTarget::AudioInputTrack) => Some(RenderTarget::Popup),
+        Some(HitTarget::Audio)
+        | Some(HitTarget::AudioMute)
+        | Some(HitTarget::AudioInputMute)
+        | Some(HitTarget::AudioInside) => None,
+        Some(HitTarget::AudioOutputDevice(_)) | Some(HitTarget::AudioInputDevice(_)) => {
+            Some(RenderTarget::Popup)
+        }
+        Some(HitTarget::BluetoothDevice(_)) => Some(RenderTarget::Popup),
+        Some(HitTarget::BluetoothPower)
+        | Some(HitTarget::BluetoothInside)
+        | Some(HitTarget::Bluetooth) => None,
+        Some(HitTarget::NetworkWireless)
+        | Some(HitTarget::NetworkInside)
+        | Some(HitTarget::NetworkWifi(_))
+        | Some(HitTarget::Network) => None,
+    }
+}
+
+fn merge_render_target(
+    current: Option<RenderTarget>,
+    required: Option<RenderTarget>,
+) -> Option<RenderTarget> {
+    match (current, required) {
+        (Some(current), Some(required)) => Some(current.merge(required)),
+        (Some(current), None) => Some(current),
+        (None, Some(required)) => Some(required),
+        (None, None) => None,
+    }
+}
+
+fn render_target_for_changes(
+    reduced: bool,
+    semantic_target: Option<RenderTarget>,
+    popup_hover_changed: bool,
+) -> Option<RenderTarget> {
+    let semantic_target = reduced.then_some(semantic_target).flatten();
+    let popup_hover_target = popup_hover_changed.then_some(RenderTarget::Popup);
+    merge_render_target(semantic_target, popup_hover_target)
 }
 
 fn tray_action_event(
@@ -1697,8 +1722,12 @@ fn keyboard_event(
 
 #[cfg(test)]
 mod scheduler_tests {
-    use super::{pending_lazy_root_to_schedule, should_schedule_invalidation};
+    use super::{
+        hover_render_target_for, merge_render_target, pending_lazy_root_to_schedule,
+        render_target_for_changes, should_schedule_invalidation,
+    };
     use crate::core::{LazyRootOpenPending, MenuEndpoint, MenuItemId, MenuSource, WindowId};
+    use crate::platform::x11::{HitTarget, RenderTarget};
 
     fn pending(
         window_id: u32,
@@ -1783,6 +1812,78 @@ mod scheduler_tests {
         assert_eq!(
             pending_lazy_root_to_schedule(Some(&before), Some(&after)),
             Some(&after)
+        );
+    }
+
+    #[test]
+    fn changed_local_popup_hover_requires_popup_without_reducer_change() {
+        assert_eq!(
+            render_target_for_changes(false, None, true),
+            Some(RenderTarget::Popup)
+        );
+    }
+
+    #[test]
+    fn unchanged_local_popup_hover_requires_no_render_target() {
+        assert_eq!(
+            render_target_for_changes(false, Some(RenderTarget::Popup), false),
+            None
+        );
+    }
+
+    #[test]
+    fn semantic_and_auxiliary_popup_targets_stay_popup_scoped() {
+        assert_eq!(
+            render_target_for_changes(true, Some(RenderTarget::Popup), true),
+            Some(RenderTarget::Popup)
+        );
+    }
+
+    #[test]
+    fn auxiliary_popup_target_cannot_replace_dock_context_target() {
+        assert_eq!(
+            render_target_for_changes(true, Some(RenderTarget::DockContext), true),
+            Some(RenderTarget::DockContext.merge(RenderTarget::Popup))
+        );
+    }
+
+    #[test]
+    fn global_menu_popup_item_hover_is_popup_scoped() {
+        assert_eq!(
+            hover_render_target_for(
+                Some(&HitTarget::Item(vec![MenuItemId(1)])),
+                Some(RenderTarget::DockContext),
+            ),
+            Some(RenderTarget::Popup)
+        );
+    }
+
+    #[test]
+    fn global_menu_hover_outside_clears_dock_context_without_all_fallback() {
+        let semantic_target =
+            hover_render_target_for(Some(&HitTarget::Outside), Some(RenderTarget::DockContext));
+        assert_eq!(semantic_target, Some(RenderTarget::DockContext));
+        assert_eq!(
+            render_target_for_changes(true, semantic_target, false),
+            Some(RenderTarget::DockContext)
+        );
+    }
+
+    #[test]
+    fn menu_popup_exit_merges_popup_and_dock_context_requirements() {
+        let semantic_target =
+            hover_render_target_for(Some(&HitTarget::Outside), Some(RenderTarget::DockContext));
+        assert_eq!(
+            render_target_for_changes(true, semantic_target, true),
+            Some(RenderTarget::DockContext.merge(RenderTarget::Popup))
+        );
+    }
+
+    #[test]
+    fn genuine_global_invalidation_remains_all_after_target_merge() {
+        assert_eq!(
+            merge_render_target(Some(RenderTarget::All), Some(RenderTarget::Popup)),
+            Some(RenderTarget::All)
         );
     }
 }
