@@ -397,6 +397,8 @@ enum PopupHover {
     MenuItem(crate::core::MenuItemId),
     AudioOutputDevice(String),
     AudioInputDevice(String),
+    BluetoothPower,
+    BluetoothDevice(String),
     NetworkWifi(NetworkWifiTarget),
     NetworkWireless,
 }
@@ -882,6 +884,21 @@ impl X11Platform {
         Ok(())
     }
 
+    fn switch_thumb_rect(rect: layout::MenuRect, enabled: bool) -> layout::MenuRect {
+        let thumb = rect.height.saturating_sub(6);
+        let x_offset = if enabled {
+            rect.width.saturating_sub(thumb.saturating_add(3))
+        } else {
+            3
+        };
+        layout::MenuRect {
+            x: rect.x.saturating_add(x_offset as i16),
+            y: rect.y.saturating_add(3),
+            width: thumb,
+            height: thumb,
+        }
+    }
+
     fn draw_switch(
         &self,
         window: u32,
@@ -907,7 +924,7 @@ impl X11Platform {
                 height: rect.height,
             }],
         )?;
-        let thumb = rect.height.saturating_sub(6);
+        let thumb = Self::switch_thumb_rect(rect, enabled);
         self.conn
             .change_gc(
                 gc,
@@ -921,15 +938,10 @@ impl X11Platform {
             window,
             gc,
             &[xproto::Rectangle {
-                x: rect.x - popup.x
-                    + if enabled {
-                        rect.width.saturating_sub(thumb + 3) as i16
-                    } else {
-                        3
-                    },
-                y: rect.y - popup.y + 3,
-                width: thumb,
-                height: thumb,
+                x: thumb.x - popup.x,
+                y: thumb.y - popup.y,
+                width: thumb.width,
+                height: thumb.height,
             }],
         )?;
         Ok(())
@@ -3068,10 +3080,13 @@ impl X11Platform {
             height: popup_height,
         };
         let power = layout::MenuRect {
-            x: rect.x + rect.width as i16 - 82,
+            x: rect.x + rect.width as i16
+                - POPUP_STYLE.outer_padding as i16
+                - POPUP_STYLE.card_padding as i16
+                - 46,
             y: rect.y + POPUP_STYLE.outer_padding as i16 + POPUP_STYLE.card_padding as i16,
-            width: 68,
-            height: 28,
+            width: 46,
+            height: 22,
         };
         let rows: Vec<_> = devices
             .iter()
@@ -3158,25 +3173,25 @@ impl X11Platform {
                 height: rect.height.saturating_sub(POPUP_STYLE.outer_padding * 2),
             },
         )?;
-        let power_label = state
-            .bluetooth_pending
-            .iter()
-            .find_map(|pending| match pending {
-                crate::core::BluetoothPendingAction::SetPowered(powered) => Some(if *powered {
-                    "Ligando..."
-                } else {
-                    "Desligando..."
-                }),
-                _ => None,
-            })
-            .unwrap_or(if state.bluetooth.powered { "ON" } else { "OFF" });
+        if matches!(self.popup_hover, Some(PopupHover::BluetoothPower)) {
+            self.draw_popup_hover(window, gc, rect, power)?;
+        }
+        for (path, device) in &rows {
+            if matches!(
+                self.popup_hover,
+                Some(PopupHover::BluetoothDevice(ref hovered)) if hovered == path
+            ) {
+                self.draw_popup_hover(window, gc, rect, *device)?;
+            }
+        }
         self.text.draw_popup_utf8(
-            &format!("Bluetooth                 {power_label}"),
+            "Bluetooth",
             (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding - POPUP_STYLE.border_width)
                 as i32,
             35,
             BAR_STYLE.material.foreground,
         )?;
+        self.draw_switch(window, gc, rect, power, state.bluetooth.powered)?;
         self.text.draw_popup_utf8(
             "Dispositivos",
             (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding - POPUP_STYLE.border_width)
@@ -4127,6 +4142,8 @@ fn popup_hover_for(target: Option<&HitTarget>) -> Option<PopupHover> {
             Some(PopupHover::AudioOutputDevice(name.clone()))
         }
         Some(HitTarget::AudioInputDevice(name)) => Some(PopupHover::AudioInputDevice(name.clone())),
+        Some(HitTarget::BluetoothPower) => Some(PopupHover::BluetoothPower),
+        Some(HitTarget::BluetoothDevice(path)) => Some(PopupHover::BluetoothDevice(path.clone())),
         Some(HitTarget::NetworkWifi(target)) => Some(PopupHover::NetworkWifi(target.clone())),
         Some(HitTarget::NetworkWireless) => Some(PopupHover::NetworkWireless),
         _ => None,
@@ -4952,11 +4969,56 @@ mod tests {
             Some(PopupHover::NetworkWireless)
         );
         assert_eq!(
+            popup_hover_for(Some(&HitTarget::BluetoothPower)),
+            Some(PopupHover::BluetoothPower)
+        );
+        assert_eq!(
+            popup_hover_for(Some(&HitTarget::BluetoothDevice("device.a".into()))),
+            Some(PopupHover::BluetoothDevice("device.a".into()))
+        );
+        assert_eq!(
             popup_hover_for(Some(&HitTarget::Item(vec![crate::core::MenuItemId(7)]))),
             Some(PopupHover::MenuItem(crate::core::MenuItemId(7)))
         );
         assert_eq!(popup_hover_for(Some(&HitTarget::AudioInside)), None);
         assert_eq!(popup_hover_for(Some(&HitTarget::NetworkInside)), None);
+    }
+
+    #[test]
+    fn switch_thumb_tracks_binary_state_inside_the_canonical_target() {
+        let target = MenuRect {
+            x: 100,
+            y: 20,
+            width: 46,
+            height: 22,
+        };
+        let off = super::X11Platform::switch_thumb_rect(target, false);
+        let on = super::X11Platform::switch_thumb_rect(target, true);
+
+        assert_eq!(
+            off,
+            MenuRect {
+                x: 103,
+                y: 23,
+                width: 16,
+                height: 16
+            }
+        );
+        assert_eq!(
+            on,
+            MenuRect {
+                x: 127,
+                y: 23,
+                width: 16,
+                height: 16
+            }
+        );
+        for thumb in [off, on] {
+            assert!(thumb.x >= target.x);
+            assert!(thumb.y >= target.y);
+            assert!(thumb.x + thumb.width as i16 <= target.x + target.width as i16);
+            assert!(thumb.y + thumb.height as i16 <= target.y + target.height as i16);
+        }
     }
 
     #[test]
