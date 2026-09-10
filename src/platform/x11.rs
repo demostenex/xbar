@@ -340,6 +340,23 @@ fn classify_attention_property_reply<T>(
     }
 }
 
+fn classify_property_string_reply(
+    window: u32,
+    reply: Result<xproto::GetPropertyReply, x11rb::errors::ReplyError>,
+) -> Result<Option<xproto::GetPropertyReply>, x11rb::errors::ReplyError> {
+    match reply {
+        Ok(reply) if reply.value.is_empty() => Ok(None),
+        Ok(reply) => Ok(Some(reply)),
+        Err(x11rb::errors::ReplyError::X11Error(error))
+            if error.error_kind == x11rb::protocol::ErrorKind::Window
+                && error.bad_value == window =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AttentionProperty {
     NetWmState,
@@ -1796,7 +1813,10 @@ impl X11Platform {
         let reply = self
             .conn
             .get_property(false, window, atom, AtomEnum::ANY, 0, u32::MAX)?
-            .reply()?;
+            .reply();
+        let Some(reply) = classify_property_string_reply(window, reply)? else {
+            return Ok(None);
+        };
         if reply.value.is_empty() {
             return Ok(None);
         }
@@ -4135,11 +4155,12 @@ fn is_xbar_owned_window(
 #[cfg(test)]
 mod tests {
     use super::{
-        blur_behind_rect, classify_attention_property_reply, effect_owner_property_value,
-        install_passive_grabs, is_xbar_owned_window, network_primary_row_label, popup_effect_owner,
-        popup_hover_for, popup_hover_transition, preserve_color_pixel, template_icon_pixel,
-        tray_draw_size, tray_hit, AttentionPropertyRead, BarWindow, GlobalPinShortcut, HitTarget,
-        PopupHover, RenderTarget, SurfaceWindowGeometry, X11Event,
+        blur_behind_rect, classify_attention_property_reply, classify_property_string_reply,
+        effect_owner_property_value, install_passive_grabs, is_xbar_owned_window,
+        network_primary_row_label, popup_effect_owner, popup_hover_for, popup_hover_transition,
+        preserve_color_pixel, template_icon_pixel, tray_draw_size, tray_hit, AttentionPropertyRead,
+        BarWindow, GlobalPinShortcut, HitTarget, PopupHover, RenderTarget, SurfaceWindowGeometry,
+        X11Event,
     };
     use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
     use crate::ui::{layout::MenuRect, view::TrayIconRenderMode, view::TrayVisualItem};
@@ -4159,6 +4180,45 @@ mod tests {
             extension_name: None,
             request_name: Some("GetProperty"),
         })
+    }
+
+    fn property_reply(value: &[u8]) -> xproto::GetPropertyReply {
+        xproto::GetPropertyReply {
+            format: 8,
+            sequence: 1,
+            length: value.len() as u32,
+            type_: 31,
+            bytes_after: 0,
+            value_len: value.len() as u32,
+            value: value.to_vec(),
+        }
+    }
+
+    #[test]
+    fn property_string_classifies_success_and_absence() {
+        assert!(
+            classify_property_string_reply(7, Ok(property_reply(b"app")))
+                .expect("successful property")
+                .is_some()
+        );
+        assert!(classify_property_string_reply(7, Ok(property_reply(b"")))
+            .expect("absent property")
+            .is_none());
+    }
+
+    #[test]
+    fn property_string_classifies_stale_window_as_absent() {
+        assert!(
+            classify_property_string_reply(7, Err(x11_error(ErrorKind::Window, 7)))
+                .expect("stale external window")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn property_string_propagates_unrelated_x11_errors() {
+        assert!(classify_property_string_reply(7, Err(x11_error(ErrorKind::Match, 7))).is_err());
+        assert!(classify_property_string_reply(7, Err(x11_error(ErrorKind::Window, 8))).is_err());
     }
 
     #[test]
