@@ -279,7 +279,9 @@ pub struct X11Platform {
     audio_popup: Option<AudioPopupWindow>,
     audio_backing: Option<PopupBacking>,
     bluetooth_popup: Option<BluetoothPopupWindow>,
+    bluetooth_backing: Option<PopupBacking>,
     network_popup: Option<NetworkPopupWindow>,
+    network_backing: Option<PopupBacking>,
     popup_hover: Option<PopupHover>,
     popup_hover_changed: bool,
     hover_repaint_active: bool,
@@ -1115,7 +1117,9 @@ impl X11Platform {
             audio_popup: None,
             audio_backing: None,
             bluetooth_popup: None,
+            bluetooth_backing: None,
             network_popup: None,
+            network_backing: None,
             popup_hover: None,
             popup_hover_changed: false,
             hover_repaint_active: false,
@@ -2708,6 +2712,11 @@ impl X11Platform {
             self.text.release_drawable(popup.window);
             trace_x11_resource("WINDOW_DESTROY", "bluetooth-popup", popup.window);
             self.conn.destroy_window(popup.window)?.check()?;
+            if let Some(backing) = self.bluetooth_backing.take() {
+                self.text.release_drawable(backing.pixmap);
+                self.conn.free_gc(backing.gc)?.check()?;
+                self.conn.free_pixmap(backing.pixmap)?.check()?;
+            }
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!("xbar trace: UNMAP popup=Bluetooth xid={}", popup.window);
             }
@@ -2716,6 +2725,11 @@ impl X11Platform {
             self.text.release_drawable(popup.window);
             trace_x11_resource("WINDOW_DESTROY", "network-popup", popup.window);
             self.conn.destroy_window(popup.window)?.check()?;
+            if let Some(backing) = self.network_backing.take() {
+                self.text.release_drawable(backing.pixmap);
+                self.conn.free_gc(backing.gc)?.check()?;
+                self.conn.free_pixmap(backing.pixmap)?.check()?;
+            }
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!("xbar trace: UNMAP popup=Network xid={}", popup.window);
             }
@@ -3209,7 +3223,70 @@ impl X11Platform {
             power,
             devices: rows.clone(),
         });
-        if resize {
+        let backing_replaced = !backing_matches(
+            self.bluetooth_backing,
+            rect.width,
+            rect.height,
+            self.glass_surface.depth,
+        );
+        if backing_replaced {
+            let pixmap = self.conn.generate_id()?;
+            let create_result = self
+                .conn
+                .create_pixmap(
+                    self.glass_surface.depth,
+                    pixmap,
+                    self.root,
+                    rect.width,
+                    rect.height,
+                )?
+                .check();
+            if let Err(error) = create_result {
+                if matches!(
+                    error,
+                    x11rb::errors::ReplyError::X11Error(ref error)
+                        if error.error_kind == x11rb::protocol::ErrorKind::Alloc
+                ) {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+            let gc = self.conn.generate_id()?;
+            let gc_result = self
+                .conn
+                .create_gc(
+                    gc,
+                    pixmap,
+                    &xproto::CreateGCAux::new().foreground(
+                        self.glass_surface
+                            .background_pixel(POPUP_STYLE.material.background),
+                    ),
+                )?
+                .check();
+            if let Err(error) = gc_result {
+                self.conn.free_pixmap(pixmap)?.check()?;
+                if matches!(
+                    error,
+                    x11rb::errors::ReplyError::X11Error(ref error)
+                        if error.error_kind == x11rb::protocol::ErrorKind::Alloc
+                ) {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+            if let Some(old) = self.bluetooth_backing.replace(PopupBacking {
+                pixmap,
+                gc,
+                width: rect.width,
+                height: rect.height,
+                depth: self.glass_surface.depth,
+            }) {
+                self.conn.free_gc(old.gc)?.check()?;
+                self.conn.free_pixmap(old.pixmap)?.check()?;
+            }
+        }
+        let backing = self.bluetooth_backing.expect("bluetooth backing created");
+        if resize || backing_replaced {
             self.conn
                 .configure_window(
                     window,
@@ -3234,24 +3311,12 @@ impl X11Platform {
             )?;
         }
         self.text
-            .prepare_drawable("bluetooth-popup", window, self.glass_surface)?;
-        let gc = self.conn.generate_id()?;
-        self.conn
-            .create_gc(
-                gc,
-                window,
-                &xproto::CreateGCAux::new().foreground(
-                    self.glass_surface
-                        .background_pixel(POPUP_STYLE.material.background),
-                ),
-            )?
-            .check()?;
-        if !self.should_skip_popup_clear_for_hover() {
-            self.fill_glass_background(window, gc, rect.width, rect.height)?;
-            self.draw_popup_frame(window, gc, rect.width, rect.height)?;
-        }
+            .prepare_drawable("bluetooth-popup", backing.pixmap, self.glass_surface)?;
+        let gc = backing.gc;
+        self.fill_glass_background(backing.pixmap, gc, rect.width, rect.height)?;
+        self.draw_popup_frame(backing.pixmap, gc, rect.width, rect.height)?;
         self.draw_popup_card(
-            window,
+            backing.pixmap,
             gc,
             rect,
             layout::MenuRect {
@@ -3262,16 +3327,19 @@ impl X11Platform {
             },
         )?;
         if matches!(self.popup_hover, Some(PopupHover::BluetoothPower)) {
-            self.draw_popup_hover(window, gc, rect, power)?;
+            self.draw_popup_hover(backing.pixmap, gc, rect, power)?;
         }
         for (path, device) in &rows {
             if matches!(
                 self.popup_hover,
                 Some(PopupHover::BluetoothDevice(ref hovered)) if hovered == path
             ) {
-                self.draw_popup_hover(window, gc, rect, *device)?;
+                self.draw_popup_hover(backing.pixmap, gc, rect, *device)?;
             }
         }
+        self.draw_switch(backing.pixmap, gc, rect, power, state.bluetooth.powered)?;
+        self.conn.flush()?;
+        self.conn.get_input_focus()?.reply()?;
         self.text.draw_popup_utf8(
             "Bluetooth",
             (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding - POPUP_STYLE.border_width)
@@ -3279,7 +3347,6 @@ impl X11Platform {
             35,
             BAR_STYLE.material.foreground,
         )?;
-        self.draw_switch(window, gc, rect, power, state.bluetooth.powered)?;
         self.text.draw_popup_utf8(
             "Dispositivos",
             (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding - POPUP_STYLE.border_width)
@@ -3331,7 +3398,20 @@ impl X11Platform {
                 BAR_STYLE.material.foreground,
             )?;
         }
-        self.conn.free_gc(gc)?.check()?;
+        self.text.release_drawable(backing.pixmap);
+        self.conn
+            .copy_area(
+                backing.pixmap,
+                window,
+                gc,
+                0,
+                0,
+                0,
+                0,
+                rect.width,
+                rect.height,
+            )?
+            .check()?;
         if !self.pointer_grabbed {
             let grab = self
                 .conn
@@ -3441,7 +3521,70 @@ impl X11Platform {
             wireless,
             access_points: rows.clone(),
         });
-        if resize {
+        let backing_replaced = !backing_matches(
+            self.network_backing,
+            rect.width,
+            rect.height,
+            self.glass_surface.depth,
+        );
+        if backing_replaced {
+            let pixmap = self.conn.generate_id()?;
+            let create_result = self
+                .conn
+                .create_pixmap(
+                    self.glass_surface.depth,
+                    pixmap,
+                    self.root,
+                    rect.width,
+                    rect.height,
+                )?
+                .check();
+            if let Err(error) = create_result {
+                if matches!(
+                    error,
+                    x11rb::errors::ReplyError::X11Error(ref error)
+                        if error.error_kind == x11rb::protocol::ErrorKind::Alloc
+                ) {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+            let gc = self.conn.generate_id()?;
+            let gc_result = self
+                .conn
+                .create_gc(
+                    gc,
+                    pixmap,
+                    &xproto::CreateGCAux::new().foreground(
+                        self.glass_surface
+                            .background_pixel(POPUP_STYLE.material.background),
+                    ),
+                )?
+                .check();
+            if let Err(error) = gc_result {
+                self.conn.free_pixmap(pixmap)?.check()?;
+                if matches!(
+                    error,
+                    x11rb::errors::ReplyError::X11Error(ref error)
+                        if error.error_kind == x11rb::protocol::ErrorKind::Alloc
+                ) {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+            if let Some(old) = self.network_backing.replace(PopupBacking {
+                pixmap,
+                gc,
+                width: rect.width,
+                height: rect.height,
+                depth: self.glass_surface.depth,
+            }) {
+                self.conn.free_gc(old.gc)?.check()?;
+                self.conn.free_pixmap(old.pixmap)?.check()?;
+            }
+        }
+        let backing = self.network_backing.expect("network backing created");
+        if resize || backing_replaced {
             self.conn
                 .configure_window(
                     window,
@@ -3466,25 +3609,13 @@ impl X11Platform {
             )?;
         }
         self.text
-            .prepare_drawable("network-popup", window, self.glass_surface)?;
-        let gc = self.conn.generate_id()?;
-        self.conn
-            .create_gc(
-                gc,
-                window,
-                &xproto::CreateGCAux::new().foreground(
-                    self.glass_surface
-                        .background_pixel(POPUP_STYLE.material.background),
-                ),
-            )?
-            .check()?;
-        if !self.should_skip_popup_clear_for_hover() {
-            self.fill_glass_background(window, gc, rect.width, rect.height)?;
-            self.draw_popup_frame(window, gc, rect.width, rect.height)?;
-        }
-        self.draw_popup_card(window, gc, rect, status_card)?;
+            .prepare_drawable("network-popup", backing.pixmap, self.glass_surface)?;
+        let gc = backing.gc;
+        self.fill_glass_background(backing.pixmap, gc, rect.width, rect.height)?;
+        self.draw_popup_frame(backing.pixmap, gc, rect.width, rect.height)?;
+        self.draw_popup_card(backing.pixmap, gc, rect, status_card)?;
         for interface in &network_layout.interfaces {
-            self.draw_popup_card(window, gc, rect, interface.card)?;
+            self.draw_popup_card(backing.pixmap, gc, rect, interface.card)?;
         }
         let wireless_label = state
             .network_pending
@@ -3505,9 +3636,32 @@ impl X11Platform {
                 "OFF"
             });
         if matches!(self.popup_hover, Some(PopupHover::NetworkWireless)) {
-            self.draw_popup_hover(window, gc, rect, wireless)?;
+            self.draw_popup_hover(backing.pixmap, gc, rect, wireless)?;
         }
-        self.draw_switch(window, gc, rect, wireless, state.network.wireless_enabled)?;
+        self.draw_switch(
+            backing.pixmap,
+            gc,
+            rect,
+            wireless,
+            state.network.wireless_enabled,
+        )?;
+        for (target, row) in &rows {
+            if matches!(
+                self.popup_hover,
+                Some(PopupHover::NetworkWifi(ref hovered)) if hovered == target
+            ) {
+                self.draw_popup_hover(backing.pixmap, gc, rect, *row)?;
+            }
+            let button = layout::MenuRect {
+                x: row.x + row.width as i16 - 78,
+                y: row.y + 4,
+                width: 68,
+                height: row.height.saturating_sub(8),
+            };
+            self.draw_popup_card(backing.pixmap, gc, rect, button)?;
+        }
+        self.conn.flush()?;
+        self.conn.get_input_focus()?.reply()?;
         self.text.draw_popup_utf8(
             "Wi-Fi",
             (status_card.x - rect.x + card_padding) as i32,
@@ -3566,19 +3720,12 @@ impl X11Platform {
                         && crate::core::wifi_band(access_point.frequency) == target.band
                 })
                 .expect("network popup row has matching access point");
-            if matches!(
-                self.popup_hover,
-                Some(PopupHover::NetworkWifi(ref hovered)) if hovered == target
-            ) {
-                self.draw_popup_hover(window, gc, rect, *row)?;
-            }
             let button = layout::MenuRect {
                 x: row.x + row.width as i16 - 78,
                 y: row.y + 4,
                 width: 68,
                 height: row.height.saturating_sub(8),
             };
-            self.draw_popup_card(window, gc, rect, button)?;
             let label_width = button
                 .x
                 .saturating_sub(row.x)
@@ -3603,7 +3750,20 @@ impl X11Platform {
                 BAR_STYLE.material.foreground,
             )?;
         }
-        self.conn.free_gc(gc)?.check()?;
+        self.text.release_drawable(backing.pixmap);
+        self.conn
+            .copy_area(
+                backing.pixmap,
+                window,
+                gc,
+                0,
+                0,
+                0,
+                0,
+                rect.width,
+                rect.height,
+            )?
+            .check()?;
         if !self.pointer_grabbed {
             let grab = self
                 .conn
@@ -4264,6 +4424,19 @@ impl Drop for X11Platform {
             self.keyboard_grab_session = None;
         }
         self.text.release_active_drawable();
+
+        for backing in [
+            self.audio_backing.take(),
+            self.bluetooth_backing.take(),
+            self.network_backing.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.text.release_drawable(backing.pixmap);
+            let _ = self.conn.free_gc(backing.gc);
+            let _ = self.conn.free_pixmap(backing.pixmap);
+        }
 
         for popup in self.popups.drain(..) {
             let _ = self.conn.destroy_window(popup.window);
@@ -5131,7 +5304,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_backing_reuses_only_matching_geometry_and_depth() {
+    fn popup_backing_reuses_only_matching_geometry_and_depth() {
         let backing = Some(PopupBacking {
             pixmap: 1,
             gc: 2,
