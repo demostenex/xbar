@@ -368,6 +368,30 @@ enum AttentionProperty {
 struct BarWindow {
     output: OutputId,
     window: u32,
+    backing: Option<BarBacking>,
+}
+
+#[derive(Clone, Copy)]
+struct BarBacking {
+    pixmap: u32,
+    gc: u32,
+    width: u16,
+    height: u16,
+    depth: u8,
+}
+
+#[derive(Clone, Copy)]
+enum BarTextKind {
+    Bar,
+    StatusIcon,
+}
+
+struct BarText {
+    kind: BarTextKind,
+    text: String,
+    x: i32,
+    y: i32,
+    color: u32,
 }
 struct PopupWindow {
     window: u32,
@@ -395,6 +419,12 @@ struct PopupBacking {
 }
 
 fn backing_matches(backing: Option<PopupBacking>, width: u16, height: u16, depth: u8) -> bool {
+    backing.is_some_and(|backing| {
+        backing.width == width && backing.height == height && backing.depth == depth
+    })
+}
+
+fn bar_backing_matches(backing: Option<BarBacking>, width: u16, height: u16, depth: u8) -> bool {
     backing.is_some_and(|backing| {
         backing.width == width && backing.height == height && backing.depth == depth
     })
@@ -587,6 +617,26 @@ fn x11_rect(rect: layout::MenuRect, output: &OutputState) -> xproto::Rectangle {
         width: rect.width,
         height: rect.height,
     }
+}
+
+fn union_menu_rects(rects: &[layout::MenuRect]) -> Option<layout::MenuRect> {
+    let mut rects = rects
+        .iter()
+        .copied()
+        .filter(|rect| rect.width > 0 && rect.height > 0);
+    let first = rects.next()?;
+    Some(rects.fold(first, |union, rect| {
+        let left = union.x.min(rect.x);
+        let top = union.y.min(rect.y);
+        let right = (union.x as i32 + union.width as i32).max(rect.x as i32 + rect.width as i32);
+        let bottom = (union.y as i32 + union.height as i32).max(rect.y as i32 + rect.height as i32);
+        layout::MenuRect {
+            x: left,
+            y: top,
+            width: (right - left as i32) as u16,
+            height: (bottom - top as i32) as u16,
+        }
+    }))
 }
 
 fn workspace_as_menu(rect: layout::WorkspaceRect) -> layout::MenuRect {
@@ -1891,11 +1941,75 @@ impl X11Platform {
         }
         Ok(result)
     }
+
+    fn create_bar_backing(
+        &self,
+        width: u16,
+        height: u16,
+    ) -> Result<Option<BarBacking>, Box<dyn Error>> {
+        let pixmap = self.conn.generate_id()?;
+        let create_result = self
+            .conn
+            .create_pixmap(self.glass_surface.depth, pixmap, self.root, width, height)?
+            .check();
+        if let Err(error) = create_result {
+            if matches!(
+                error,
+                x11rb::errors::ReplyError::X11Error(ref error)
+                    if error.error_kind == x11rb::protocol::ErrorKind::Alloc
+            ) {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        let gc = self.conn.generate_id()?;
+        let gc_result = self
+            .conn
+            .create_gc(
+                gc,
+                pixmap,
+                &xproto::CreateGCAux::new().foreground(
+                    self.glass_surface
+                        .background_pixel(BAR_STYLE.material.background),
+                ),
+            )?
+            .check();
+        if let Err(error) = gc_result {
+            self.conn.free_pixmap(pixmap)?.check()?;
+            if matches!(
+                error,
+                x11rb::errors::ReplyError::X11Error(ref error)
+                    if error.error_kind == x11rb::protocol::ErrorKind::Alloc
+            ) {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        Ok(Some(BarBacking {
+            pixmap,
+            gc,
+            width,
+            height,
+            depth: self.glass_surface.depth,
+        }))
+    }
+
+    fn release_bar_backing(&mut self, backing: BarBacking) -> Result<(), Box<dyn Error>> {
+        self.text.release_drawable(backing.pixmap);
+        self.conn.free_gc(backing.gc)?.check()?;
+        self.conn.free_pixmap(backing.pixmap)?.check()?;
+        Ok(())
+    }
+
     pub fn sync_windows(&mut self, outputs: &[OutputState]) -> Result<(), Box<dyn Error>> {
         self.close_popups(None)?;
         self.previous_contexts.clear();
-        for old in self.windows.drain(..) {
+        let old_windows = std::mem::take(&mut self.windows);
+        for old in old_windows {
             self.text.release_drawable(old.window);
+            if let Some(backing) = old.backing {
+                self.release_bar_backing(backing)?;
+            }
             trace_x11_resource("WINDOW_DESTROY", "bar", old.window);
             self.conn.destroy_window(old.window)?.check()?;
         }
@@ -2005,6 +2119,7 @@ impl X11Platform {
             self.windows.push(BarWindow {
                 output: output.id,
                 window,
+                backing: None,
             });
         }
         self.conn.flush()?;
@@ -2216,15 +2331,15 @@ impl X11Platform {
 
     fn render_dock(&mut self, state: &State, target: RenderTarget) -> Result<(), Box<dyn Error>> {
         self.bar_hits.clear();
-        let full = target.is_full_dock();
-        let draw_workspaces = full || target.contains(RenderTarget::WORKSPACES);
-        let draw_context = full || target.contains(RenderTarget::CONTEXT);
-        let draw_plugins = full || target.contains(RenderTarget::PLUGIN_ZONE);
-        let draw_tray = full || target.contains(RenderTarget::TRAY);
-        let draw_network = full || target.contains(RenderTarget::NETWORK);
-        let draw_bluetooth = full || target.contains(RenderTarget::BLUETOOTH);
-        let draw_audio = full || target.contains(RenderTarget::AUDIO);
-        let draw_datetime = full || target.contains(RenderTarget::DATETIME);
+        let requested_full = target.is_full_dock();
+        let draw_workspaces = requested_full || target.contains(RenderTarget::WORKSPACES);
+        let draw_context = requested_full || target.contains(RenderTarget::CONTEXT);
+        let draw_plugins = requested_full || target.contains(RenderTarget::PLUGIN_ZONE);
+        let draw_tray = requested_full || target.contains(RenderTarget::TRAY);
+        let draw_network = requested_full || target.contains(RenderTarget::NETWORK);
+        let draw_bluetooth = requested_full || target.contains(RenderTarget::BLUETOOTH);
+        let draw_audio = requested_full || target.contains(RenderTarget::AUDIO);
+        let draw_datetime = requested_full || target.contains(RenderTarget::DATETIME);
         let trace = std::env::var_os("XBAR_TRACE").is_some();
         if trace {
             for (draw, name) in [
@@ -2242,24 +2357,47 @@ impl X11Platform {
                 }
             }
         }
-        for bar in &self.windows {
-            let Some(output) = state.outputs.iter().find(|output| output.id == bar.output) else {
+        for bar_index in 0..self.windows.len() {
+            let (bar_output, bar_window, backing) = {
+                let bar = &self.windows[bar_index];
+                (bar.output, bar.window, bar.backing)
+            };
+            let Some(output) = state.outputs.iter().find(|output| output.id == bar_output) else {
                 continue;
             };
-            self.text
-                .prepare_drawable("bar", bar.window, self.glass_surface)?;
-            let gc = self.conn.generate_id()?;
+            let backing_replaced =
+                !bar_backing_matches(backing, output.width, BAR_HEIGHT, self.glass_surface.depth);
+            if backing_replaced {
+                let Some(new_backing) = self.create_bar_backing(output.width, BAR_HEIGHT)? else {
+                    continue;
+                };
+                if let Some(old_backing) = self.windows[bar_index].backing.replace(new_backing) {
+                    self.release_bar_backing(old_backing)?;
+                }
+            }
+            let backing = self.windows[bar_index]
+                .backing
+                .expect("bar backing created");
+            let full = requested_full || backing_replaced;
+            let draw_workspaces = full || draw_workspaces;
+            let draw_context = full || draw_context;
+            let draw_plugins = full || draw_plugins;
+            let draw_tray = full || draw_tray;
+            let draw_network = full || draw_network;
+            let draw_bluetooth = full || draw_bluetooth;
+            let draw_audio = full || draw_audio;
+            let draw_datetime = full || draw_datetime;
+            let gc = backing.gc;
             self.conn
-                .create_gc(
+                .change_gc(
                     gc,
-                    bar.window,
-                    &xproto::CreateGCAux::new().foreground(
+                    &xproto::ChangeGCAux::new().foreground(
                         self.glass_surface
                             .background_pixel(BAR_STYLE.material.background),
                     ),
                 )?
                 .check()?;
-            let previous_context = self.previous_contexts.get(&bar.window).cloned();
+            let previous_context = self.previous_contexts.get(&bar_window).cloned();
             let workspaces: Vec<_> = state
                 .workspaces
                 .iter()
@@ -2271,7 +2409,7 @@ impl X11Platform {
                                 state
                                     .outputs
                                     .iter()
-                                    .any(|o| o.id == bar.output && o.name == n)
+                                    .any(|o| o.id == bar_output && o.name == n)
                             })
                             .unwrap_or(true)
                 })
@@ -2328,8 +2466,8 @@ impl X11Platform {
             let draw_audio = draw_audio || old_context.audio != context.audio;
             let draw_datetime = draw_datetime || old_context.datetime != context.datetime;
             self.bar_hits.push((
-                bar.window,
-                bar.output,
+                bar_window,
+                bar_output,
                 output.x,
                 output.y,
                 context.menu.clone(),
@@ -2338,9 +2476,9 @@ impl X11Platform {
                 context.audio.clone(),
                 context.bluetooth.clone(),
             ));
-            if full {
+            let present_region = if full {
                 self.conn.poly_fill_rectangle(
-                    bar.window,
+                    backing.pixmap,
                     gc,
                     &[xproto::Rectangle {
                         x: 0,
@@ -2349,6 +2487,12 @@ impl X11Platform {
                         height: BAR_HEIGHT,
                     }],
                 )?;
+                layout::MenuRect {
+                    x: output.x,
+                    y: output.y,
+                    width: output.width,
+                    height: BAR_HEIGHT,
+                }
             } else {
                 let old = old_context;
                 let mut clear: Vec<layout::MenuRect> = Vec::new();
@@ -2405,11 +2549,20 @@ impl X11Platform {
                         clear.push(item.rect);
                     }
                 }
-                for rect in clear {
-                    self.conn
-                        .poly_fill_rectangle(bar.window, gc, &[x11_rect(rect, output)])?;
+                let Some(present_region) = union_menu_rects(&clear) else {
+                    self.previous_contexts.insert(bar_window, context);
+                    continue;
+                };
+                for rect in &clear {
+                    self.conn.poly_fill_rectangle(
+                        backing.pixmap,
+                        gc,
+                        &[x11_rect(*rect, output)],
+                    )?;
                 }
-            }
+                present_region
+            };
+            let mut text = Vec::new();
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!(
                     "xbar trace: PLUGINZONE_VIEW items={}",
@@ -2450,7 +2603,7 @@ impl X11Platform {
                     .change_gc(gc, &xproto::ChangeGCAux::new().foreground(color))?
                     .check()?;
                 self.conn.poly_fill_rectangle(
-                    bar.window,
+                    backing.pixmap,
                     gc,
                     &[xproto::Rectangle {
                         x,
@@ -2468,17 +2621,18 @@ impl X11Platform {
                         ),
                     )?
                     .check()?;
-                self.text.draw_utf8(
-                    &layout::truncate_text_to_width(
+                text.push(BarText {
+                    kind: BarTextKind::Bar,
+                    text: layout::truncate_text_to_width(
                         &workspace.name,
                         rect.width.saturating_sub(12),
                         &self.text,
                     )
                     .unwrap_or_default(),
-                    x as i32 + BAR_STYLE.horizontal_padding as i32,
-                    self.text.baseline(BAR_HEIGHT) as i32,
-                    BAR_STYLE.workspace_foreground,
-                )?;
+                    x: x as i32 + BAR_STYLE.horizontal_padding as i32,
+                    y: self.text.baseline(BAR_HEIGHT) as i32,
+                    color: BAR_STYLE.workspace_foreground,
+                });
             }
             for item in &context.menu {
                 if !draw_context {
@@ -2506,28 +2660,34 @@ impl X11Platform {
                 } else {
                     BAR_STYLE.menu_disabled_foreground
                 };
-                self.text.draw_utf8(
-                    &layout::truncate_text_to_width(
+                text.push(BarText {
+                    kind: BarTextKind::Bar,
+                    text: layout::truncate_text_to_width(
                         &item.label,
                         item.rect.width.saturating_sub(16),
                         &self.text,
                     )
                     .unwrap_or_default(),
-                    x as i32,
-                    self.text.baseline(BAR_HEIGHT) as i32,
+                    x: x as i32,
+                    y: self.text.baseline(BAR_HEIGHT) as i32,
                     color,
-                )?;
+                });
             }
             if draw_context {
                 if let Some(title) = &context.app_name {
                     let x = title.rect.x.saturating_sub(output.x) as i32;
-                    self.text.draw_utf8(
-                        &layout::truncate_text_to_width(&title.text, title.rect.width, &self.text)
-                            .unwrap_or_default(),
+                    text.push(BarText {
+                        kind: BarTextKind::Bar,
+                        text: layout::truncate_text_to_width(
+                            &title.text,
+                            title.rect.width,
+                            &self.text,
+                        )
+                        .unwrap_or_default(),
                         x,
-                        self.text.baseline(BAR_HEIGHT) as i32,
-                        BAR_STYLE.material.foreground,
-                    )?;
+                        y: self.text.baseline(BAR_HEIGHT) as i32,
+                        color: BAR_STYLE.material.foreground,
+                    });
                 }
             }
             if draw_network || draw_audio || draw_bluetooth {
@@ -2537,12 +2697,13 @@ impl X11Platform {
                         let x = network.rect.x.saturating_sub(output.x) as i32
                             + (network.rect.width.saturating_sub(width) / 2) as i32;
                         let baseline = self.text.status_icon_baseline(BAR_HEIGHT) as i32;
-                        self.text.draw_status_icon_utf8(
-                            &network.text,
+                        text.push(BarText {
+                            kind: BarTextKind::StatusIcon,
+                            text: network.text.clone(),
                             x,
-                            baseline,
-                            BAR_STYLE.material.foreground,
-                        )?;
+                            y: baseline,
+                            color: BAR_STYLE.material.foreground,
+                        });
                     }
                 }
                 if draw_audio {
@@ -2551,12 +2712,13 @@ impl X11Platform {
                         let x = audio.rect.x.saturating_sub(output.x) as i32
                             + (audio.rect.width.saturating_sub(width) / 2) as i32;
                         let baseline = self.text.status_icon_baseline(BAR_HEIGHT) as i32;
-                        self.text.draw_status_icon_utf8(
-                            &audio.text,
+                        text.push(BarText {
+                            kind: BarTextKind::StatusIcon,
+                            text: audio.text.clone(),
                             x,
-                            baseline,
-                            BAR_STYLE.material.foreground,
-                        )?;
+                            y: baseline,
+                            color: BAR_STYLE.material.foreground,
+                        });
                     }
                 }
                 if draw_bluetooth {
@@ -2565,12 +2727,13 @@ impl X11Platform {
                         let x = bluetooth.rect.x.saturating_sub(output.x) as i32
                             + (bluetooth.rect.width.saturating_sub(width) / 2) as i32;
                         let baseline = self.text.status_icon_baseline(BAR_HEIGHT) as i32;
-                        self.text.draw_status_icon_utf8(
-                            &bluetooth.text,
+                        text.push(BarText {
+                            kind: BarTextKind::StatusIcon,
+                            text: bluetooth.text.clone(),
                             x,
-                            baseline,
-                            BAR_STYLE.material.foreground,
-                        )?;
+                            y: baseline,
+                            color: BAR_STYLE.material.foreground,
+                        });
                     }
                 }
             }
@@ -2620,7 +2783,7 @@ impl X11Platform {
                             )?
                             .check()?;
                         self.conn.poly_fill_rectangle(
-                            bar.window,
+                            backing.pixmap,
                             gc,
                             &[xproto::Rectangle {
                                 x: x0 + px as i16,
@@ -2637,17 +2800,18 @@ impl X11Platform {
                     continue;
                 }
                 let x = plugin.rect.x.saturating_sub(output.x) as i32 + 6;
-                self.text.draw_utf8(
-                    &layout::truncate_text_to_width(
+                text.push(BarText {
+                    kind: BarTextKind::Bar,
+                    text: layout::truncate_text_to_width(
                         &plugin.text,
                         plugin.rect.width.saturating_sub(12),
                         &self.text,
                     )
                     .unwrap_or_default(),
                     x,
-                    self.text.baseline(BAR_HEIGHT) as i32,
-                    BAR_STYLE.material.foreground,
-                )?;
+                    y: self.text.baseline(BAR_HEIGHT) as i32,
+                    color: BAR_STYLE.material.foreground,
+                });
             }
             if trace && draw_plugins {
                 eprintln!(
@@ -2671,21 +2835,52 @@ impl X11Platform {
             if let Some(datetime) = &context.datetime {
                 if draw_datetime {
                     let x = datetime.rect.x.saturating_sub(output.x).saturating_add(8);
-                    self.text.draw_utf8(
-                        &layout::truncate_text_to_width(
+                    text.push(BarText {
+                        kind: BarTextKind::Bar,
+                        text: layout::truncate_text_to_width(
                             &datetime.text,
                             datetime.rect.width.saturating_sub(8),
                             &self.text,
                         )
                         .unwrap_or_default(),
-                        x as i32,
-                        self.text.baseline(BAR_HEIGHT) as i32,
-                        BAR_STYLE.material.foreground,
-                    )?;
+                        x: x as i32,
+                        y: self.text.baseline(BAR_HEIGHT) as i32,
+                        color: BAR_STYLE.material.foreground,
+                    });
                 }
             }
-            self.conn.free_gc(gc)?.check()?;
-            self.previous_contexts.insert(bar.window, context);
+            self.conn.flush()?;
+            self.conn.get_input_focus()?.reply()?;
+            self.text
+                .prepare_drawable("bar", backing.pixmap, self.glass_surface)?;
+            for text in text {
+                match text.kind {
+                    BarTextKind::Bar => {
+                        self.text
+                            .draw_utf8(&text.text, text.x, text.y, text.color)?;
+                    }
+                    BarTextKind::StatusIcon => {
+                        self.text
+                            .draw_status_icon_utf8(&text.text, text.x, text.y, text.color)?;
+                    }
+                }
+            }
+            self.text.release_drawable(backing.pixmap);
+            let present = x11_rect(present_region, output);
+            self.conn
+                .copy_area(
+                    backing.pixmap,
+                    bar_window,
+                    gc,
+                    present.x,
+                    present.y,
+                    present.x,
+                    present.y,
+                    present.width,
+                    present.height,
+                )?
+                .check()?;
+            self.previous_contexts.insert(bar_window, context);
         }
         Ok(())
     }
@@ -4538,7 +4733,12 @@ impl Drop for X11Platform {
         {
             let _ = self.conn.destroy_window(window);
         }
-        for bar in self.windows.drain(..) {
+        for bar in std::mem::take(&mut self.windows) {
+            if let Some(backing) = bar.backing {
+                self.text.release_drawable(backing.pixmap);
+                let _ = self.conn.free_gc(backing.gc);
+                let _ = self.conn.free_pixmap(backing.pixmap);
+            }
             let _ = self.conn.destroy_window(bar.window);
         }
         if let Some(colormap) = self.glass_surface.owned_colormap {
@@ -4585,12 +4785,13 @@ fn is_xbar_owned_window(
 #[cfg(test)]
 mod tests {
     use super::{
-        backing_matches, blur_behind_rect, classify_attention_property_reply,
+        backing_matches, bar_backing_matches, blur_behind_rect, classify_attention_property_reply,
         classify_property_string_reply, effect_owner_property_value, install_passive_grabs,
         is_xbar_owned_window, network_primary_row_label, popup_effect_owner, popup_hover_for,
         popup_hover_transition, preserve_color_pixel, template_icon_pixel, tray_draw_size,
-        tray_hit, AttentionPropertyRead, BarWindow, GlobalPinShortcut, HitTarget, PopupBacking,
-        PopupHover, RenderTarget, SurfaceWindowGeometry, X11Event,
+        tray_hit, union_menu_rects, AttentionPropertyRead, BarBacking, BarWindow,
+        GlobalPinShortcut, HitTarget, PopupBacking, PopupHover, RenderTarget,
+        SurfaceWindowGeometry, X11Event, BAR_HEIGHT,
     };
     use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
     use crate::ui::{layout::MenuRect, view::TrayIconRenderMode, view::TrayVisualItem};
@@ -4943,10 +5144,12 @@ mod tests {
             BarWindow {
                 output: crate::core::OutputId(1),
                 window: 0x400_002,
+                backing: None,
             },
             BarWindow {
                 output: crate::core::OutputId(2),
                 window: 0x400_003,
+                backing: None,
             },
         ];
         assert_eq!(
@@ -5400,6 +5603,78 @@ mod tests {
         assert!(!backing_matches(backing, 340, 401, 32));
         assert!(!backing_matches(backing, 340, 400, 24));
         assert!(!backing_matches(None, 340, 400, 32));
+    }
+
+    #[test]
+    fn bar_backing_reuses_only_matching_geometry_and_depth() {
+        let backing = Some(BarBacking {
+            pixmap: 1,
+            gc: 2,
+            width: 1920,
+            height: BAR_HEIGHT,
+            depth: 32,
+        });
+
+        assert!(bar_backing_matches(backing, 1920, BAR_HEIGHT, 32));
+        assert!(!bar_backing_matches(backing, 1919, BAR_HEIGHT, 32));
+        assert!(!bar_backing_matches(backing, 1920, BAR_HEIGHT - 1, 32));
+        assert!(!bar_backing_matches(backing, 1920, BAR_HEIGHT, 24));
+        assert!(!bar_backing_matches(None, 1920, BAR_HEIGHT, 32));
+    }
+
+    #[test]
+    fn bar_backings_are_independent_per_window() {
+        let first = BarBacking {
+            pixmap: 1,
+            gc: 2,
+            width: 1920,
+            height: BAR_HEIGHT,
+            depth: 32,
+        };
+        let second = BarBacking {
+            pixmap: 3,
+            gc: 4,
+            width: 1280,
+            height: BAR_HEIGHT,
+            depth: 32,
+        };
+
+        assert_ne!(first.pixmap, second.pixmap);
+        assert_ne!(first.gc, second.gc);
+    }
+
+    #[test]
+    fn context_dirty_union_covers_old_and_new_geometry() {
+        let old = MenuRect {
+            x: 100,
+            y: 0,
+            width: 600,
+            height: BAR_HEIGHT,
+        };
+        let smaller = MenuRect {
+            x: 100,
+            y: 0,
+            width: 400,
+            height: BAR_HEIGHT,
+        };
+        let shifted = MenuRect {
+            x: 300,
+            y: 0,
+            width: 600,
+            height: BAR_HEIGHT,
+        };
+
+        assert_eq!(union_menu_rects(&[old, old]), Some(old));
+        assert_eq!(union_menu_rects(&[old, smaller]), Some(old));
+        assert_eq!(
+            union_menu_rects(&[old, shifted]),
+            Some(MenuRect {
+                x: 100,
+                y: 0,
+                width: 800,
+                height: BAR_HEIGHT,
+            })
+        );
     }
 
     #[test]
