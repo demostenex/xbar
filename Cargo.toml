@@ -5,6 +5,7 @@ edition = "2021"
 
 [workspace]
 members = [
+    "crates/xbar-sni-watcher",
     "crates/xbar-ai-protocol",
     "crates/xbar-ai-usage",
 ]
@@ -24,3 +25,7 @@ x11 = { version = "2.21", features = ["xlib", "xft"] }
 zbus = { version = "5", default-features = false, features = ["async-io"] }
 xnm = { path = "crates/xnm" }
 xbar-ai-protocol = { path = "crates/xbar-ai-protocol" }
+
+[patch.crates-io]
+libpulse-binding = { path = "vendor/libpulse-binding" }
+libpulse-sys = { path = "vendor/libpulse-sys" }

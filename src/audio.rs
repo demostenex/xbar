@@ -3,6 +3,7 @@ use libpulse_binding as pulse;
 use pulse::callbacks::ListResult;
 use pulse::context::subscribe::{Facility, InterestMaskSet, Operation};
 use pulse::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
+use pulse::def::{SinkState, SourceState};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
 use pulse::mainloop::{api::Mainloop as MainloopTrait, events::io::FlagSet as IoFlagSet};
 use pulse::proplist::Proplist;
@@ -94,6 +95,20 @@ fn trace_migration_result(kind: &str, index: u32, target: &str, success: bool) {
 
 fn refresh_detail_for(operation: Option<Operation>) -> bool {
     operation != Some(Operation::Removed)
+}
+
+fn stable_sink_state(state: SinkState) -> bool {
+    matches!(
+        state,
+        SinkState::Invalid | SinkState::Running | SinkState::Idle | SinkState::Suspended
+    )
+}
+
+fn stable_source_state(state: SourceState) -> bool {
+    matches!(
+        state,
+        SourceState::Invalid | SourceState::Running | SourceState::Idle | SourceState::Suspended
+    )
 }
 
 impl AudioBridge {
@@ -410,19 +425,21 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
                 .introspect()
                 .get_sink_info_list(move |result| match result {
                     ListResult::Item(info) => {
-                        if let Some(name) = info.name.as_deref() {
-                            flags_for_callback
-                                .outputs
-                                .lock()
-                                .expect("audio outputs lock poisoned")
-                                .push(AudioDevice {
-                                    name: name.to_owned(),
-                                    display_name: info
-                                        .description
-                                        .as_deref()
-                                        .unwrap_or(name)
-                                        .to_owned(),
-                                });
+                        if stable_sink_state(info.state) {
+                            if let Some(name) = info.name.as_deref() {
+                                flags_for_callback
+                                    .outputs
+                                    .lock()
+                                    .expect("audio outputs lock poisoned")
+                                    .push(AudioDevice {
+                                        name: name.to_owned(),
+                                        display_name: info
+                                            .description
+                                            .as_deref()
+                                            .unwrap_or(name)
+                                            .to_owned(),
+                                    });
+                            }
                         }
                     }
                     ListResult::End | ListResult::Error => {
@@ -467,7 +484,7 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
                 .introspect()
                 .get_source_info_list(move |result| match result {
                     ListResult::Item(info) => {
-                        if info.monitor_of_sink.is_none() {
+                        if info.monitor_of_sink.is_none() && stable_source_state(info.state) {
                             if let Some(name) = info.name.as_deref() {
                                 flags_for_callback
                                     .inputs
@@ -555,6 +572,9 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
                 .introspect()
                 .get_sink_info_by_name(&name, move |result| {
                     if let ListResult::Item(info) = result {
+                        if !stable_sink_state(info.state) {
+                            return;
+                        }
                         *flags_for_callback
                             .channels
                             .lock()
@@ -626,6 +646,9 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
                     .introspect()
                     .get_source_info_by_name(&name, move |result| {
                         if let ListResult::Item(info) = result {
+                            if !stable_source_state(info.state) {
+                                return;
+                            }
                             *flags_for_callback
                                 .source_channels
                                 .lock()
@@ -700,6 +723,9 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
                             .introspect()
                             .get_sink_info_by_name(&target_name, move |result| {
                                 if let ListResult::Item(info) = result {
+                                    if !stable_sink_state(info.state) {
+                                        return;
+                                    }
                                     actions
                                         .lock()
                                         .expect("audio migration queue poisoned")
@@ -718,6 +744,9 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
                             .introspect()
                             .get_source_info_by_name(&target_name, move |result| {
                                 if let ListResult::Item(info) = result {
+                                    if !stable_source_state(info.state) {
+                                        return;
+                                    }
                                     actions
                                         .lock()
                                         .expect("audio migration queue poisoned")
@@ -890,7 +919,8 @@ fn run(events: EventQueue, writer: UnixStream, mut command_reader: UnixStream) {
 #[cfg(test)]
 mod tests {
     use super::{
-        movable_client_stream, refresh_detail_for, should_move_stream, MigrationAction, Operation,
+        movable_client_stream, refresh_detail_for, should_move_stream, stable_sink_state,
+        stable_source_state, MigrationAction, Operation, SinkState, SourceState,
     };
 
     #[test]
@@ -899,6 +929,22 @@ mod tests {
         assert!(refresh_detail_for(Some(Operation::New)));
         assert!(refresh_detail_for(Some(Operation::Changed)));
         assert!(refresh_detail_for(None));
+    }
+
+    #[test]
+    fn transient_sink_states_are_not_stable_devices() {
+        assert!(!stable_sink_state(SinkState::Init));
+        assert!(!stable_sink_state(SinkState::Unlinked));
+        assert!(!stable_sink_state(SinkState::Unknown(-99)));
+        assert!(stable_sink_state(SinkState::Running));
+    }
+
+    #[test]
+    fn transient_source_states_are_not_stable_devices() {
+        assert!(!stable_source_state(SourceState::Init));
+        assert!(!stable_source_state(SourceState::Unlinked));
+        assert!(!stable_source_state(SourceState::Unknown(-99)));
+        assert!(stable_source_state(SourceState::Idle));
     }
 
     #[test]
