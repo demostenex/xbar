@@ -383,6 +383,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 event,
                 Event::X11(platform::x11::X11Event::MotionNotify { .. })
             ) && x11.update_popup_hover(mouse_target.as_ref());
+            let popup_exposed = if let Event::X11(platform::x11::X11Event::Expose(window)) = &event
+            {
+                x11.note_menu_popup_exposed(*window)
+            } else {
+                false
+            };
             let activation = match (&event, mouse_target.as_ref()) {
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { timestamp, .. }),
@@ -863,6 +869,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 );
             }
             let presentation_before = state.menu_presentation.clone();
+            let menu_interaction_before = (
+                state.menu_interaction.open_root,
+                state.menu_interaction.open_path.clone(),
+                state.menu_interaction.hovered_path.clone(),
+            );
             let workspace_event = matches!(
                 translated,
                 Event::WorkspaceFocused { .. } | Event::WorkspacesSnapshot(_)
@@ -877,6 +888,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                 translated.clone(),
                 &mut registry.lock().expect("registry poisoned"),
             );
+            if reduced {
+                x11.note_menu_interaction_change(
+                    menu_interaction_before.0,
+                    &menu_interaction_before.1,
+                    &menu_interaction_before.2,
+                    state.menu_interaction.open_root,
+                    &state.menu_interaction.open_path,
+                    &state.menu_interaction.hovered_path,
+                );
+                if matches!(
+                    &translated,
+                    Event::MenuAboutToShowRequested { .. }
+                        | Event::MenuAboutToShowCompleted { .. }
+                        | Event::MenuLoaded { .. }
+                        | Event::MenuPropertiesUpdated { .. }
+                ) {
+                    // Provider/lazy-menu completion can alter visible rows or
+                    // popup topology beyond the local hover owner.
+                    x11.mark_all_menu_popups_dirty();
+                }
+            }
             if trace && matches!(translated, Event::WindowFocusedWithApp { .. }) {
                 eprintln!(
                     "xbar trace: PLUGINZONE_STATE after_reducer items={}",
@@ -1094,7 +1126,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     semantic_render_target = None;
                 }
             }
-            dirty |= reduced || popup_hover_changed;
+            dirty |= reduced || popup_hover_changed || popup_exposed;
             match translated {
                 Event::AudioTrackChanged { input, percent }
                     if last_audio_command != Some((input, percent)) =>
@@ -1465,6 +1497,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 );
             }
         }
+        let render_target = promote_menu_popup_target(render_target, x11.has_menu_popup_dirty());
         if dirty {
             if trace {
                 eprintln!(
@@ -1624,6 +1657,17 @@ fn merge_render_target(
     }
 }
 
+fn promote_menu_popup_target(
+    target: Option<RenderTarget>,
+    menu_popup_dirty: bool,
+) -> Option<RenderTarget> {
+    if menu_popup_dirty {
+        merge_render_target(target, Some(RenderTarget::Popup))
+    } else {
+        target
+    }
+}
+
 fn render_target_for_changes(
     reduced: bool,
     semantic_target: Option<RenderTarget>,
@@ -1724,7 +1768,7 @@ fn keyboard_event(
 mod scheduler_tests {
     use super::{
         hover_render_target_for, merge_render_target, pending_lazy_root_to_schedule,
-        render_target_for_changes, should_schedule_invalidation,
+        promote_menu_popup_target, render_target_for_changes, should_schedule_invalidation,
     };
     use crate::core::{LazyRootOpenPending, MenuEndpoint, MenuItemId, MenuSource, WindowId};
     use crate::platform::x11::{HitTarget, RenderTarget};
@@ -1844,6 +1888,27 @@ mod scheduler_tests {
         assert_eq!(
             render_target_for_changes(true, Some(RenderTarget::DockContext), true),
             Some(RenderTarget::DockContext.merge(RenderTarget::Popup))
+        );
+    }
+
+    #[test]
+    fn pending_menu_popup_work_promotes_only_the_popup_render_class() {
+        assert_eq!(
+            promote_menu_popup_target(Some(RenderTarget::DockContext), false),
+            Some(RenderTarget::DockContext)
+        );
+        assert_eq!(
+            promote_menu_popup_target(Some(RenderTarget::DockContext), true),
+            Some(RenderTarget::DockContext.merge(RenderTarget::Popup))
+        );
+        assert_eq!(
+            promote_menu_popup_target(Some(RenderTarget::Popup), true),
+            Some(RenderTarget::Popup)
+        );
+        let combined = RenderTarget::DockContext.merge(RenderTarget::Popup);
+        assert_eq!(
+            promote_menu_popup_target(Some(combined), true),
+            Some(combined)
         );
     }
 

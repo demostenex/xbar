@@ -1,10 +1,10 @@
 use crate::core::{
-    GtkMenuEndpoint, NetworkWifiTarget, OutputId, OutputState, State, StatusNotifierEndpoint,
-    WindowId,
+    GtkMenuEndpoint, MenuItemId, NetworkWifiTarget, OutputId, OutputState, State,
+    StatusNotifierEndpoint, WindowId,
 };
 use crate::ui::style::{self, TextMeasurer, BAR_STYLE, POPUP_STYLE};
 use crate::ui::{layout, view};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
@@ -284,6 +284,7 @@ pub struct X11Platform {
     network_backing: Option<PopupBacking>,
     popup_hover: Option<PopupHover>,
     popup_hover_changed: bool,
+    menu_popup_dirty: MenuPopupDirty,
     hover_repaint_active: bool,
     notification: Option<NotificationWindow>,
     pointer_grabbed: bool,
@@ -416,6 +417,112 @@ struct PopupBacking {
     width: u16,
     height: u16,
     depth: u8,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum MenuPopupDirty {
+    #[default]
+    None,
+    Specific(HashSet<PopupSlot>),
+    All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PopupSlot(usize);
+
+impl MenuPopupDirty {
+    fn mark(&mut self, slot: PopupSlot) {
+        match self {
+            Self::None => {
+                *self = Self::Specific(HashSet::from([slot]));
+            }
+            Self::Specific(slots) => {
+                slots.insert(slot);
+            }
+            Self::All => {}
+        }
+    }
+
+    fn mark_all(&mut self) {
+        *self = Self::All;
+    }
+
+    fn merge(&mut self, other: Self) {
+        match other {
+            Self::None => {}
+            Self::All => self.mark_all(),
+            Self::Specific(slots) => {
+                for slot in slots {
+                    self.mark(slot);
+                }
+            }
+        }
+    }
+
+    fn renders(&self, slot: PopupSlot) -> bool {
+        matches!(self, Self::All) || matches!(self, Self::Specific(slots) if slots.contains(&slot))
+    }
+
+    fn is_pending(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+fn menu_popup_slots_for_item(popups: &[PopupWindow], item_id: MenuItemId) -> Vec<PopupSlot> {
+    popups
+        .iter()
+        .enumerate()
+        .filter_map(|(index, popup)| {
+            popup
+                .layout
+                .items
+                .iter()
+                .any(|item| item.id == item_id)
+                .then_some(PopupSlot(index))
+        })
+        .collect()
+}
+
+fn menu_popup_slot_for_window(popups: &[PopupWindow], window: u32) -> Option<PopupSlot> {
+    popups
+        .iter()
+        .enumerate()
+        .find(|(_, popup)| popup.window == window)
+        .map(|(index, _)| PopupSlot(index))
+}
+
+fn popup_slot_is_selected(dirty: &MenuPopupDirty, slot: PopupSlot) -> bool {
+    dirty.renders(slot)
+}
+
+fn menu_popup_dirty_for_interaction_change(
+    popups: &[PopupWindow],
+    old_root: Option<MenuItemId>,
+    old_open_path: &[MenuItemId],
+    old_hovered_path: &[MenuItemId],
+    new_root: Option<MenuItemId>,
+    new_open_path: &[MenuItemId],
+    new_hovered_path: &[MenuItemId],
+) -> MenuPopupDirty {
+    if old_root != new_root || old_open_path != new_open_path {
+        return MenuPopupDirty::All;
+    }
+    if old_hovered_path == new_hovered_path {
+        return MenuPopupDirty::None;
+    }
+    let mut dirty = MenuPopupDirty::None;
+    for item_id in [
+        old_hovered_path.last().copied(),
+        new_hovered_path.last().copied(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for slot in menu_popup_slots_for_item(popups, item_id) {
+            dirty.mark(slot);
+        }
+    }
+    dirty
 }
 
 fn backing_matches(backing: Option<PopupBacking>, width: u16, height: u16, depth: u8) -> bool {
@@ -1173,6 +1280,7 @@ impl X11Platform {
             network_backing: None,
             popup_hover: None,
             popup_hover_changed: false,
+            menu_popup_dirty: MenuPopupDirty::None,
             hover_repaint_active: false,
             notification: None,
             pointer_grabbed: false,
@@ -1412,10 +1520,61 @@ impl X11Platform {
     pub fn update_popup_hover(&mut self, target: Option<&HitTarget>) -> bool {
         let (next, changed) = popup_hover_transition(&self.popup_hover, target);
         if changed {
+            let old_item = match self.popup_hover {
+                Some(PopupHover::MenuItem(item_id)) => Some(item_id),
+                _ => None,
+            };
+            let new_item = match next {
+                Some(PopupHover::MenuItem(item_id)) => Some(item_id),
+                _ => None,
+            };
+            for item_id in [old_item, new_item].into_iter().flatten() {
+                for slot in menu_popup_slots_for_item(&self.popups, item_id) {
+                    self.menu_popup_dirty.mark(slot);
+                }
+            }
             self.popup_hover = next;
             self.popup_hover_changed = true;
         }
         changed
+    }
+
+    pub fn note_menu_interaction_change(
+        &mut self,
+        old_root: Option<MenuItemId>,
+        old_open_path: &[MenuItemId],
+        old_hovered_path: &[MenuItemId],
+        new_root: Option<MenuItemId>,
+        new_open_path: &[MenuItemId],
+        new_hovered_path: &[MenuItemId],
+    ) {
+        self.menu_popup_dirty
+            .merge(menu_popup_dirty_for_interaction_change(
+                &self.popups,
+                old_root,
+                old_open_path,
+                old_hovered_path,
+                new_root,
+                new_open_path,
+                new_hovered_path,
+            ));
+    }
+
+    pub fn note_menu_popup_exposed(&mut self, window: u32) -> bool {
+        if let Some(slot) = menu_popup_slot_for_window(&self.popups, window) {
+            self.menu_popup_dirty.mark(slot);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn mark_all_menu_popups_dirty(&mut self) {
+        self.menu_popup_dirty.mark_all();
+    }
+
+    pub fn has_menu_popup_dirty(&self) -> bool {
+        self.menu_popup_dirty.is_pending()
     }
 
     pub fn audio_track_percent(&self, event: &X11Event) -> Option<u32> {
@@ -2138,8 +2297,15 @@ impl X11Platform {
                 self.reconcile_interactive_popup_surfaces(state)?;
             }
             if !state.audio_popup_open && !state.bluetooth_popup_open && !state.network_popup_open {
+                // RenderTarget::Popup is shared by several popup domains. A
+                // None plan means this frame has no Global Menu work; only an
+                // explicit plan or topology reconciliation may select windows.
                 self.render_popups(state)?;
             } else {
+                // A local popup is exclusive with the Global Menu. Its menu
+                // windows are destroyed in this frame, so the plan is
+                // consumed by teardown rather than deferred to a later menu.
+                let _ = std::mem::take(&mut self.menu_popup_dirty);
                 self.destroy_popup_suffix(0)?;
             }
             if state.bluetooth_popup_open {
@@ -4054,6 +4220,7 @@ impl X11Platform {
     }
 
     fn render_popups(&mut self, state: &State) -> Result<(), Box<dyn Error>> {
+        let mut dirty = std::mem::take(&mut self.menu_popup_dirty);
         let Some(root_id) = state.menu_interaction.open_root else {
             self.close_popups(Some(state))?;
             return Ok(());
@@ -4097,6 +4264,17 @@ impl X11Platform {
         };
         let effect_owner = popup_effect_owner(&self.windows, output_id)
             .ok_or("no dock window for menu popup effect owner")?;
+        let structure_changed = self.popups.len() != state.menu_interaction.open_path.len()
+            || self
+                .popups
+                .iter()
+                .zip(state.menu_interaction.open_path.iter())
+                .any(|(popup, id)| popup.layout.parent_id != *id);
+        if structure_changed {
+            // The path owns popup topology. Reconciliation may create or
+            // destroy a suffix, so a stale per-window plan cannot be used.
+            dirty.mark_all();
+        }
         let first_mismatch = self
             .popups
             .iter()
@@ -4175,6 +4353,17 @@ impl X11Platform {
                 popup_layout.rect.height,
                 self.glass_surface.depth,
             );
+            let render_popup = popup_slot_is_selected(&dirty, PopupSlot(level))
+                || !reuse
+                || resize
+                || backing_replaced;
+            if !render_popup {
+                // A specific dirty plan only skips a popup whose existing
+                // geometry and backing are still valid. Its buffered frame is
+                // already complete and remains mapped unchanged.
+                self.popups[level].layout = popup_layout;
+                continue;
+            }
             if backing_replaced {
                 let pixmap = self.conn.generate_id()?;
                 let create_result = self
@@ -4787,14 +4976,19 @@ mod tests {
     use super::{
         backing_matches, bar_backing_matches, blur_behind_rect, classify_attention_property_reply,
         classify_property_string_reply, effect_owner_property_value, install_passive_grabs,
-        is_xbar_owned_window, network_primary_row_label, popup_effect_owner, popup_hover_for,
-        popup_hover_transition, preserve_color_pixel, template_icon_pixel, tray_draw_size,
-        tray_hit, union_menu_rects, AttentionPropertyRead, BarBacking, BarWindow,
-        GlobalPinShortcut, HitTarget, PopupBacking, PopupHover, RenderTarget,
-        SurfaceWindowGeometry, X11Event, BAR_HEIGHT,
+        is_xbar_owned_window, menu_popup_dirty_for_interaction_change, menu_popup_slot_for_window,
+        menu_popup_slots_for_item, network_primary_row_label, popup_effect_owner, popup_hover_for,
+        popup_hover_transition, popup_slot_is_selected, preserve_color_pixel, template_icon_pixel,
+        tray_draw_size, tray_hit, union_menu_rects, AttentionPropertyRead, BarBacking, BarWindow,
+        GlobalPinShortcut, HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot,
+        PopupWindow, RenderTarget, SurfaceWindowGeometry, X11Event, BAR_HEIGHT,
     };
-    use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
-    use crate::ui::{layout::MenuRect, view::TrayIconRenderMode, view::TrayVisualItem};
+    use crate::core::{MenuItemId, StatusNotifierEndpoint, StatusNotifierIcon};
+    use crate::ui::{
+        layout::{MenuRect, PopupItemRect, PopupLayout},
+        view::TrayIconRenderMode,
+        view::TrayVisualItem,
+    };
     use x11rb::errors::ReplyError;
     use x11rb::protocol::xproto::{EventMask, ModMask};
     use x11rb::protocol::{xproto, ErrorKind};
@@ -5529,6 +5723,208 @@ mod tests {
         );
         assert_eq!(popup_hover_for(Some(&HitTarget::AudioInside)), None);
         assert_eq!(popup_hover_for(Some(&HitTarget::NetworkInside)), None);
+    }
+
+    fn menu_popup(window: u32, parent_id: i32, item_ids: &[i32]) -> PopupWindow {
+        PopupWindow {
+            window,
+            layout: PopupLayout {
+                parent_id: MenuItemId(parent_id),
+                rect: MenuRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                },
+                items: item_ids
+                    .iter()
+                    .map(|id| PopupItemRect {
+                        id: MenuItemId(*id),
+                        rect: MenuRect {
+                            x: 0,
+                            y: 0,
+                            width: 100,
+                            height: 20,
+                        },
+                        label: String::new(),
+                        enabled: true,
+                        separator: false,
+                        has_submenu: false,
+                        shortcut: None,
+                    })
+                    .collect(),
+            },
+            backing: None,
+        }
+    }
+
+    #[test]
+    fn menu_popup_hover_marks_only_the_structural_slot_at_each_depth() {
+        let popups = vec![
+            menu_popup(10, 1, &[11, 12]),
+            menu_popup(20, 12, &[21, 22]),
+            menu_popup(30, 22, &[31, 32]),
+        ];
+        assert_eq!(
+            menu_popup_slots_for_item(&popups, MenuItemId(11)),
+            vec![PopupSlot(0)]
+        );
+        assert_eq!(
+            menu_popup_slots_for_item(&popups, MenuItemId(21)),
+            vec![PopupSlot(1)]
+        );
+        assert_eq!(
+            menu_popup_slots_for_item(&popups, MenuItemId(31)),
+            vec![PopupSlot(2)]
+        );
+
+        for (old_item, new_item, slot) in [(11, 12, 0), (21, 22, 1), (31, 32, 2)] {
+            assert_eq!(
+                menu_popup_dirty_for_interaction_change(
+                    &popups,
+                    Some(MenuItemId(1)),
+                    &[MenuItemId(1), MenuItemId(12), MenuItemId(22)],
+                    &[MenuItemId(old_item)],
+                    Some(MenuItemId(1)),
+                    &[MenuItemId(1), MenuItemId(12), MenuItemId(22)],
+                    &[MenuItemId(new_item)],
+                ),
+                MenuPopupDirty::Specific(std::collections::HashSet::from([PopupSlot(slot)])),
+            );
+        }
+    }
+
+    #[test]
+    fn menu_popup_cross_popup_and_outside_hover_merge_affected_slots() {
+        let popups = vec![menu_popup(10, 1, &[11]), menu_popup(20, 11, &[21])];
+        assert_eq!(
+            menu_popup_dirty_for_interaction_change(
+                &popups,
+                Some(MenuItemId(1)),
+                &[MenuItemId(1), MenuItemId(11)],
+                &[MenuItemId(11)],
+                Some(MenuItemId(1)),
+                &[MenuItemId(1), MenuItemId(11)],
+                &[MenuItemId(21)],
+            ),
+            MenuPopupDirty::Specific(std::collections::HashSet::from([
+                PopupSlot(0),
+                PopupSlot(1),
+            ])),
+        );
+        assert_eq!(
+            menu_popup_dirty_for_interaction_change(
+                &popups,
+                Some(MenuItemId(1)),
+                &[MenuItemId(1), MenuItemId(11)],
+                &[MenuItemId(21)],
+                Some(MenuItemId(1)),
+                &[MenuItemId(1), MenuItemId(11)],
+                &[],
+            ),
+            MenuPopupDirty::Specific(std::collections::HashSet::from([PopupSlot(1)])),
+        );
+    }
+
+    #[test]
+    fn popup_selection_uses_slots_not_provider_item_ids() {
+        let popups = vec![
+            menu_popup(10, 1, &[7]),
+            // Provider IDs may collide across layouts; the structural slots
+            // remain independent and select both affected rendered frames.
+            menu_popup(20, 7, &[7]),
+            menu_popup(30, 7, &[9]),
+        ];
+        assert_eq!(
+            menu_popup_slots_for_item(&popups, MenuItemId(7)),
+            vec![PopupSlot(0), PopupSlot(1)]
+        );
+        let selected = |dirty: &MenuPopupDirty| {
+            (0..popups.len())
+                .map(PopupSlot)
+                .filter(|slot| popup_slot_is_selected(dirty, *slot))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            selected(&MenuPopupDirty::Specific(std::collections::HashSet::from(
+                [PopupSlot(1),]
+            ))),
+            vec![PopupSlot(1)]
+        );
+        assert_eq!(
+            selected(&MenuPopupDirty::Specific(std::collections::HashSet::from(
+                [PopupSlot(0), PopupSlot(2),]
+            ))),
+            vec![PopupSlot(0), PopupSlot(2)]
+        );
+        assert_eq!(
+            selected(&MenuPopupDirty::All),
+            vec![PopupSlot(0), PopupSlot(1), PopupSlot(2)]
+        );
+    }
+
+    #[test]
+    fn popup_target_without_menu_plan_selects_no_global_menu_windows() {
+        let selected = |dirty: &MenuPopupDirty| {
+            (0..3)
+                .map(PopupSlot)
+                .filter(|slot| popup_slot_is_selected(dirty, *slot))
+                .collect::<Vec<_>>()
+        };
+        assert!(RenderTarget::Popup.contains(RenderTarget::POPUP));
+        assert_eq!(selected(&MenuPopupDirty::None), Vec::<PopupSlot>::new());
+    }
+
+    #[test]
+    fn menu_popup_structure_change_overrides_specific_dirty_ownership() {
+        let popups = vec![menu_popup(10, 1, &[11]), menu_popup(20, 11, &[21])];
+        assert_eq!(
+            menu_popup_dirty_for_interaction_change(
+                &popups,
+                Some(MenuItemId(1)),
+                &[MenuItemId(1), MenuItemId(11)],
+                &[MenuItemId(21)],
+                Some(MenuItemId(1)),
+                &[MenuItemId(1)],
+                &[MenuItemId(11)],
+            ),
+            MenuPopupDirty::All,
+        );
+    }
+
+    #[test]
+    fn menu_popup_root_switch_invalidates_all_structural_slots() {
+        let popups = vec![menu_popup(10, 1, &[11]), menu_popup(20, 11, &[21])];
+        assert_eq!(
+            menu_popup_dirty_for_interaction_change(
+                &popups,
+                Some(MenuItemId(1)),
+                &[MenuItemId(1), MenuItemId(11)],
+                &[MenuItemId(21)],
+                Some(MenuItemId(2)),
+                &[MenuItemId(2)],
+                &[],
+            ),
+            MenuPopupDirty::All,
+        );
+    }
+
+    #[test]
+    fn menu_popup_expose_and_merged_causes_preserve_specific_window_slots() {
+        let popups = vec![menu_popup(10, 1, &[11]), menu_popup(20, 11, &[21])];
+        assert_eq!(menu_popup_slot_for_window(&popups, 20), Some(PopupSlot(1)));
+        assert_eq!(menu_popup_slot_for_window(&popups, 99), None);
+
+        let mut dirty = MenuPopupDirty::None;
+        dirty.mark(PopupSlot(0));
+        dirty.merge(MenuPopupDirty::Specific(std::collections::HashSet::from([
+            PopupSlot(1),
+        ])));
+        assert!(dirty.renders(PopupSlot(0)));
+        assert!(dirty.renders(PopupSlot(1)));
+        assert!(!dirty.renders(PopupSlot(2)));
+        dirty.mark_all();
+        assert!(dirty.renders(PopupSlot(2)));
     }
 
     #[test]
