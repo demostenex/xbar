@@ -372,6 +372,7 @@ struct BarWindow {
 struct PopupWindow {
     window: u32,
     layout: layout::PopupLayout,
+    backing: Option<PopupBacking>,
 }
 struct AudioPopupWindow {
     window: u32,
@@ -1365,10 +1366,6 @@ impl X11Platform {
             self.popup_hover_changed = true;
         }
         changed
-    }
-
-    fn should_skip_popup_clear_for_hover(&self) -> bool {
-        self.hover_repaint_active
     }
 
     pub fn audio_track_percent(&self, event: &X11Event) -> Option<u32> {
@@ -3847,6 +3844,11 @@ impl X11Platform {
         let trace = std::env::var_os("XBAR_TRACE").is_some();
         for popup in self.popups.split_off(index) {
             self.text.release_drawable(popup.window);
+            if let Some(backing) = popup.backing {
+                self.text.release_drawable(backing.pixmap);
+                self.conn.free_gc(backing.gc)?.check()?;
+                self.conn.free_pixmap(backing.pixmap)?.check()?;
+            }
             if trace {
                 eprintln!("xbar trace: popup destroyed xid={}", popup.window);
             }
@@ -3951,32 +3953,7 @@ impl X11Platform {
                 trace_x11_resource("WINDOW_CREATE", "menu-popup", window);
                 window
             };
-            if reuse {
-                if self.popups[level].layout.rect != popup_layout.rect {
-                    self.conn
-                        .configure_window(
-                            window,
-                            &xproto::ConfigureWindowAux::new()
-                                .x(popup_layout.rect.x as i32)
-                                .y(popup_layout.rect.y as i32)
-                                .width(popup_layout.rect.width as u32)
-                                .height(popup_layout.rect.height as u32),
-                        )?
-                        .check()?;
-                    self.apply_surface_effect(
-                        self.glass_surface,
-                        popup_role,
-                        window,
-                        SurfaceWindowGeometry {
-                            x: popup_layout.rect.x,
-                            y: popup_layout.rect.y,
-                            width: popup_layout.rect.width,
-                            height: popup_layout.rect.height,
-                            border_width: POPUP_STYLE.border_width,
-                        },
-                    )?;
-                }
-            } else {
+            if !reuse {
                 self.create_glass_popup_window(
                     popup_role,
                     window,
@@ -3990,40 +3967,123 @@ impl X11Platform {
                 )?;
                 self.configure_auxiliary_effect_surface(popup_role, window, effect_owner)?;
                 self.conn.map_window(window)?.check()?;
+                self.popups.push(PopupWindow {
+                    window,
+                    layout: popup_layout.clone(),
+                    backing: None,
+                });
+            }
+            let resize = self.popups[level].layout.rect != popup_layout.rect;
+            let backing_replaced = !backing_matches(
+                self.popups[level].backing,
+                popup_layout.rect.width,
+                popup_layout.rect.height,
+                self.glass_surface.depth,
+            );
+            if backing_replaced {
+                let pixmap = self.conn.generate_id()?;
+                let create_result = self
+                    .conn
+                    .create_pixmap(
+                        self.glass_surface.depth,
+                        pixmap,
+                        self.root,
+                        popup_layout.rect.width,
+                        popup_layout.rect.height,
+                    )?
+                    .check();
+                if let Err(error) = create_result {
+                    if matches!(
+                        error,
+                        x11rb::errors::ReplyError::X11Error(ref error)
+                            if error.error_kind == x11rb::protocol::ErrorKind::Alloc
+                    ) {
+                        return Ok(());
+                    }
+                    return Err(error.into());
+                }
+                let gc = self.conn.generate_id()?;
+                let gc_result = self
+                    .conn
+                    .create_gc(
+                        gc,
+                        pixmap,
+                        &xproto::CreateGCAux::new().foreground(
+                            self.glass_surface
+                                .background_pixel(POPUP_STYLE.material.background),
+                        ),
+                    )?
+                    .check();
+                if let Err(error) = gc_result {
+                    self.conn.free_pixmap(pixmap)?.check()?;
+                    if matches!(
+                        error,
+                        x11rb::errors::ReplyError::X11Error(ref error)
+                            if error.error_kind == x11rb::protocol::ErrorKind::Alloc
+                    ) {
+                        return Ok(());
+                    }
+                    return Err(error.into());
+                }
+                if let Some(old) = self.popups[level].backing.replace(PopupBacking {
+                    pixmap,
+                    gc,
+                    width: popup_layout.rect.width,
+                    height: popup_layout.rect.height,
+                    depth: self.glass_surface.depth,
+                }) {
+                    self.conn.free_gc(old.gc)?.check()?;
+                    self.conn.free_pixmap(old.pixmap)?.check()?;
+                }
+            }
+            let backing = self.popups[level]
+                .backing
+                .expect("menu popup backing created");
+            if resize || backing_replaced {
+                self.conn
+                    .configure_window(
+                        window,
+                        &xproto::ConfigureWindowAux::new()
+                            .x(popup_layout.rect.x as i32)
+                            .y(popup_layout.rect.y as i32)
+                            .width(popup_layout.rect.width as u32)
+                            .height(popup_layout.rect.height as u32),
+                    )?
+                    .check()?;
+                self.apply_surface_effect(
+                    self.glass_surface,
+                    popup_role,
+                    window,
+                    SurfaceWindowGeometry {
+                        x: popup_layout.rect.x,
+                        y: popup_layout.rect.y,
+                        width: popup_layout.rect.width,
+                        height: popup_layout.rect.height,
+                        border_width: POPUP_STYLE.border_width,
+                    },
+                )?;
             }
             self.text
-                .prepare_drawable("menu-popup", window, self.glass_surface)?;
-            let gc = self.conn.generate_id()?;
-            self.conn
-                .create_gc(
-                    gc,
-                    window,
-                    &xproto::CreateGCAux::new().foreground(
-                        self.glass_surface
-                            .background_pixel(POPUP_STYLE.material.background),
-                    ),
-                )?
-                .check()?;
-            if !self.should_skip_popup_clear_for_hover() {
-                self.fill_glass_background(
-                    window,
-                    gc,
-                    popup_layout.rect.width,
-                    popup_layout.rect.height,
-                )?;
-                self.draw_popup_frame(
-                    window,
-                    gc,
-                    popup_layout.rect.width,
-                    popup_layout.rect.height,
-                )?;
-            }
+                .prepare_drawable("menu-popup", backing.pixmap, self.glass_surface)?;
+            let gc = backing.gc;
+            self.fill_glass_background(
+                backing.pixmap,
+                gc,
+                popup_layout.rect.width,
+                popup_layout.rect.height,
+            )?;
+            self.draw_popup_frame(
+                backing.pixmap,
+                gc,
+                popup_layout.rect.width,
+                popup_layout.rect.height,
+            )?;
             let card = popup_layout.content_rect();
-            self.draw_popup_card(window, gc, popup_layout.rect, card)?;
+            self.draw_popup_card(backing.pixmap, gc, popup_layout.rect, card)?;
             for item in &popup_layout.items {
                 if item.separator {
                     self.conn.poly_fill_rectangle(
-                        window,
+                        backing.pixmap,
                         gc,
                         &[xproto::Rectangle {
                             x: card.x - popup_layout.rect.x + POPUP_STYLE.card_padding as i16,
@@ -4037,7 +4097,7 @@ impl X11Platform {
                 }
                 let hovered = state.menu_interaction.hovered_path.last() == Some(&item.id);
                 if hovered {
-                    self.draw_popup_hover(window, gc, popup_layout.rect, item.rect)?;
+                    self.draw_popup_hover(backing.pixmap, gc, popup_layout.rect, item.rect)?;
                     self.conn
                         .change_gc(
                             gc,
@@ -4060,6 +4120,18 @@ impl X11Platform {
                             .foreground(self.glass_surface.opaque_pixel(color)),
                     )?
                     .check()?;
+            }
+            self.conn.flush()?;
+            self.conn.get_input_focus()?.reply()?;
+            for item in &popup_layout.items {
+                if item.separator {
+                    continue;
+                }
+                let color = if item.enabled {
+                    BAR_STYLE.material.foreground
+                } else {
+                    POPUP_STYLE.muted_foreground
+                };
                 self.text.draw_popup_utf8(
                     &item.label,
                     (item.rect.x - popup_layout.rect.x + POPUP_STYLE.row_horizontal_padding as i16)
@@ -4094,15 +4166,21 @@ impl X11Platform {
                     )?;
                 }
             }
-            self.conn.free_gc(gc)?.check()?;
-            if reuse {
-                self.popups[level].layout = popup_layout;
-            } else {
-                self.popups.push(PopupWindow {
+            self.text.release_drawable(backing.pixmap);
+            self.conn
+                .copy_area(
+                    backing.pixmap,
                     window,
-                    layout: popup_layout,
-                });
-            }
+                    gc,
+                    0,
+                    0,
+                    0,
+                    0,
+                    popup_layout.rect.width,
+                    popup_layout.rect.height,
+                )?
+                .check()?;
+            self.popups[level].layout = popup_layout;
             if !reuse && std::env::var_os("XBAR_TRACE").is_some() {
                 let popup = self.popups.last().expect("popup just inserted");
                 eprintln!(
@@ -4439,6 +4517,11 @@ impl Drop for X11Platform {
         }
 
         for popup in self.popups.drain(..) {
+            if let Some(backing) = popup.backing {
+                self.text.release_drawable(backing.pixmap);
+                let _ = self.conn.free_gc(backing.gc);
+                let _ = self.conn.free_pixmap(backing.pixmap);
+            }
             let _ = self.conn.destroy_window(popup.window);
         }
         for window in [
@@ -4502,12 +4585,12 @@ fn is_xbar_owned_window(
 #[cfg(test)]
 mod tests {
     use super::{
-        blur_behind_rect, classify_attention_property_reply, classify_property_string_reply,
-        effect_owner_property_value, install_passive_grabs, is_xbar_owned_window,
-        network_primary_row_label, popup_effect_owner, popup_hover_for, popup_hover_transition,
-        preserve_color_pixel, template_icon_pixel, tray_draw_size, tray_hit, AttentionPropertyRead,
-        BarWindow, GlobalPinShortcut, HitTarget, PopupHover, RenderTarget, SurfaceWindowGeometry,
-        PopupBacking, X11Event, backing_matches,
+        backing_matches, blur_behind_rect, classify_attention_property_reply,
+        classify_property_string_reply, effect_owner_property_value, install_passive_grabs,
+        is_xbar_owned_window, network_primary_row_label, popup_effect_owner, popup_hover_for,
+        popup_hover_transition, preserve_color_pixel, template_icon_pixel, tray_draw_size,
+        tray_hit, AttentionPropertyRead, BarWindow, GlobalPinShortcut, HitTarget, PopupBacking,
+        PopupHover, RenderTarget, SurfaceWindowGeometry, X11Event,
     };
     use crate::core::{StatusNotifierEndpoint, StatusNotifierIcon};
     use crate::ui::{layout::MenuRect, view::TrayIconRenderMode, view::TrayVisualItem};
@@ -5317,5 +5400,26 @@ mod tests {
         assert!(!backing_matches(backing, 340, 401, 32));
         assert!(!backing_matches(backing, 340, 400, 24));
         assert!(!backing_matches(None, 340, 400, 32));
+    }
+
+    #[test]
+    fn popup_backings_are_independent_per_window() {
+        let root_backing = PopupBacking {
+            pixmap: 1,
+            gc: 2,
+            width: 340,
+            height: 400,
+            depth: 32,
+        };
+        let submenu_backing = PopupBacking {
+            pixmap: 3,
+            gc: 4,
+            width: 280,
+            height: 320,
+            depth: 32,
+        };
+
+        assert_ne!(root_backing.pixmap, submenu_backing.pixmap);
+        assert_ne!(root_backing.gc, submenu_backing.gc);
     }
 }
