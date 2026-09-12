@@ -612,6 +612,7 @@ struct NotificationServer {
     timer: SharedTimer,
     events: EventQueue,
     wake: Arc<Mutex<UnixStream>>,
+    sound: Option<crate::notification_sound::NotificationSoundSender>,
 }
 
 impl NotificationServer {
@@ -644,14 +645,19 @@ impl NotificationServer {
         summary: String,
         body: String,
         _actions: Vec<String>,
-        _hints: HashMap<String, OwnedValue>,
+        hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> zbus::fdo::Result<u32> {
-        let id = self
+        let parsed_hints = notifications::parse_sound_hints(&hints);
+        let (id, delivery) = self
             .store
             .lock()
             .expect("notification store poisoned")
-            .notify(replaces_id, app_name, summary, body, expire_timeout);
+            .notify_with_disposition(replaces_id, app_name, summary, body, expire_timeout);
+        let sound_decision = notifications::decide_notification_sound(delivery, &parsed_hints);
+        if let Some(sound) = &self.sound {
+            let _ = sound.try_decision(sound_decision);
+        }
         self.publish();
         Ok(id.0)
     }
@@ -1577,6 +1583,8 @@ async fn run(
 ) -> zbus::Result<()> {
     let wake = Arc::new(Mutex::new(writer));
     let notification_store = Arc::new(Mutex::new(notifications::Store::default()));
+    let sound_bridge = crate::notification_sound::NotificationSoundBridge::spawn();
+    let sound_sender = sound_bridge.as_ref().and_then(|bridge| bridge.sender());
     let mut builder = zbus::connection::Builder::session()?.serve_at(
         REGISTRAR_PATH,
         Registrar {
@@ -1592,6 +1600,7 @@ async fn run(
             timer: Arc::clone(&notification_timer),
             events: Arc::clone(&events),
             wake: Arc::clone(&wake),
+            sound: sound_sender,
         },
     )?;
     let connection = builder

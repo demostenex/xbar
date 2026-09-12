@@ -7,10 +7,72 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use zbus::zvariant::OwnedValue;
 
 pub const DEFAULT_EXPIRE: Duration = Duration::from_secs(5);
 pub const REASON_EXPIRED: u32 = 1;
 pub const REASON_CLOSED: u32 = 3;
+pub const MAX_SOUND_HINT_LENGTH: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NotificationSoundRequest {
+    Default,
+    Named(String),
+    File(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SoundDecision {
+    Silent,
+    Play(NotificationSoundRequest),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ParsedSoundHints {
+    pub sound_name: Option<String>,
+    pub sound_file: Option<String>,
+    pub suppress_sound: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryKind {
+    New,
+    Replacement,
+}
+
+fn bounded_string(value: &OwnedValue) -> Option<String> {
+    let value: &str = value.downcast_ref().ok()?;
+    (value.len() <= MAX_SOUND_HINT_LENGTH).then(|| value.to_owned())
+}
+
+pub fn parse_sound_hints(
+    hints: &std::collections::HashMap<String, OwnedValue>,
+) -> ParsedSoundHints {
+    ParsedSoundHints {
+        sound_name: hints.get("sound-name").and_then(bounded_string),
+        sound_file: hints.get("sound-file").and_then(bounded_string),
+        suppress_sound: hints
+            .get("suppress-sound")
+            .and_then(|value| bool::try_from(value).ok())
+            .unwrap_or(false),
+    }
+}
+
+pub fn decide_notification_sound(
+    delivery: DeliveryKind,
+    hints: &ParsedSoundHints,
+) -> SoundDecision {
+    if delivery == DeliveryKind::Replacement || hints.suppress_sound {
+        return SoundDecision::Silent;
+    }
+    if let Some(file) = &hints.sound_file {
+        return SoundDecision::Play(NotificationSoundRequest::File(file.clone()));
+    }
+    if let Some(name) = &hints.sound_name {
+        return SoundDecision::Play(NotificationSoundRequest::Named(name.clone()));
+    }
+    SoundDecision::Play(NotificationSoundRequest::Default)
+}
 
 struct Record {
     notification: Notification,
@@ -26,6 +88,7 @@ pub struct Store {
 }
 
 impl Store {
+    #[allow(dead_code)]
     pub fn notify(
         &mut self,
         replaces_id: u32,
@@ -34,6 +97,19 @@ impl Store {
         body: String,
         expire_timeout: i32,
     ) -> NotificationId {
+        self.notify_with_disposition(replaces_id, app_name, summary, body, expire_timeout)
+            .0
+    }
+
+    pub fn notify_with_disposition(
+        &mut self,
+        replaces_id: u32,
+        app_name: String,
+        summary: String,
+        body: String,
+        expire_timeout: i32,
+    ) -> (NotificationId, DeliveryKind) {
+        let replacing = replaces_id != 0 && self.records.contains_key(&NotificationId(replaces_id));
         let id = if replaces_id != 0 && self.records.contains_key(&NotificationId(replaces_id)) {
             NotificationId(replaces_id)
         } else {
@@ -77,7 +153,14 @@ impl Store {
             },
         );
         self.history.truncate(50);
-        id
+        (
+            id,
+            if replacing {
+                DeliveryKind::Replacement
+            } else {
+                DeliveryKind::New
+            },
+        )
     }
 
     pub fn attention(&mut self, window: WindowId, app_name: String, active: bool) {
@@ -325,6 +408,160 @@ pub fn expire(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hints(values: &[(&str, OwnedValue)]) -> std::collections::HashMap<String, OwnedValue> {
+        values
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect()
+    }
+
+    fn string_value(value: &str) -> OwnedValue {
+        OwnedValue::try_from(zbus::zvariant::Value::from(value.to_owned())).unwrap()
+    }
+
+    fn bool_value(value: bool) -> OwnedValue {
+        OwnedValue::try_from(zbus::zvariant::Value::from(value)).unwrap()
+    }
+
+    fn sound(delivery: DeliveryKind, values: &[(&str, OwnedValue)]) -> SoundDecision {
+        let parsed = parse_sound_hints(&hints(values));
+        decide_notification_sound(delivery, &parsed)
+    }
+
+    #[test]
+    fn sound_policy_defaults_and_selects_name_or_file() {
+        assert_eq!(
+            sound(DeliveryKind::New, &[]),
+            SoundDecision::Play(NotificationSoundRequest::Default)
+        );
+        assert_eq!(
+            sound(
+                DeliveryKind::New,
+                &[("sound-name", string_value("message-new"))]
+            ),
+            SoundDecision::Play(NotificationSoundRequest::Named("message-new".into()))
+        );
+        assert_eq!(
+            sound(
+                DeliveryKind::New,
+                &[("sound-file", string_value("/tmp/notify.wav"))]
+            ),
+            SoundDecision::Play(NotificationSoundRequest::File("/tmp/notify.wav".into()))
+        );
+        assert_eq!(
+            sound(
+                DeliveryKind::New,
+                &[
+                    ("sound-name", string_value("message-new")),
+                    ("sound-file", string_value("/tmp/notify.wav")),
+                ],
+            ),
+            SoundDecision::Play(NotificationSoundRequest::File("/tmp/notify.wav".into()))
+        );
+    }
+
+    #[test]
+    fn sound_policy_suppression_overrides_every_request() {
+        for values in [
+            vec![("suppress-sound", bool_value(true))],
+            vec![
+                ("suppress-sound", bool_value(true)),
+                ("sound-name", string_value("message-new")),
+            ],
+            vec![
+                ("suppress-sound", bool_value(true)),
+                ("sound-file", string_value("/tmp/notify.wav")),
+            ],
+        ] {
+            assert_eq!(sound(DeliveryKind::New, &values), SoundDecision::Silent);
+        }
+        assert_eq!(
+            sound(DeliveryKind::New, &[("suppress-sound", bool_value(false))]),
+            SoundDecision::Play(NotificationSoundRequest::Default)
+        );
+    }
+
+    #[test]
+    fn sound_policy_replacement_is_always_silent() {
+        assert_eq!(
+            sound(
+                DeliveryKind::Replacement,
+                &[
+                    ("sound-name", string_value("message-new")),
+                    ("sound-file", string_value("/tmp/notify.wav")),
+                ],
+            ),
+            SoundDecision::Silent
+        );
+    }
+
+    #[test]
+    fn malformed_and_oversized_sound_hints_are_ignored() {
+        let malformed = hints(&[
+            ("sound-name", bool_value(true)),
+            ("sound-file", bool_value(true)),
+            ("suppress-sound", string_value("true")),
+        ]);
+        assert_eq!(
+            decide_notification_sound(DeliveryKind::New, &parse_sound_hints(&malformed)),
+            SoundDecision::Play(NotificationSoundRequest::Default)
+        );
+        assert_eq!(
+            sound(
+                DeliveryKind::New,
+                &[
+                    ("sound-file", bool_value(true)),
+                    ("sound-name", string_value("message-new")),
+                ],
+            ),
+            SoundDecision::Play(NotificationSoundRequest::Named("message-new".into()))
+        );
+        let oversized = "x".repeat(MAX_SOUND_HINT_LENGTH + 1);
+        assert_eq!(
+            sound(
+                DeliveryKind::New,
+                &[("sound-name", string_value(&oversized))]
+            ),
+            SoundDecision::Play(NotificationSoundRequest::Default)
+        );
+        assert_eq!(
+            sound(
+                DeliveryKind::New,
+                &[("sound-file", string_value(&oversized))]
+            ),
+            SoundDecision::Play(NotificationSoundRequest::Default)
+        );
+        assert_eq!(
+            sound(
+                DeliveryKind::New,
+                &[
+                    ("sound-file", string_value(&oversized)),
+                    ("sound-name", string_value("message-new")),
+                ],
+            ),
+            SoundDecision::Play(NotificationSoundRequest::Named("message-new".into()))
+        );
+    }
+
+    #[test]
+    fn unknown_replacement_is_new_delivery_for_sound_policy() {
+        let mut store = Store::default();
+        let (_, first_kind) =
+            store.notify_with_disposition(99, "app".into(), "one".into(), String::new(), 0);
+        assert_eq!(first_kind, DeliveryKind::New);
+        assert_eq!(
+            sound(
+                DeliveryKind::New,
+                &[("sound-name", string_value("message-new"))]
+            ),
+            SoundDecision::Play(NotificationSoundRequest::Named("message-new".into()))
+        );
+        let first = store.snapshot()[0].id;
+        let (_, replacement_kind) =
+            store.notify_with_disposition(first.0, "app".into(), "two".into(), String::new(), 0);
+        assert_eq!(replacement_kind, DeliveryKind::Replacement);
+    }
 
     #[test]
     fn ids_are_nonzero_and_replacement_keeps_id() {
