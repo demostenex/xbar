@@ -12,7 +12,8 @@ use x11rb::connection::Connection;
 use x11rb::protocol::randr::{self, ConnectionExt as RandrExt};
 use x11rb::protocol::render::{self, ConnectionExt as RenderExt};
 use x11rb::protocol::xproto::{
-    self, Atom, AtomEnum, ConnectionExt as XprotoExt, EventMask, ModMask, WindowClass,
+    self, Atom, AtomEnum, ButtonIndex, ConnectionExt as XprotoExt, EventMask, GrabMode, ModMask,
+    WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as WrapperExt;
@@ -31,6 +32,10 @@ fn trace_x11_resource(event: &str, role: &str, xid: u32) {
         let _ = writeln!(stderr, "xbar xft: {event} role={role} xid=0x{xid:x}");
         let _ = stderr.flush();
     }
+}
+
+fn notification_scroll_trace_enabled() -> bool {
+    std::env::var_os("XBAR_TRACE_NOTIFICATION_SCROLL").is_some()
 }
 
 /// Render an eligible template pixel while retaining its source alpha as
@@ -575,7 +580,59 @@ struct NotificationCenterWindow {
     backing: Option<PopupBacking>,
     card_hits: Vec<(crate::core::NotificationId, layout::MenuRect)>,
     hover: Option<crate::core::NotificationId>,
+    scroll: usize,
+    scroll_changed: bool,
     dirty: bool,
+}
+
+fn notification_visible_capacity(output_height: u16) -> usize {
+    usize::from(output_height.saturating_sub(BAR_HEIGHT + 12) / 62).max(1)
+}
+
+fn notification_max_scroll(history_len: usize, visible_capacity: usize) -> usize {
+    history_len.saturating_sub(visible_capacity)
+}
+
+fn notification_previous_scroll(same_output: bool, previous: usize) -> usize {
+    if same_output {
+        previous
+    } else {
+        0
+    }
+}
+
+fn notification_scroll_target(
+    current: usize,
+    button: u8,
+    history_len: usize,
+    visible_capacity: usize,
+) -> usize {
+    let maximum = notification_max_scroll(history_len, visible_capacity);
+    match button {
+        4 => current.saturating_sub(1),
+        5 => current.saturating_add(1).min(maximum),
+        _ => current.min(maximum),
+    }
+}
+
+fn notification_wheel_direction(button: u8) -> Option<i8> {
+    match button {
+        4 => Some(-1),
+        5 => Some(1),
+        _ => None,
+    }
+}
+
+fn reconcile_notification_scroll(
+    previous: usize,
+    anchor: Option<crate::core::NotificationId>,
+    history: &[crate::core::NotificationHistoryEntry],
+    visible_capacity: usize,
+) -> usize {
+    let scroll = anchor
+        .and_then(|anchor| history.iter().position(|entry| entry.id == anchor))
+        .unwrap_or(previous);
+    scroll.min(notification_max_scroll(history.len(), visible_capacity))
 }
 
 fn notification_hover_transition(
@@ -1747,6 +1804,96 @@ impl X11Platform {
         }
         changed
     }
+
+    pub fn scroll_notification_center(&mut self, button: u8, state: &State) -> bool {
+        let Some(center) = self.notification_center.as_mut() else {
+            return false;
+        };
+        let Some(output) = state
+            .outputs
+            .iter()
+            .find(|output| output.id == center.output)
+        else {
+            return false;
+        };
+        let capacity = notification_visible_capacity(output.height);
+        let Some(_) = notification_wheel_direction(button) else {
+            return false;
+        };
+        let next = notification_scroll_target(
+            center.scroll,
+            button,
+            state.notification_history.len(),
+            capacity,
+        );
+        let before = center.scroll;
+        let dirty_before = center.dirty;
+        if next == center.scroll {
+            if notification_scroll_trace_enabled() {
+                eprintln!(
+                    "notification-center scroll: button={} scroll_before={} history_len={} visible_capacity={} max_scroll={} scroll_after={} changed=false dirty_before={} dirty_after={}",
+                    button,
+                    before,
+                    state.notification_history.len(),
+                    capacity,
+                    notification_max_scroll(state.notification_history.len(), capacity),
+                    next,
+                    dirty_before,
+                    center.dirty
+                );
+            }
+            return false;
+        }
+        center.scroll = next;
+        center.scroll_changed = true;
+        center.dirty = true;
+        if notification_scroll_trace_enabled() {
+            eprintln!(
+                "notification-center scroll: button={} scroll_before={} history_len={} visible_capacity={} max_scroll={} scroll_after={} changed=true dirty_before={} dirty_after={}",
+                button,
+                before,
+                state.notification_history.len(),
+                capacity,
+                notification_max_scroll(state.notification_history.len(), capacity),
+                center.scroll,
+                dirty_before,
+                center.dirty
+            );
+        }
+        true
+    }
+
+    fn install_notification_center_wheel_grabs(&self, window: u32) -> (String, String) {
+        let mut outcomes = Vec::with_capacity(2);
+        for (button, label) in [(ButtonIndex::M4, "button4"), (ButtonIndex::M5, "button5")] {
+            let result = self.conn.grab_button(
+                true,
+                window,
+                EventMask::BUTTON_PRESS,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                x11rb::NONE,
+                x11rb::NONE,
+                button,
+                ModMask::ANY,
+            );
+            let outcome = match result {
+                Ok(cookie) => match cookie.check() {
+                    Ok(()) => "SUCCESS".to_owned(),
+                    Err(error) => format!("ERROR:{error}"),
+                },
+                Err(error) => format!("ERROR:{error}"),
+            };
+            if notification_scroll_trace_enabled() {
+                eprintln!(
+                    "notification-center grab {}: xid={} result={}",
+                    label, window, outcome
+                );
+            }
+            outcomes.push(outcome);
+        }
+        (outcomes.remove(0), outcomes.remove(0))
+    }
     pub fn acquire_instance(&mut self) -> Result<bool, Box<dyn Error>> {
         let window = self.conn.generate_id()?;
         trace_x11_resource("WINDOW_CREATE", "instance-candidate", window);
@@ -1812,6 +1959,22 @@ impl X11Platform {
                         e.root_y,
                         e.detail,
                         e.state.bits()
+                    );
+                }
+                if notification_scroll_trace_enabled() {
+                    eprintln!(
+                        "notification-center button-press raw: event={} root={} child={} event_x={} event_y={} root_x={} root_y={} detail={} center_xid={}",
+                        e.event,
+                        e.root,
+                        e.child,
+                        e.event_x,
+                        e.event_y,
+                        e.root_x,
+                        e.root_y,
+                        e.detail,
+                        self.notification_center
+                            .as_ref()
+                            .map_or(0, |center| center.window)
                     );
                 }
                 Some(X11Event::ButtonPress {
@@ -2654,16 +2817,47 @@ impl X11Platform {
         };
         let width = 360_u16.min(output.width.max(1));
         let available = output.height.saturating_sub(BAR_HEIGHT + 12);
-        let max_cards = usize::from(available / 62);
+        let visible_capacity = notification_visible_capacity(output.height);
+        let previous = self.notification_center.as_ref();
+        let same_output = previous.is_some_and(|center| center.output == output_id);
+        let previous_scroll =
+            notification_previous_scroll(same_output, previous.map_or(0, |center| center.scroll));
+        let user_scrolled = same_output && previous.is_some_and(|center| center.scroll_changed);
+        let previous_anchor = (!user_scrolled && previous_scroll > 0)
+            .then(|| previous.and_then(|center| center.card_hits.first().map(|(id, _)| *id)));
+        let scroll = reconcile_notification_scroll(
+            previous_scroll,
+            previous_anchor.flatten(),
+            &state.notification_history,
+            visible_capacity,
+        );
         let cards = state
             .notification_history
             .iter()
-            .take(max_cards.max(1))
+            .skip(scroll)
+            .take(visible_capacity)
             .count();
+        if notification_scroll_trace_enabled() {
+            let first_visible = state
+                .notification_history
+                .iter()
+                .skip(scroll)
+                .take(cards)
+                .next()
+                .map_or_else(|| "NONE".to_owned(), |entry| entry.id.0.to_string());
+            eprintln!(
+                "notification-center render: scroll={} history_len={} capacity={} first_visible_id={} visible_count={}",
+                scroll,
+                state.notification_history.len(),
+                visible_capacity,
+                first_visible,
+                cards
+            );
+        }
         let height = if state.notification_history.is_empty() {
             62
         } else {
-            (cards.max(1) as u16)
+            (visible_capacity as u16)
                 .saturating_mul(62)
                 .min(available.max(62))
         };
@@ -2697,9 +2891,16 @@ impl X11Platform {
                 },
                 xproto::CreateWindowAux::new()
                     .override_redirect(1)
-                    .event_mask(EventMask::EXPOSURE),
+                    .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
             )?;
             self.conn.map_window(window)?.check()?;
+            let (grab_button4, grab_button5) = self.install_notification_center_wheel_grabs(window);
+            if notification_scroll_trace_enabled() {
+                eprintln!(
+                    "notification-center create: xid={} output={} geometry={}x{}+{}+{} event_mask=EXPOSURE|BUTTON_PRESS grab_button4={} grab_button5={}",
+                    window, output_id.0, width, height, x, y, grab_button4, grab_button5
+                );
+            }
             window
         };
         if self.notification_center.as_ref().is_some_and(|center| {
@@ -2790,7 +2991,13 @@ impl X11Platform {
             }],
         )?;
         let mut card_hits = Vec::with_capacity(cards);
-        for (index, entry) in state.notification_history.iter().take(cards).enumerate() {
+        for (index, entry) in state
+            .notification_history
+            .iter()
+            .skip(scroll)
+            .take(cards)
+            .enumerate()
+        {
             let top = (index as u16).saturating_mul(62);
             let card_rect = layout::MenuRect {
                 x: 4,
@@ -2893,6 +3100,8 @@ impl X11Platform {
             backing: Some(backing),
             card_hits,
             hover,
+            scroll,
+            scroll_changed: false,
             dirty: false,
         });
         Ok(())
@@ -5055,6 +5264,17 @@ impl X11Platform {
             _ => return HitTarget::Outside,
         };
         if let Some(center) = &self.notification_center {
+            if notification_scroll_trace_enabled() {
+                if let X11Event::ButtonPress { button, .. } = event {
+                    eprintln!(
+                        "notification-center button-match: event={} center={} matches={} detail={}",
+                        window,
+                        center.window,
+                        center.window == window,
+                        button
+                    );
+                }
+            }
             if center.window == window {
                 let local_x = x;
                 let local_y = y;
@@ -5439,12 +5659,13 @@ mod tests {
         classify_property_string_reply, effect_owner_property_value, install_passive_grabs,
         is_xbar_owned_window, menu_popup_dirty_for_interaction_change, menu_popup_slot_for_window,
         menu_popup_slots_for_item, network_primary_row_label, notification_hover_transition,
-        notification_indicator_hit, notification_indicator_rect, popup_effect_owner,
+        notification_indicator_hit, notification_indicator_rect, notification_previous_scroll,
+        notification_scroll_target, notification_wheel_direction, popup_effect_owner,
         popup_hover_for, popup_hover_transition, popup_slot_is_selected, preserve_color_pixel,
-        template_icon_pixel, tray_draw_size, tray_hit, union_menu_rects, AttentionPropertyRead,
-        BarBacking, BarWindow, GlobalPinShortcut, HitTarget, MenuPopupDirty, PopupBacking,
-        PopupHover, PopupSlot, PopupWindow, RenderTarget, SurfaceWindowGeometry, X11Event,
-        BAR_HEIGHT,
+        reconcile_notification_scroll, template_icon_pixel, tray_draw_size, tray_hit,
+        union_menu_rects, AttentionPropertyRead, BarBacking, BarWindow, GlobalPinShortcut,
+        HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot, PopupWindow, RenderTarget,
+        SurfaceWindowGeometry, X11Event, BAR_HEIGHT,
     };
     use crate::core::{
         MenuItemId, OutputId, OutputState, StatusNotifierEndpoint, StatusNotifierIcon,
@@ -6639,5 +6860,92 @@ mod tests {
         );
         assert_eq!(rect_a, notification_indicator_rect(&output_a));
         assert_eq!(rect_b, notification_indicator_rect(&output_b));
+    }
+
+    fn test_history(ids: &[u32]) -> Vec<crate::core::NotificationHistoryEntry> {
+        ids.iter()
+            .enumerate()
+            .map(|(order, id)| crate::core::NotificationHistoryEntry {
+                id: crate::core::NotificationId(*id),
+                source: crate::core::NotificationSource::Freedesktop,
+                app_name: String::new(),
+                summary: String::new(),
+                body: String::new(),
+                order: order as u64,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn notification_scroll_is_card_aligned_and_clamped() {
+        assert_eq!(notification_scroll_target(0, 4, 5, 3), 0);
+        assert_eq!(notification_scroll_target(0, 5, 5, 3), 1);
+        assert_eq!(notification_scroll_target(1, 5, 5, 3), 2);
+        assert_eq!(notification_scroll_target(2, 5, 5, 3), 2);
+        assert_eq!(notification_scroll_target(2, 4, 5, 3), 1);
+        assert_eq!(notification_scroll_target(0, 4, 0, 3), 0);
+        assert_eq!(notification_scroll_target(0, 5, 2, 3), 0);
+    }
+
+    #[test]
+    fn notification_scroll_visible_slice_contains_only_complete_entries() {
+        let history = test_history(&[1, 2, 3, 4, 5]);
+        let visible = |scroll| {
+            history
+                .iter()
+                .skip(scroll)
+                .take(3)
+                .map(|entry| entry.id.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(visible(0), vec![1, 2, 3]);
+        assert_eq!(visible(1), vec![2, 3, 4]);
+        assert_eq!(visible(2), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn notification_scroll_preserves_first_visible_anchor_on_history_changes() {
+        let history = test_history(&[1, 2, 3, 4, 5]);
+        let anchor = Some(crate::core::NotificationId(3));
+        assert_eq!(
+            reconcile_notification_scroll(2, anchor, &test_history(&[9, 1, 2, 3, 4, 5]), 3),
+            3
+        );
+        assert_eq!(
+            reconcile_notification_scroll(2, anchor, &test_history(&[3, 1, 2, 4, 5]), 3),
+            0
+        );
+        assert_eq!(
+            reconcile_notification_scroll(2, anchor, &test_history(&[1, 3, 4, 5]), 3),
+            1
+        );
+        assert_eq!(
+            reconcile_notification_scroll(2, anchor, &test_history(&[1, 2, 4, 5]), 3),
+            1
+        );
+        assert_eq!(history[2].id, crate::core::NotificationId(3));
+    }
+
+    #[test]
+    fn notification_scroll_clamps_when_capacity_changes_or_history_is_empty() {
+        let history = test_history(&[1, 2, 3, 4, 5]);
+        assert_eq!(reconcile_notification_scroll(4, None, &history, 3), 2);
+        assert_eq!(reconcile_notification_scroll(2, None, &history, 5), 0);
+        assert_eq!(reconcile_notification_scroll(2, None, &Vec::new(), 3), 0);
+    }
+
+    #[test]
+    fn notification_scroll_resets_on_reopen_or_output_switch() {
+        assert_eq!(notification_previous_scroll(true, 2), 2);
+        assert_eq!(notification_previous_scroll(false, 2), 0);
+        assert_eq!(notification_previous_scroll(false, 0), 0);
+    }
+
+    #[test]
+    fn notification_center_wheel_dispatch_preserves_vertical_buttons() {
+        assert_eq!(notification_wheel_direction(4), Some(-1));
+        assert_eq!(notification_wheel_direction(5), Some(1));
+        assert_eq!(notification_wheel_direction(1), None);
+        assert_eq!(notification_wheel_direction(6), None);
     }
 }

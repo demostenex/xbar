@@ -380,6 +380,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 _ => None,
             };
+            let notification_scrolled = match (&event, mouse_target.as_ref()) {
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button, .. }),
+                    Some(
+                        platform::x11::HitTarget::NotificationCenterCard(_)
+                        | platform::x11::HitTarget::NotificationCenterEmpty,
+                    ),
+                ) if *button == 4 || *button == 5 => {
+                    x11.scroll_notification_center(*button, &state)
+                }
+                _ => false,
+            };
             let popup_hover_changed = matches!(
                 event,
                 Event::X11(platform::x11::X11Event::MotionNotify { .. })
@@ -1136,7 +1148,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     semantic_render_target = None;
                 }
             }
-            dirty |= reduced || popup_hover_changed || popup_exposed;
+            dirty |= reduced || popup_hover_changed || popup_exposed || notification_scrolled;
             match translated {
                 Event::AudioTrackChanged { input, percent }
                     if last_audio_command != Some((input, percent)) =>
@@ -1297,6 +1309,19 @@ fn run() -> Result<(), Box<dyn Error>> {
             if notification_hover_changed {
                 render_target =
                     merge_render_target(render_target, Some(RenderTarget::Notification));
+            }
+            if notification_scrolled {
+                render_target =
+                    merge_render_target(render_target, Some(RenderTarget::Notification));
+            }
+            if notification_scrolled && std::env::var_os("XBAR_TRACE_NOTIFICATION_SCROLL").is_some()
+            {
+                eprintln!(
+                    "notification-center scroll-redraw: dirty={} render_target={} scheduled=true",
+                    dirty,
+                    render_target
+                        .map_or_else(|| "NONE".to_owned(), |target| target.debug_regions())
+                );
             }
             let current_active_source =
                 state.active_menu_endpoint(&registry.lock().expect("registry poisoned"));
@@ -1575,6 +1600,14 @@ fn render_target_for(
         Event::OutputsChanged(_) => Some(RenderTarget::Dock.merge(RenderTarget::Notification)),
         Event::X11(platform::x11::X11Event::MotionNotify { .. }) => {
             hover_render_target_for(mouse_target.as_ref(), None)
+        }
+        Event::X11(platform::x11::X11Event::ButtonPress { button: 4 | 5, .. })
+            if matches!(
+                mouse_target,
+                Some(HitTarget::NotificationCenterCard(_) | HitTarget::NotificationCenterEmpty)
+            ) =>
+        {
+            Some(RenderTarget::Notification)
         }
         Event::MenuItemHovered { .. } => {
             hover_render_target_for(mouse_target.as_ref(), Some(RenderTarget::DockContext))
