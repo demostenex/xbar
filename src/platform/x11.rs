@@ -578,8 +578,8 @@ struct NotificationCenterWindow {
     width: u16,
     height: u16,
     backing: Option<PopupBacking>,
-    card_hits: Vec<(crate::core::NotificationId, layout::MenuRect)>,
-    hover: Option<crate::core::NotificationId>,
+    card_hits: Vec<(crate::core::HistoryEntryId, layout::MenuRect)>,
+    hover: Option<crate::core::HistoryEntryId>,
     scroll: usize,
     scroll_changed: bool,
     dirty: bool,
@@ -625,7 +625,7 @@ fn notification_wheel_direction(button: u8) -> Option<i8> {
 
 fn reconcile_notification_scroll(
     previous: usize,
-    anchor: Option<crate::core::NotificationId>,
+    anchor: Option<crate::core::HistoryEntryId>,
     history: &[crate::core::NotificationHistoryEntry],
     visible_capacity: usize,
 ) -> usize {
@@ -636,9 +636,9 @@ fn reconcile_notification_scroll(
 }
 
 fn notification_hover_transition(
-    old: Option<crate::core::NotificationId>,
-    next: Option<crate::core::NotificationId>,
-) -> (Option<crate::core::NotificationId>, bool) {
+    old: Option<crate::core::HistoryEntryId>,
+    next: Option<crate::core::HistoryEntryId>,
+) -> (Option<crate::core::HistoryEntryId>, bool) {
     (next, old != next)
 }
 
@@ -685,7 +685,7 @@ type BarHitMap = (
 pub enum HitTarget {
     #[allow(dead_code)]
     NotificationCenter(OutputId),
-    NotificationCenterCard(crate::core::NotificationId),
+    NotificationCenterCard(crate::core::HistoryEntryId),
     NotificationCenterEmpty,
     TopLevel(crate::core::MenuItemId),
     Item(Vec<crate::core::MenuItemId>),
@@ -6782,8 +6782,8 @@ mod tests {
 
     #[test]
     fn notification_hover_transitions_dirty_only_on_identity_change() {
-        let a = crate::core::NotificationId(1);
-        let b = crate::core::NotificationId(2);
+        let a = crate::core::HistoryEntryId(1);
+        let b = crate::core::HistoryEntryId(2);
         assert!(notification_hover_transition(None, Some(a)).1);
         assert!(!notification_hover_transition(Some(a), Some(a)).1);
         assert!(notification_hover_transition(Some(a), Some(b)).1);
@@ -6799,10 +6799,10 @@ mod tests {
             width: 352,
             height: 54,
         };
-        let cards = [(crate::core::NotificationId(1), rect)];
+        let cards = [(crate::core::HistoryEntryId(1), rect)];
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].1, rect);
-        let empty: Vec<(crate::core::NotificationId, MenuRect)> = Vec::new();
+        let empty: Vec<(crate::core::HistoryEntryId, MenuRect)> = Vec::new();
         assert!(empty.is_empty());
     }
 
@@ -6866,7 +6866,8 @@ mod tests {
         ids.iter()
             .enumerate()
             .map(|(order, id)| crate::core::NotificationHistoryEntry {
-                id: crate::core::NotificationId(*id),
+                id: crate::core::HistoryEntryId(u64::from(*id)),
+                live_notification_id: None,
                 source: crate::core::NotificationSource::Freedesktop,
                 app_name: String::new(),
                 summary: String::new(),
@@ -6906,7 +6907,7 @@ mod tests {
     #[test]
     fn notification_scroll_preserves_first_visible_anchor_on_history_changes() {
         let history = test_history(&[1, 2, 3, 4, 5]);
-        let anchor = Some(crate::core::NotificationId(3));
+        let anchor = Some(crate::core::HistoryEntryId(3));
         assert_eq!(
             reconcile_notification_scroll(2, anchor, &test_history(&[9, 1, 2, 3, 4, 5]), 3),
             3
@@ -6923,7 +6924,7 @@ mod tests {
             reconcile_notification_scroll(2, anchor, &test_history(&[1, 2, 4, 5]), 3),
             1
         );
-        assert_eq!(history[2].id, crate::core::NotificationId(3));
+        assert_eq!(history[2].id, crate::core::HistoryEntryId(3));
     }
 
     #[test]

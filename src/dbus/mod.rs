@@ -2,9 +2,9 @@
 use crate::core::NetworkAccessPoint;
 use crate::core::{
     parse_notifier_item_id, BluetoothDevice, BluetoothPendingAction, BluetoothState, Event,
-    GtkMenuEndpoint, MenuActionTarget, MenuEndpoint, MenuRegistry, MenuSource, NotificationId,
-    StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierIcon, StatusNotifierItem,
-    StatusNotifierStatus,
+    GtkMenuEndpoint, HistoryEntryId, MenuActionTarget, MenuEndpoint, MenuRegistry, MenuSource,
+    NotificationId, StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierIcon,
+    StatusNotifierItem, StatusNotifierStatus,
 };
 mod ai_usage;
 mod gmenu;
@@ -196,6 +196,10 @@ enum Request {
     BluetoothConnectDevice(String),
     BluetoothDisconnectDevice(String),
     NotificationTimerFired,
+    #[allow(dead_code)]
+    DismissNotificationHistoryEntry(HistoryEntryId),
+    #[allow(dead_code)]
+    ClearNotificationHistory,
     WindowAttention {
         window: crate::core::WindowId,
         app_name: String,
@@ -444,6 +448,18 @@ impl DbusBridge {
 
     pub fn notification_timer_fired(&self) {
         let _ = self.requests.try_send(Request::NotificationTimerFired);
+    }
+
+    #[allow(dead_code)]
+    pub fn dismiss_notification_history_entry(&self, id: HistoryEntryId) {
+        let _ = self
+            .requests
+            .try_send(Request::DismissNotificationHistoryEntry(id));
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_notification_history(&self) {
+        let _ = self.requests.try_send(Request::ClearNotificationHistory);
     }
 
     pub fn window_attention(
@@ -2147,6 +2163,34 @@ async fn run(
                     }
                 } else {
                     eprintln!("xbar: BlueZ Disconnect skipped: system bus unavailable");
+                }
+            }
+            Either::Request(Ok(Request::DismissNotificationHistoryEntry(id))) => {
+                let changed = notification_store
+                    .lock()
+                    .expect("notification store poisoned")
+                    .dismiss_history_entry(id);
+                if changed {
+                    notifications::publish(
+                        &notification_store,
+                        &notification_timer,
+                        &events,
+                        &wake,
+                    );
+                }
+            }
+            Either::Request(Ok(Request::ClearNotificationHistory)) => {
+                let changed = notification_store
+                    .lock()
+                    .expect("notification store poisoned")
+                    .clear_history();
+                if changed {
+                    notifications::publish(
+                        &notification_store,
+                        &notification_timer,
+                        &events,
+                        &wake,
+                    );
                 }
             }
             Either::Request(Ok(Request::NotificationTimerFired)) => {

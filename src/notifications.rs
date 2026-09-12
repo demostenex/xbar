@@ -1,5 +1,6 @@
 use crate::core::{
-    Event, Notification, NotificationHistoryEntry, NotificationId, NotificationSource, WindowId,
+    Event, HistoryEntryId, Notification, NotificationHistoryEntry, NotificationId,
+    NotificationSource, WindowId,
 };
 use std::collections::BTreeMap;
 use std::io;
@@ -77,11 +78,13 @@ pub fn decide_notification_sound(
 struct Record {
     notification: Notification,
     deadline: Option<Instant>,
+    pending_history_id: Option<HistoryEntryId>,
 }
 
 #[derive(Default)]
 pub struct Store {
     next_id: u32,
+    next_history_id: u64,
     next_order: u64,
     records: BTreeMap<NotificationId, Record>,
     history: Vec<NotificationHistoryEntry>,
@@ -115,6 +118,10 @@ impl Store {
         } else {
             self.allocate_id()
         };
+        let pending_history_id = self
+            .records
+            .get(&id)
+            .and_then(|record| record.pending_history_id);
         let deadline = if expire_timeout == 0 {
             None
         } else {
@@ -137,22 +144,25 @@ impl Store {
                     body,
                 },
                 deadline,
+                pending_history_id,
             },
         );
         self.next_order = self.next_order.wrapping_add(1);
-        self.history.retain(|entry| entry.id != id);
-        self.history.insert(
-            0,
-            NotificationHistoryEntry {
-                id,
-                source: NotificationSource::Freedesktop,
-                app_name: self.records[&id].notification.app_name.clone(),
-                summary: self.records[&id].notification.summary.clone(),
-                body: self.records[&id].notification.body.clone(),
-                order: self.next_order,
-            },
-        );
-        self.history.truncate(50);
+        if let Some(history_id) = pending_history_id {
+            if let Some(entry) = self.history.iter_mut().find(|entry| entry.id == history_id) {
+                entry.live_notification_id = Some(id);
+                entry.app_name = self.records[&id].notification.app_name.clone();
+                entry.summary = self.records[&id].notification.summary.clone();
+                entry.body = self.records[&id].notification.body.clone();
+                entry.order = self.next_order;
+                self.history
+                    .sort_by_key(|entry| std::cmp::Reverse(entry.order));
+            } else {
+                self.create_pending_history(id);
+            }
+        } else {
+            self.create_pending_history(id);
+        }
         (
             id,
             if replacing {
@@ -190,6 +200,7 @@ impl Store {
                             body: "A window is requesting attention".into(),
                         },
                         deadline: None,
+                        pending_history_id: None,
                     },
                 );
             }
@@ -209,12 +220,97 @@ impl Store {
         }
     }
 
-    pub fn close(&mut self, id: NotificationId) -> bool {
-        let removed = self.records.remove(&id).is_some();
-        if removed {
-            self.history.retain(|entry| entry.id != id);
+    fn allocate_history_id(&mut self) -> HistoryEntryId {
+        loop {
+            self.next_history_id = self.next_history_id.wrapping_add(1);
+            if self.next_history_id != 0
+                && !self
+                    .history
+                    .iter()
+                    .any(|entry| entry.id == HistoryEntryId(self.next_history_id))
+            {
+                return HistoryEntryId(self.next_history_id);
+            }
         }
-        removed
+    }
+
+    fn create_pending_history(&mut self, id: NotificationId) {
+        let history_id = self.allocate_history_id();
+        let notification = &self.records[&id].notification;
+        self.history.insert(
+            0,
+            NotificationHistoryEntry {
+                id: history_id,
+                live_notification_id: Some(id),
+                source: notification.source.clone(),
+                app_name: notification.app_name.clone(),
+                summary: notification.summary.clone(),
+                body: notification.body.clone(),
+                order: self.next_order,
+            },
+        );
+        if let Some(record) = self.records.get_mut(&id) {
+            record.pending_history_id = Some(history_id);
+        }
+        self.evict_history_overflow();
+    }
+
+    fn evict_history_overflow(&mut self) {
+        while self.history.len() > 50 {
+            if let Some(evicted) = self.history.pop() {
+                if let Some(notification_id) = evicted.live_notification_id {
+                    if let Some(record) = self.records.get_mut(&notification_id) {
+                        if record.pending_history_id == Some(evicted.id) {
+                            record.pending_history_id = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn dismiss_history_entry(&mut self, id: HistoryEntryId) -> bool {
+        let Some(index) = self.history.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        let entry = self.history.remove(index);
+        if let Some(notification_id) = entry.live_notification_id {
+            if let Some(record) = self.records.get_mut(&notification_id) {
+                if record.pending_history_id == Some(id) {
+                    record.pending_history_id = None;
+                }
+            }
+        }
+        true
+    }
+
+    pub fn clear_history(&mut self) -> bool {
+        if self.history.is_empty() {
+            return false;
+        }
+        for entry in &self.history {
+            if let Some(notification_id) = entry.live_notification_id {
+                if let Some(record) = self.records.get_mut(&notification_id) {
+                    if record.pending_history_id == Some(entry.id) {
+                        record.pending_history_id = None;
+                    }
+                }
+            }
+        }
+        self.history.clear();
+        true
+    }
+
+    pub fn close(&mut self, id: NotificationId) -> bool {
+        let record = self.records.remove(&id);
+        if let Some(record) = record {
+            if let Some(history_id) = record.pending_history_id {
+                self.history.retain(|entry| entry.id != history_id);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     pub fn expired(&mut self, now: Instant) -> Vec<NotificationId> {
@@ -229,7 +325,15 @@ impl Store {
             })
             .collect::<Vec<_>>();
         for id in &ids {
-            self.records.remove(id);
+            if let Some(record) = self.records.remove(id) {
+                if let Some(history_id) = record.pending_history_id {
+                    if let Some(entry) =
+                        self.history.iter_mut().find(|entry| entry.id == history_id)
+                    {
+                        entry.live_notification_id = None;
+                    }
+                }
+            }
         }
         ids
     }
@@ -638,15 +742,15 @@ mod tests {
             store
                 .history_snapshot()
                 .iter()
-                .map(|e| e.id)
+                .map(|e| e.live_notification_id)
                 .collect::<Vec<_>>(),
-            vec![second, first]
+            vec![Some(second), Some(first)]
         );
         let replaced = store.notify(first.0, "app".into(), "updated".into(), "body".into(), 0);
         let history = store.history_snapshot();
         assert_eq!(replaced, first);
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].id, first);
+        assert_eq!(history[0].live_notification_id, Some(first));
         assert_eq!(history[0].summary, "updated");
     }
 
@@ -672,5 +776,161 @@ mod tests {
         assert!(store.history_snapshot().is_empty());
         store.attention(WindowId(1), "Editor".into(), true);
         assert!(store.history_snapshot().is_empty());
+    }
+
+    #[test]
+    fn pending_entries_have_bidirectional_local_identity_links() {
+        let mut store = Store::default();
+        let (notification_id, disposition) =
+            store.notify_with_disposition(0, "app".into(), "one".into(), String::new(), 0);
+        assert_eq!(disposition, DeliveryKind::New);
+        let entry = &store.history[0];
+        assert_eq!(entry.live_notification_id, Some(notification_id));
+        assert_eq!(
+            store.records[&notification_id].pending_history_id,
+            Some(entry.id)
+        );
+    }
+
+    #[test]
+    fn separate_deliveries_have_distinct_protocol_and_history_ids() {
+        let mut store = Store::default();
+        let first = store.notify(0, "app".into(), "one".into(), String::new(), 0);
+        let second = store.notify(0, "app".into(), "two".into(), String::new(), 0);
+        assert_ne!(first, second);
+        assert_ne!(store.history[0].id, store.history[1].id);
+    }
+
+    #[test]
+    fn replacement_pending_preserves_history_entry_id() {
+        let mut store = Store::default();
+        let first = store.notify(0, "app".into(), "one".into(), String::new(), 0);
+        let history_id = store.history[0].id;
+        let (replaced, disposition) =
+            store.notify_with_disposition(first.0, "app".into(), "two".into(), String::new(), 0);
+        assert_eq!(replaced, first);
+        assert_eq!(disposition, DeliveryKind::Replacement);
+        assert_eq!(store.history.len(), 1);
+        assert_eq!(store.history[0].id, history_id);
+    }
+
+    #[test]
+    fn dismiss_removes_pending_but_keeps_active_without_protocol_close() {
+        let mut store = Store::default();
+        let notification_id = store.notify(0, "app".into(), "one".into(), String::new(), 0);
+        let history_id = store.history[0].id;
+        assert!(store.dismiss_history_entry(history_id));
+        assert!(store
+            .snapshot()
+            .iter()
+            .any(|item| item.id == notification_id));
+        assert!(store.history.is_empty());
+        assert_eq!(store.records[&notification_id].pending_history_id, None);
+        assert!(!store.dismiss_history_entry(history_id));
+    }
+
+    #[test]
+    fn replacement_after_dismiss_creates_new_pending_identity() {
+        let mut store = Store::default();
+        let notification_id = store.notify(0, "app".into(), "one".into(), String::new(), 0);
+        let old_history_id = store.history[0].id;
+        assert!(store.dismiss_history_entry(old_history_id));
+        let (replaced, disposition) = store.notify_with_disposition(
+            notification_id.0,
+            "app".into(),
+            "two".into(),
+            String::new(),
+            0,
+        );
+        assert_eq!(replaced, notification_id);
+        assert_eq!(disposition, DeliveryKind::Replacement);
+        assert_eq!(store.history.len(), 1);
+        assert_ne!(store.history[0].id, old_history_id);
+        assert_eq!(store.history[0].live_notification_id, Some(notification_id));
+    }
+
+    #[test]
+    fn replacement_after_clear_history_reappears_with_new_identity() {
+        let mut store = Store::default();
+        let notification_id = store.notify(0, "app".into(), "one".into(), String::new(), 0);
+        let old_history_id = store.history[0].id;
+        assert!(store.clear_history());
+        let (replaced, disposition) = store.notify_with_disposition(
+            notification_id.0,
+            "app".into(),
+            "two".into(),
+            String::new(),
+            0,
+        );
+        assert_eq!(replaced, notification_id);
+        assert_eq!(disposition, DeliveryKind::Replacement);
+        assert_ne!(store.history[0].id, old_history_id);
+    }
+
+    #[test]
+    fn close_after_local_dismiss_removes_active_record_safely() {
+        let mut store = Store::default();
+        let notification_id = store.notify(0, "app".into(), "one".into(), String::new(), 0);
+        let history_id = store.history[0].id;
+        assert!(store.dismiss_history_entry(history_id));
+        assert!(store.close(notification_id));
+        assert!(store.snapshot().is_empty());
+        assert!(store.history.is_empty());
+    }
+
+    #[test]
+    fn unknown_replacement_is_new_with_new_notification_and_history_ids() {
+        let mut store = Store::default();
+        let (id, disposition) =
+            store.notify_with_disposition(999, "app".into(), "one".into(), String::new(), 0);
+        assert_eq!(disposition, DeliveryKind::New);
+        assert_ne!(id, NotificationId(999));
+        assert_eq!(store.history.len(), 1);
+        assert_eq!(store.history[0].live_notification_id, Some(id));
+    }
+
+    #[test]
+    fn clear_history_keeps_active_records_and_clears_links() {
+        let mut store = Store::default();
+        let first = store.notify(0, "app".into(), "one".into(), String::new(), 0);
+        let second = store.notify(0, "app".into(), "two".into(), String::new(), 0);
+        assert!(store.clear_history());
+        assert!(store.history.is_empty());
+        assert_eq!(store.snapshot().len(), 2);
+        assert_eq!(store.records[&first].pending_history_id, None);
+        assert_eq!(store.records[&second].pending_history_id, None);
+        assert!(!store.clear_history());
+    }
+
+    #[test]
+    fn expiry_detaches_live_identity_but_retains_history_identity() {
+        let mut store = Store::default();
+        let id = store.notify(0, "app".into(), "one".into(), String::new(), 1);
+        let history_id = store.history[0].id;
+        let expired = store.expired(Instant::now() + Duration::from_secs(2));
+        assert_eq!(expired, vec![id]);
+        assert!(store.snapshot().is_empty());
+        assert_eq!(store.history[0].id, history_id);
+        assert_eq!(store.history[0].live_notification_id, None);
+    }
+
+    #[test]
+    fn eviction_clears_evicted_active_record_link() {
+        let mut store = Store::default();
+        let first = store.notify(0, "app".into(), "one".into(), String::new(), 0);
+        for index in 1..51 {
+            store.notify(0, "app".into(), index.to_string(), String::new(), 0);
+        }
+        assert_eq!(store.history.len(), 50);
+        assert_eq!(store.records[&first].pending_history_id, None);
+        let (replacement, disposition) =
+            store.notify_with_disposition(first.0, "app".into(), "again".into(), String::new(), 0);
+        assert_eq!(replacement, first);
+        assert_eq!(disposition, DeliveryKind::Replacement);
+        assert_eq!(store.history.len(), 50);
+        assert!(store
+            .history
+            .iter()
+            .any(|entry| entry.live_notification_id == Some(first)));
     }
 }

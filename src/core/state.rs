@@ -290,6 +290,9 @@ pub enum BluetoothPendingAction {
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NotificationId(pub u32);
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HistoryEntryId(pub u64);
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Notification {
     pub id: NotificationId,
@@ -302,7 +305,8 @@ pub struct Notification {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NotificationHistoryEntry {
-    pub id: NotificationId,
+    pub id: HistoryEntryId,
+    pub live_notification_id: Option<NotificationId>,
     pub source: NotificationSource,
     pub app_name: String,
     pub summary: String,
