@@ -1456,6 +1456,11 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             if state.outputs == outputs {
                 false
             } else {
+                if let Some(open) = state.notification_center_open {
+                    if !outputs.iter().any(|output| output.id == open) {
+                        state.notification_center_open = None;
+                    }
+                }
                 state.outputs = outputs;
                 true
             }
@@ -1684,6 +1689,22 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.notifications = notifications;
                 true
             }
+        }
+        Event::NotificationsState { active, history } => {
+            let changed = state.notifications != active || state.notification_history != history;
+            if changed {
+                state.notifications = active;
+                state.notification_history = history;
+            }
+            changed
+        }
+        Event::ToggleNotificationCenter(output) => {
+            state.notification_center_open = match state.notification_center_open {
+                None => Some(output),
+                Some(current) if current == output => None,
+                Some(_) => Some(output),
+            };
+            true
         }
         Event::WindowAttentionChanged { .. } => false,
         Event::AudioUnavailable => {
@@ -3041,6 +3062,63 @@ mod tests {
             &mut MenuRegistry::default()
         ));
         assert_eq!(s.outputs, vec![o]);
+    }
+
+    #[test]
+    fn notification_center_toggle_is_output_owned() {
+        let mut state = State::default();
+        assert!(reduce(
+            &mut state,
+            Event::ToggleNotificationCenter(OutputId(1)),
+            &mut MenuRegistry::default()
+        ));
+        assert_eq!(state.notification_center_open, Some(OutputId(1)));
+        assert!(reduce(
+            &mut state,
+            Event::ToggleNotificationCenter(OutputId(1)),
+            &mut MenuRegistry::default()
+        ));
+        assert_eq!(state.notification_center_open, None);
+        reduce(
+            &mut state,
+            Event::ToggleNotificationCenter(OutputId(1)),
+            &mut MenuRegistry::default(),
+        );
+        reduce(
+            &mut state,
+            Event::ToggleNotificationCenter(OutputId(2)),
+            &mut MenuRegistry::default(),
+        );
+        assert_eq!(state.notification_center_open, Some(OutputId(2)));
+    }
+
+    #[test]
+    fn removed_output_closes_notification_center_without_migration() {
+        let mut state = State {
+            notification_center_open: Some(OutputId(1)),
+            outputs: vec![OutputState {
+                id: OutputId(1),
+                name: "A".into(),
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }],
+            ..Default::default()
+        };
+        reduce(
+            &mut state,
+            Event::OutputsChanged(vec![OutputState {
+                id: OutputId(2),
+                name: "B".into(),
+                x: 100,
+                y: 0,
+                width: 100,
+                height: 100,
+            }]),
+            &mut MenuRegistry::default(),
+        );
+        assert_eq!(state.notification_center_open, None);
     }
     #[test]
     fn irrelevant_duplicate_does_not_dirty() {

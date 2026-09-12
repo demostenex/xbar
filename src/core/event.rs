@@ -175,7 +175,14 @@ pub enum Event {
     BluetoothConnectDevice(String),
     BluetoothDisconnectDevice(String),
     BluetoothActionFinished(BluetoothPendingAction),
+    #[allow(dead_code)]
     NotificationsSnapshot(Vec<super::Notification>),
+    NotificationsState {
+        active: Vec<super::Notification>,
+        history: Vec<super::NotificationHistoryEntry>,
+    },
+    #[allow(dead_code)]
+    ToggleNotificationCenter(super::OutputId),
     WindowAttentionChanged {
         window: WindowId,
         app_name: String,

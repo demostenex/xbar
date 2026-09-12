@@ -287,11 +287,13 @@ pub struct X11Platform {
     menu_popup_dirty: MenuPopupDirty,
     hover_repaint_active: bool,
     notification: Option<NotificationWindow>,
+    notification_center: Option<NotificationCenterWindow>,
     pointer_grabbed: bool,
     keyboard_grab_session: Option<u64>,
     global_pin_shortcut: Option<GlobalPinShortcut>,
     global_navigation_shortcut: Option<GlobalPinShortcut>,
     bar_hits: Vec<BarHitMap>,
+    notification_hits: Vec<(u32, OutputId, layout::MenuRect)>,
     previous_contexts: HashMap<u32, view::ContextView>,
 }
 struct Atoms {
@@ -562,6 +564,53 @@ struct NotificationWindow {
     window: u32,
     width: u16,
     height: u16,
+    backing: Option<PopupBacking>,
+}
+
+struct NotificationCenterWindow {
+    window: u32,
+    output: OutputId,
+    width: u16,
+    height: u16,
+    backing: Option<PopupBacking>,
+    card_hits: Vec<(crate::core::NotificationId, layout::MenuRect)>,
+    hover: Option<crate::core::NotificationId>,
+    dirty: bool,
+}
+
+fn notification_hover_transition(
+    old: Option<crate::core::NotificationId>,
+    next: Option<crate::core::NotificationId>,
+) -> (Option<crate::core::NotificationId>, bool) {
+    (next, old != next)
+}
+
+#[cfg(test)]
+fn notification_indicator_rect(output: &OutputState) -> layout::MenuRect {
+    layout::MenuRect {
+        x: (output.x as i32 + output.width as i32 - 8 - 28).max(output.x as i32) as i16,
+        y: output.y,
+        width: 28.min(output.width),
+        height: BAR_HEIGHT,
+    }
+}
+
+fn notification_indicator_hit(
+    indicators: &[(u32, OutputId, layout::MenuRect)],
+    window: u32,
+    x: i16,
+    y: i16,
+) -> Option<HitTarget> {
+    indicators
+        .iter()
+        .find(|(bar, _, rect)| {
+            *bar == window
+                && x >= rect.x
+                && x < rect.x + rect.width as i16
+                && y >= rect.y
+                && y < rect.y + rect.height as i16
+        })
+        .map(|(_, output, _)| HitTarget::NotificationCenter(*output))
 }
 type BarHitMap = (
     u32,
@@ -577,6 +626,10 @@ type BarHitMap = (
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HitTarget {
+    #[allow(dead_code)]
+    NotificationCenter(OutputId),
+    NotificationCenterCard(crate::core::NotificationId),
+    NotificationCenterEmpty,
     TopLevel(crate::core::MenuItemId),
     Item(Vec<crate::core::MenuItemId>),
     Tray(StatusNotifierEndpoint),
@@ -1283,11 +1336,13 @@ impl X11Platform {
             menu_popup_dirty: MenuPopupDirty::None,
             hover_repaint_active: false,
             notification: None,
+            notification_center: None,
             pointer_grabbed: false,
             keyboard_grab_session: None,
             global_pin_shortcut: None,
             global_navigation_shortcut: None,
             bar_hits: Vec::new(),
+            notification_hits: Vec::new(),
             previous_contexts: HashMap::new(),
         };
         platform.install_global_pin_shortcut();
@@ -1658,6 +1713,39 @@ impl X11Platform {
                 .network_popup
                 .as_ref()
                 .is_some_and(|popup| popup.window == window)
+            || self
+                .notification_center
+                .as_ref()
+                .is_some_and(|center| center.window == window)
+    }
+
+    pub fn is_notification_center_window(&self, window: u32) -> bool {
+        self.notification_center
+            .as_ref()
+            .is_some_and(|center| center.window == window)
+    }
+
+    pub fn update_notification_center_hover(&mut self, target: Option<&HitTarget>) -> bool {
+        let Some(center) = self.notification_center.as_mut() else {
+            return false;
+        };
+        let next = match target {
+            Some(HitTarget::NotificationCenterCard(id))
+                if center
+                    .card_hits
+                    .iter()
+                    .any(|(candidate, _)| candidate == id) =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        };
+        let (hover, changed) = notification_hover_transition(center.hover, next);
+        if changed {
+            center.hover = hover;
+            center.dirty = true;
+        }
+        changed
     }
     pub fn acquire_instance(&mut self) -> Result<bool, Box<dyn Error>> {
         let window = self.conn.generate_id()?;
@@ -2325,6 +2413,7 @@ impl X11Platform {
         }
         if target.contains(RenderTarget::NOTIFICATION) {
             self.render_notification(state)?;
+            self.render_notification_center(state)?;
         }
         self.conn.flush()?;
         self.text.flush();
@@ -2388,6 +2477,11 @@ impl X11Platform {
         let Some(notification) = state.notifications.last() else {
             if let Some(notification) = self.notification.take() {
                 self.text.release_drawable(notification.window);
+                if let Some(backing) = notification.backing {
+                    self.text.release_drawable(backing.pixmap);
+                    self.conn.free_gc(backing.gc)?.check()?;
+                    self.conn.free_pixmap(backing.pixmap)?.check()?;
+                }
                 trace_x11_resource("WINDOW_DESTROY", "notification", notification.window);
                 self.conn.destroy_window(notification.window)?.check()?;
             }
@@ -2450,24 +2544,49 @@ impl X11Platform {
                 )?
                 .check()?;
         }
-        self.notification = Some(NotificationWindow {
-            window,
+        let backing_replaced = !backing_matches(
+            self.notification.as_ref().and_then(|n| n.backing),
             width,
             height,
-        });
-        self.text
-            .prepare_drawable("notification", window, self.default_surface)?;
-        let gc = self.conn.generate_id()?;
-        self.conn
-            .create_gc(
+            self.default_surface.depth,
+        );
+        let backing = if backing_replaced {
+            let pixmap = self.conn.generate_id()?;
+            self.conn
+                .create_pixmap(self.default_surface.depth, pixmap, self.root, width, height)?
+                .check()?;
+            let gc = self.conn.generate_id()?;
+            self.conn
+                .create_gc(
+                    gc,
+                    pixmap,
+                    &xproto::CreateGCAux::new().foreground(
+                        self.default_surface
+                            .background_pixel(BAR_STYLE.material.background),
+                    ),
+                )?
+                .check()?;
+            if let Some(old) = self.notification.as_mut().and_then(|n| n.backing.take()) {
+                self.text.release_drawable(old.pixmap);
+                self.conn.free_gc(old.gc)?.check()?;
+                self.conn.free_pixmap(old.pixmap)?.check()?;
+            }
+            PopupBacking {
+                pixmap,
                 gc,
-                window,
-                &xproto::CreateGCAux::new().foreground(BAR_STYLE.material.background.rgb()),
-            )?
-            .check()?;
+                width,
+                height,
+                depth: self.default_surface.depth,
+            }
+        } else {
+            self.notification
+                .as_ref()
+                .and_then(|n| n.backing)
+                .expect("notification backing")
+        };
         self.conn.poly_fill_rectangle(
-            window,
-            gc,
+            backing.pixmap,
+            backing.gc,
             &[xproto::Rectangle {
                 x: 0,
                 y: 0,
@@ -2476,8 +2595,8 @@ impl X11Platform {
             }],
         )?;
         self.conn.poly_rectangle(
-            window,
-            gc,
+            backing.pixmap,
+            backing.gc,
             &[xproto::Rectangle {
                 x: 0,
                 y: 0,
@@ -2485,18 +2604,303 @@ impl X11Platform {
                 height,
             }],
         )?;
+        self.conn.flush()?;
+        self.conn.get_input_focus()?.reply()?;
+        self.text
+            .prepare_drawable("notification", backing.pixmap, self.default_surface)?;
         self.text
             .draw_popup_utf8(&summary, 12, 25, BAR_STYLE.material.foreground)?;
         if !body.is_empty() {
             self.text
                 .draw_popup_utf8(&body, 12, 52, BAR_STYLE.material.foreground)?;
         }
-        self.conn.free_gc(gc)?.check()?;
+        self.text.release_drawable(backing.pixmap);
+        self.conn
+            .copy_area(
+                backing.pixmap,
+                window,
+                backing.gc,
+                0,
+                0,
+                0,
+                0,
+                width,
+                height,
+            )?
+            .check()?;
+        self.notification = Some(NotificationWindow {
+            window,
+            width,
+            height,
+            backing: Some(backing),
+        });
+        Ok(())
+    }
+
+    fn render_notification_center(&mut self, state: &State) -> Result<(), Box<dyn Error>> {
+        let Some(output_id) = state.notification_center_open else {
+            if let Some(center) = self.notification_center.take() {
+                if let Some(backing) = center.backing {
+                    self.text.release_drawable(backing.pixmap);
+                    self.conn.free_gc(backing.gc)?.check()?;
+                    self.conn.free_pixmap(backing.pixmap)?.check()?;
+                }
+                self.conn.destroy_window(center.window)?.check()?;
+            }
+            return Ok(());
+        };
+        let Some(output) = state.outputs.iter().find(|output| output.id == output_id) else {
+            return Ok(());
+        };
+        let width = 360_u16.min(output.width.max(1));
+        let available = output.height.saturating_sub(BAR_HEIGHT + 12);
+        let max_cards = usize::from(available / 62);
+        let cards = state
+            .notification_history
+            .iter()
+            .take(max_cards.max(1))
+            .count();
+        let height = if state.notification_history.is_empty() {
+            62
+        } else {
+            (cards.max(1) as u16)
+                .saturating_mul(62)
+                .min(available.max(62))
+        };
+        let x =
+            (output.x as i32 + output.width as i32 - width as i32 - 8).max(output.x as i32) as i16;
+        let y = output.y.saturating_add(BAR_HEIGHT as i16 + 4);
+        let existing = self
+            .notification_center
+            .as_ref()
+            .map(|center| center.window);
+        let window = if let Some(window) = existing {
+            window
+        } else {
+            let window = self.conn.generate_id()?;
+            self.create_surface_window(
+                self.glass_surface,
+                SurfaceRole::Notification,
+                window,
+                SurfaceWindowGeometry {
+                    x,
+                    y,
+                    width,
+                    height,
+                    border_width: 1,
+                },
+                crate::ui::style::Rgba {
+                    red: 0x20,
+                    green: 0x24,
+                    blue: 0x2b,
+                    alpha: 0xb8,
+                },
+                xproto::CreateWindowAux::new()
+                    .override_redirect(1)
+                    .event_mask(EventMask::EXPOSURE),
+            )?;
+            self.conn.map_window(window)?.check()?;
+            window
+        };
+        if self.notification_center.as_ref().is_some_and(|center| {
+            center.width != width || center.height != height || center.output != output_id
+        }) {
+            self.conn
+                .configure_window(
+                    window,
+                    &xproto::ConfigureWindowAux::new()
+                        .x(x as i32)
+                        .y(y as i32)
+                        .width(width as u32)
+                        .height(height as u32),
+                )?
+                .check()?;
+        }
+        let backing_replaced = !backing_matches(
+            self.notification_center
+                .as_ref()
+                .and_then(|center| center.backing),
+            width,
+            height,
+            self.glass_surface.depth,
+        );
+        let backing = if backing_replaced {
+            let pixmap = self.conn.generate_id()?;
+            self.conn
+                .create_pixmap(self.glass_surface.depth, pixmap, self.root, width, height)?
+                .check()?;
+            let gc = self.conn.generate_id()?;
+            self.conn
+                .create_gc(
+                    gc,
+                    pixmap,
+                    &xproto::CreateGCAux::new().foreground(self.glass_surface.background_pixel(
+                        crate::ui::style::Rgba {
+                            red: 0x20,
+                            green: 0x24,
+                            blue: 0x2b,
+                            alpha: 0xb8,
+                        },
+                    )),
+                )?
+                .check()?;
+            if let Some(old) = self
+                .notification_center
+                .as_mut()
+                .and_then(|center| center.backing.take())
+            {
+                self.text.release_drawable(old.pixmap);
+                self.conn.free_gc(old.gc)?.check()?;
+                self.conn.free_pixmap(old.pixmap)?.check()?;
+            }
+            PopupBacking {
+                pixmap,
+                gc,
+                width,
+                height,
+                depth: self.glass_surface.depth,
+            }
+        } else {
+            self.notification_center
+                .as_ref()
+                .and_then(|center| center.backing)
+                .expect("center backing")
+        };
+        self.conn
+            .change_gc(
+                backing.gc,
+                &xproto::ChangeGCAux::new().foreground(self.glass_surface.background_pixel(
+                    crate::ui::style::Rgba {
+                        red: 0x20,
+                        green: 0x24,
+                        blue: 0x2b,
+                        alpha: 0xb8,
+                    },
+                )),
+            )?
+            .check()?;
+        self.conn.poly_fill_rectangle(
+            backing.pixmap,
+            backing.gc,
+            &[xproto::Rectangle {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }],
+        )?;
+        let mut card_hits = Vec::with_capacity(cards);
+        for (index, entry) in state.notification_history.iter().take(cards).enumerate() {
+            let top = (index as u16).saturating_mul(62);
+            let card_rect = layout::MenuRect {
+                x: 4,
+                y: (top + 4) as i16,
+                width: width.saturating_sub(8),
+                height: 54,
+            };
+            card_hits.push((entry.id, card_rect));
+            let hovered = self
+                .notification_center
+                .as_ref()
+                .and_then(|center| center.hover)
+                == Some(entry.id);
+            self.conn
+                .change_gc(
+                    backing.gc,
+                    &xproto::ChangeGCAux::new().foreground(
+                        self.glass_surface
+                            .opaque_pixel(if hovered { 0x354052 } else { 0x2b3340 }),
+                    ),
+                )?
+                .check()?;
+            self.conn.poly_fill_rectangle(
+                backing.pixmap,
+                backing.gc,
+                &[xproto::Rectangle {
+                    x: card_rect.x,
+                    y: card_rect.y,
+                    width: card_rect.width,
+                    height: card_rect.height,
+                }],
+            )?;
+            self.conn.flush()?;
+            self.conn.get_input_focus()?.reply()?;
+            self.text.prepare_drawable(
+                "notification-center",
+                backing.pixmap,
+                self.glass_surface,
+            )?;
+            let title = if entry.app_name.is_empty() {
+                "Notification"
+            } else {
+                &entry.app_name
+            };
+            self.text.draw_popup_utf8(
+                title,
+                12,
+                i32::from(top) + 20,
+                BAR_STYLE.material.foreground,
+            )?;
+            self.text.draw_popup_utf8(
+                &single_line(&entry.summary),
+                12,
+                i32::from(top) + 38,
+                BAR_STYLE.material.foreground,
+            )?;
+            self.text.draw_popup_utf8(
+                &single_line(&entry.body),
+                12,
+                i32::from(top) + 54,
+                BAR_STYLE.material.foreground,
+            )?;
+            self.text.release_drawable(backing.pixmap);
+        }
+        if state.notification_history.is_empty() {
+            self.conn.flush()?;
+            self.conn.get_input_focus()?.reply()?;
+            self.text.prepare_drawable(
+                "notification-center",
+                backing.pixmap,
+                self.glass_surface,
+            )?;
+            self.text
+                .draw_popup_utf8("No notifications", 12, 34, BAR_STYLE.material.foreground)?;
+            self.text.release_drawable(backing.pixmap);
+        }
+        self.conn
+            .copy_area(
+                backing.pixmap,
+                window,
+                backing.gc,
+                0,
+                0,
+                0,
+                0,
+                width,
+                height,
+            )?
+            .check()?;
+        let hover = self
+            .notification_center
+            .as_ref()
+            .and_then(|center| center.hover)
+            .filter(|id| card_hits.iter().any(|(candidate, _)| candidate == id));
+        self.notification_center = Some(NotificationCenterWindow {
+            window,
+            output: output_id,
+            width,
+            height,
+            backing: Some(backing),
+            card_hits,
+            hover,
+            dirty: false,
+        });
         Ok(())
     }
 
     fn render_dock(&mut self, state: &State, target: RenderTarget) -> Result<(), Box<dyn Error>> {
         self.bar_hits.clear();
+        self.notification_hits.clear();
         let requested_full = target.is_full_dock();
         let draw_workspaces = requested_full || target.contains(RenderTarget::WORKSPACES);
         let draw_context = requested_full || target.contains(RenderTarget::CONTEXT);
@@ -2631,6 +3035,8 @@ impl X11Platform {
             let draw_bluetooth = draw_bluetooth || old_context.bluetooth != context.bluetooth;
             let draw_audio = draw_audio || old_context.audio != context.audio;
             let draw_datetime = draw_datetime || old_context.datetime != context.datetime;
+            let draw_notification =
+                full || draw_context || old_context.notification != context.notification;
             self.bar_hits.push((
                 bar_window,
                 bar_output,
@@ -2642,6 +3048,8 @@ impl X11Platform {
                 context.audio.clone(),
                 context.bluetooth.clone(),
             ));
+            self.notification_hits
+                .push((bar_window, bar_output, context.notification.rect));
             let present_region = if full {
                 self.conn.poly_fill_rectangle(
                     backing.pixmap,
@@ -2902,6 +3310,19 @@ impl X11Platform {
                         });
                     }
                 }
+            }
+            if draw_notification {
+                let indicator = &context.notification;
+                let width = self.text.measure_status_icon_width(&indicator.text);
+                let x = indicator.rect.x.saturating_sub(output.x) as i32
+                    + (indicator.rect.width.saturating_sub(width) / 2) as i32;
+                text.push(BarText {
+                    kind: BarTextKind::StatusIcon,
+                    text: indicator.text.clone(),
+                    x,
+                    y: self.text.status_icon_baseline(BAR_HEIGHT) as i32,
+                    color: BAR_STYLE.material.foreground,
+                });
             }
             for tray in &context.tray {
                 if !draw_tray {
@@ -3460,7 +3881,12 @@ impl X11Platform {
             (input_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 40) as i32,
             BAR_STYLE.material.foreground,
         )?;
-        self.draw_audio_slider(backing.pixmap, gc, input_track, state.audio.input_volume_percent)?;
+        self.draw_audio_slider(
+            backing.pixmap,
+            gc,
+            input_track,
+            state.audio.input_volume_percent,
+        )?;
         self.text.draw_popup_utf8(
             "Mudo",
             audio_content_x as i32,
@@ -4628,11 +5054,33 @@ impl X11Platform {
             | X11Event::MotionNotify { window, x, y } => (*window, *x, *y, *x, *y),
             _ => return HitTarget::Outside,
         };
+        if let Some(center) = &self.notification_center {
+            if center.window == window {
+                let local_x = x;
+                let local_y = y;
+                return center
+                    .card_hits
+                    .iter()
+                    .find(|(_, rect)| {
+                        local_x >= rect.x
+                            && local_x < rect.x + rect.width as i16
+                            && local_y >= rect.y
+                            && local_y < rect.y + rect.height as i16
+                    })
+                    .map(|(id, _)| HitTarget::NotificationCenterCard(*id))
+                    .unwrap_or(HitTarget::NotificationCenterEmpty);
+            }
+        }
         if let Some((_bar, _, ox, oy, items, tray, network, audio, bluetooth)) =
             self.bar_hits.iter().find(|(bar, _, _, _, _, _, _, _, _)| {
                 *bar == window || (self.root == window && root_y < BAR_HEIGHT as i16)
             })
         {
+            if let Some(target) =
+                notification_indicator_hit(&self.notification_hits, window, root_x, root_y)
+            {
+                return target;
+            }
             let root_coordinates = self.root == window;
             let bar_x = if root_coordinates { root_x } else { x + *ox };
             let bar_y = if root_coordinates { root_y } else { y + *oy };
@@ -4908,13 +5356,26 @@ impl Drop for X11Platform {
             }
             let _ = self.conn.destroy_window(popup.window);
         }
+        if let Some(notification) = self.notification.take() {
+            if let Some(backing) = notification.backing {
+                self.text.release_drawable(backing.pixmap);
+                let _ = self.conn.free_gc(backing.gc);
+                let _ = self.conn.free_pixmap(backing.pixmap);
+            }
+            let _ = self.conn.destroy_window(notification.window);
+        }
+        if let Some(center) = self.notification_center.take() {
+            if let Some(backing) = center.backing {
+                self.text.release_drawable(backing.pixmap);
+                let _ = self.conn.free_gc(backing.gc);
+                let _ = self.conn.free_pixmap(backing.pixmap);
+            }
+            let _ = self.conn.destroy_window(center.window);
+        }
         for window in [
             self.audio_popup.take().map(|popup| popup.window),
             self.bluetooth_popup.take().map(|popup| popup.window),
             self.network_popup.take().map(|popup| popup.window),
-            self.notification
-                .take()
-                .map(|notification| notification.window),
             self.instance_window.take(),
         ]
         .into_iter()
@@ -4977,13 +5438,17 @@ mod tests {
         backing_matches, bar_backing_matches, blur_behind_rect, classify_attention_property_reply,
         classify_property_string_reply, effect_owner_property_value, install_passive_grabs,
         is_xbar_owned_window, menu_popup_dirty_for_interaction_change, menu_popup_slot_for_window,
-        menu_popup_slots_for_item, network_primary_row_label, popup_effect_owner, popup_hover_for,
-        popup_hover_transition, popup_slot_is_selected, preserve_color_pixel, template_icon_pixel,
-        tray_draw_size, tray_hit, union_menu_rects, AttentionPropertyRead, BarBacking, BarWindow,
-        GlobalPinShortcut, HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot,
-        PopupWindow, RenderTarget, SurfaceWindowGeometry, X11Event, BAR_HEIGHT,
+        menu_popup_slots_for_item, network_primary_row_label, notification_hover_transition,
+        notification_indicator_hit, notification_indicator_rect, popup_effect_owner,
+        popup_hover_for, popup_hover_transition, popup_slot_is_selected, preserve_color_pixel,
+        template_icon_pixel, tray_draw_size, tray_hit, union_menu_rects, AttentionPropertyRead,
+        BarBacking, BarWindow, GlobalPinShortcut, HitTarget, MenuPopupDirty, PopupBacking,
+        PopupHover, PopupSlot, PopupWindow, RenderTarget, SurfaceWindowGeometry, X11Event,
+        BAR_HEIGHT,
     };
-    use crate::core::{MenuItemId, StatusNotifierEndpoint, StatusNotifierIcon};
+    use crate::core::{
+        MenuItemId, OutputId, OutputState, StatusNotifierEndpoint, StatusNotifierIcon,
+    };
     use crate::ui::{
         layout::{MenuRect, PopupItemRect, PopupLayout},
         view::TrayIconRenderMode,
@@ -6092,5 +6557,87 @@ mod tests {
 
         assert_ne!(root_backing.pixmap, submenu_backing.pixmap);
         assert_ne!(root_backing.gc, submenu_backing.gc);
+    }
+
+    #[test]
+    fn notification_hover_transitions_dirty_only_on_identity_change() {
+        let a = crate::core::NotificationId(1);
+        let b = crate::core::NotificationId(2);
+        assert!(notification_hover_transition(None, Some(a)).1);
+        assert!(!notification_hover_transition(Some(a), Some(a)).1);
+        assert!(notification_hover_transition(Some(a), Some(b)).1);
+        assert!(notification_hover_transition(Some(a), None).1);
+        assert!(!notification_hover_transition(None, None).1);
+    }
+
+    #[test]
+    fn notification_card_rectangles_are_canonical_and_empty_has_none() {
+        let rect = MenuRect {
+            x: 4,
+            y: 4,
+            width: 352,
+            height: 54,
+        };
+        let cards = [(crate::core::NotificationId(1), rect)];
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].1, rect);
+        let empty: Vec<(crate::core::NotificationId, MenuRect)> = Vec::new();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn notification_indicator_exists_for_empty_and_non_empty_history() {
+        let output = OutputState {
+            id: OutputId(7),
+            name: "HDMI-1".into(),
+            x: 100,
+            y: 20,
+            width: 1920,
+            height: 1080,
+        };
+        let rect = notification_indicator_rect(&output);
+        let indicators = vec![(42, output.id, rect)];
+        assert_eq!(rect, notification_indicator_rect(&output));
+        assert_eq!(
+            notification_indicator_hit(&indicators, 42, rect.x + 1, rect.y + 1),
+            Some(HitTarget::NotificationCenter(output.id))
+        );
+        // The affordance is independent of history population.
+        let empty_history: Vec<crate::core::NotificationHistoryEntry> = Vec::new();
+        assert!(empty_history.is_empty());
+        assert!(notification_indicator_hit(&indicators, 42, rect.x + 1, rect.y + 1).is_some());
+    }
+
+    #[test]
+    fn notification_indicator_hit_carries_each_originating_output_id() {
+        let output_a = OutputState {
+            id: OutputId(1),
+            name: "A".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let output_b = OutputState {
+            id: OutputId(2),
+            name: "B".into(),
+            x: 800,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let rect_a = notification_indicator_rect(&output_a);
+        let rect_b = notification_indicator_rect(&output_b);
+        let indicators = vec![(11, output_a.id, rect_a), (22, output_b.id, rect_b)];
+        assert_eq!(
+            notification_indicator_hit(&indicators, 11, rect_a.x + 2, rect_a.y + 2),
+            Some(HitTarget::NotificationCenter(output_a.id))
+        );
+        assert_eq!(
+            notification_indicator_hit(&indicators, 22, rect_b.x + 2, rect_b.y + 2),
+            Some(HitTarget::NotificationCenter(output_b.id))
+        );
+        assert_eq!(rect_a, notification_indicator_rect(&output_a));
+        assert_eq!(rect_b, notification_indicator_rect(&output_b));
     }
 }

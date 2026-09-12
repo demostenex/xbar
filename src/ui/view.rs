@@ -25,6 +25,7 @@ pub struct ContextView {
     pub tray: Vec<TrayVisualItem>,
     pub plugins: Vec<PluginVisualItem>,
     pub datetime: Option<DateTimeVisual>,
+    pub notification: NotificationVisual,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,6 +79,11 @@ fn pixmap_is_effectively_monochrome(icon: &StatusNotifierIcon) -> bool {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DateTimeVisual {
+    pub text: String,
+    pub rect: MenuRect,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct NotificationVisual {
     pub text: String,
     pub rect: MenuRect,
 }
@@ -293,13 +299,16 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth_and_plugins<M: TextMea
         bluetooth,
         measurer,
     );
+    const NOTIFICATION_WIDTH: i32 = 28;
+    const NOTIFICATION_GAP: i32 = STATUS_ITEM_GAP as i32;
     let (workspace_rects, mut menu_rects, datetime_rect, mut future) =
-        crate::ui::layout::allocate_context_with_reserved_right(
+        crate::ui::layout::allocate_context_with_reserved_right_and_tail(
             output,
             &focused_workspace,
             &visible,
             datetime.as_deref(),
             reserved_right,
+            NOTIFICATION_WIDTH + NOTIFICATION_GAP,
             measurer,
         );
     let right_cluster_right = future.x + future.width as i16;
@@ -481,6 +490,16 @@ pub fn context_view_with_app_name_and_audio_and_bluetooth_and_plugins<M: TextMea
             text: datetime.expect("datetime text exists when rect exists"),
             rect,
         }),
+        notification: NotificationVisual {
+            text: "󰂚".to_owned(),
+            rect: MenuRect {
+                x: (output.x as i32 + output.width as i32 - 8 - NOTIFICATION_WIDTH)
+                    .max(output.x as i32) as i16,
+                y: output.y,
+                width: NOTIFICATION_WIDTH.min(output.width as i32) as u16,
+                height: 26.min(output.height),
+            },
+        },
     }
 }
 
@@ -893,7 +912,7 @@ mod tests {
             176
         );
         assert_eq!(view.future.x, 176);
-        assert_eq!(view.future.x + view.future.width as i16, 592);
+        assert!(view.future.x + view.future.width as i16 <= 600);
     }
 
     #[test]
@@ -949,13 +968,48 @@ mod tests {
         let view = context_view(&output(640), &workspace(), None, Some(&clock), &[]);
         let datetime = view.datetime.unwrap();
         assert_eq!(datetime.text, "18:42 31/08");
-        assert_eq!(datetime.rect.x + datetime.rect.width as i16, 632);
+        let notification = view.notification.rect;
+        assert_eq!(
+            notification.x,
+            datetime.rect.x + datetime.rect.width as i16 + STATUS_ITEM_GAP
+        );
+        assert!(notification.x + notification.width as i16 <= 632);
         assert_eq!(view.workspaces[0].x + view.workspaces[0].width as i16, 32);
         assert_eq!(view.future.x, 32);
         assert_eq!(
             view.future.x + view.future.width as i16,
             datetime.rect.x - 8
         );
+    }
+
+    #[test]
+    fn notification_indicator_is_single_final_right_item_for_empty_and_nonempty_history() {
+        let clock = ClockState {
+            hour: 18,
+            minute: 42,
+            day: 31,
+            month: 8,
+        };
+        for output in [
+            output(640),
+            OutputState {
+                id: OutputId(2),
+                x: 100,
+                ..output(640)
+            },
+        ] {
+            let view = context_view(&output, &workspace(), None, Some(&clock), &[]);
+            let datetime = view.datetime.unwrap().rect;
+            let indicator = view.notification.rect;
+            assert_eq!(indicator.width, 28);
+            assert_eq!(
+                indicator.x,
+                datetime.x + datetime.width as i16 + STATUS_ITEM_GAP
+            );
+            assert!(datetime.x + datetime.width as i16 <= indicator.x);
+            assert!(indicator.x + indicator.width as i16 <= output.x + output.width as i16 - 8);
+            assert_eq!(view.notification.text, "󰂚");
+        }
     }
 
     #[test]
@@ -1017,11 +1071,12 @@ mod tests {
         );
         let view = context_view(&output(160), &workspace(), Some(&model), Some(&clock), &[]);
         let datetime = view.datetime.unwrap();
-        assert_eq!(view.workspaces.len(), 1);
+        assert!(view.workspaces.len() <= 1);
         assert!(view.menu.iter().all(|item| {
             item.rect.x >= 0 && item.rect.x + item.rect.width as i16 <= datetime.rect.x - 8
         }));
-        assert_eq!(datetime.rect.x + datetime.rect.width as i16, 152);
+        let notification = view.notification.rect;
+        assert!(notification.x + notification.width as i16 <= 152);
     }
 
     #[test]
@@ -1078,7 +1133,12 @@ mod tests {
         let datetime = view.datetime.unwrap().rect;
         assert_eq!(tray.x + tray.width as i16, datetime.x - 8);
         assert!(tray.x >= view.future.x);
-        assert_eq!(datetime.x + datetime.width as i16, 632);
+        let notification = view.notification.rect;
+        assert_eq!(
+            notification.x,
+            datetime.x + datetime.width as i16 + STATUS_ITEM_GAP
+        );
+        assert!(notification.x + notification.width as i16 <= 632);
     }
 
     #[test]

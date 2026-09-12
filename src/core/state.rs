@@ -300,6 +300,16 @@ pub struct Notification {
     pub body: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotificationHistoryEntry {
+    pub id: NotificationId,
+    pub source: NotificationSource,
+    pub app_name: String,
+    pub summary: String,
+    pub body: String,
+    pub order: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum NotificationSource {
     #[default]
@@ -428,6 +438,8 @@ pub struct State {
     pub plugin_zone: PluginZoneState,
     pub audio_popup_open: bool,
     pub notifications: Vec<Notification>,
+    pub notification_history: Vec<NotificationHistoryEntry>,
+    pub notification_center_open: Option<OutputId>,
     pub audio_dragging: bool,
     pub audio_drag_input: bool,
     pub status_notifiers: super::StatusNotifierRegistry,

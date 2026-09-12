@@ -1,4 +1,6 @@
-use crate::core::{Event, Notification, NotificationId, NotificationSource, WindowId};
+use crate::core::{
+    Event, Notification, NotificationHistoryEntry, NotificationId, NotificationSource, WindowId,
+};
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
@@ -18,7 +20,9 @@ struct Record {
 #[derive(Default)]
 pub struct Store {
     next_id: u32,
+    next_order: u64,
     records: BTreeMap<NotificationId, Record>,
+    history: Vec<NotificationHistoryEntry>,
 }
 
 impl Store {
@@ -59,6 +63,20 @@ impl Store {
                 deadline,
             },
         );
+        self.next_order = self.next_order.wrapping_add(1);
+        self.history.retain(|entry| entry.id != id);
+        self.history.insert(
+            0,
+            NotificationHistoryEntry {
+                id,
+                source: NotificationSource::Freedesktop,
+                app_name: self.records[&id].notification.app_name.clone(),
+                summary: self.records[&id].notification.summary.clone(),
+                body: self.records[&id].notification.body.clone(),
+                order: self.next_order,
+            },
+        );
+        self.history.truncate(50);
         id
     }
 
@@ -109,7 +127,11 @@ impl Store {
     }
 
     pub fn close(&mut self, id: NotificationId) -> bool {
-        self.records.remove(&id).is_some()
+        let removed = self.records.remove(&id).is_some();
+        if removed {
+            self.history.retain(|entry| entry.id != id);
+        }
+        removed
     }
 
     pub fn expired(&mut self, now: Instant) -> Vec<NotificationId> {
@@ -134,6 +156,10 @@ impl Store {
             .values()
             .map(|record| record.notification.clone())
             .collect()
+    }
+
+    pub fn history_snapshot(&self) -> Vec<NotificationHistoryEntry> {
+        self.history.clone()
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -248,11 +274,18 @@ pub fn publish(
         .lock()
         .expect("notification timer poisoned")
         .rearm(deadline);
-    let snapshot = store
-        .lock()
-        .expect("notification store poisoned")
-        .snapshot();
-    crate::dbus::push_event(events, wake, Event::NotificationsSnapshot(snapshot));
+    let (snapshot, history) = {
+        let store = store.lock().expect("notification store poisoned");
+        (store.snapshot(), store.history_snapshot())
+    };
+    crate::dbus::push_event(
+        events,
+        wake,
+        Event::NotificationsState {
+            active: snapshot,
+            history,
+        },
+    );
 }
 
 pub fn expire(
@@ -274,11 +307,18 @@ pub fn expire(
         .lock()
         .expect("notification timer poisoned")
         .rearm(deadline);
-    let snapshot = store
-        .lock()
-        .expect("notification store poisoned")
-        .snapshot();
-    crate::dbus::push_event(events, wake, Event::NotificationsSnapshot(snapshot));
+    let (snapshot, history) = {
+        let store = store.lock().expect("notification store poisoned");
+        (store.snapshot(), store.history_snapshot())
+    };
+    crate::dbus::push_event(
+        events,
+        wake,
+        Event::NotificationsState {
+            active: snapshot,
+            history,
+        },
+    );
     ids
 }
 
@@ -350,5 +390,50 @@ mod tests {
         store.attention(WindowId(1), "One".into(), true);
         store.attention(WindowId(2), "Two".into(), true);
         assert_eq!(store.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn history_is_newest_first_and_replacement_moves_without_duplicate() {
+        let mut store = Store::default();
+        let first = store.notify(0, "app".into(), "one".into(), "body".into(), 0);
+        let second = store.notify(0, "app".into(), "two".into(), "body".into(), 0);
+        assert_eq!(
+            store
+                .history_snapshot()
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![second, first]
+        );
+        let replaced = store.notify(first.0, "app".into(), "updated".into(), "body".into(), 0);
+        let history = store.history_snapshot();
+        assert_eq!(replaced, first);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].id, first);
+        assert_eq!(history[0].summary, "updated");
+    }
+
+    #[test]
+    fn history_is_bounded_and_expiry_retains_entry() {
+        let mut store = Store::default();
+        for index in 0..51 {
+            store.notify(0, "app".into(), index.to_string(), String::new(), 1);
+        }
+        assert_eq!(store.history_snapshot().len(), 50);
+        let id = store.history_snapshot()[0].id;
+        store.expired(Instant::now() + Duration::from_secs(2));
+        assert!(store.snapshot().is_empty());
+        assert!(store.history_snapshot().iter().any(|entry| entry.id == id));
+    }
+
+    #[test]
+    fn close_removes_history_but_attention_never_enters_it() {
+        let mut store = Store::default();
+        let id = store.notify(0, "app".into(), "one".into(), String::new(), 0);
+        assert_eq!(store.history_snapshot().len(), 1);
+        assert!(store.close(id));
+        assert!(store.history_snapshot().is_empty());
+        store.attention(WindowId(1), "Editor".into(), true);
+        assert!(store.history_snapshot().is_empty());
     }
 }

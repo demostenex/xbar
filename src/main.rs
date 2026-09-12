@@ -383,6 +383,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 event,
                 Event::X11(platform::x11::X11Event::MotionNotify { .. })
             ) && x11.update_popup_hover(mouse_target.as_ref());
+            let notification_hover_changed = matches!(
+                event,
+                Event::X11(platform::x11::X11Event::MotionNotify { .. })
+            ) && x11
+                .update_notification_center_hover(mouse_target.as_ref());
             let popup_exposed = if let Event::X11(platform::x11::X11Event::Expose(window)) = &event
             {
                 x11.note_menu_popup_exposed(*window)
@@ -470,6 +475,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     Event::X11(platform::x11::X11Event::ButtonPress { .. }),
                     Some(platform::x11::HitTarget::TopLevel(id)),
                 ) => Event::MenuRootClicked(*id),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::NotificationCenter(output)),
+                ) => Event::ToggleNotificationCenter(*output),
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::Audio),
@@ -1284,6 +1293,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             if let Some(target) = event_render_target {
                 render_target = merge_render_target(render_target, Some(target));
             }
+            if notification_hover_changed {
+                render_target =
+                    merge_render_target(render_target, Some(RenderTarget::Notification));
+            }
             let current_active_source =
                 state.active_menu_endpoint(&registry.lock().expect("registry poisoned"));
             if previous_active_source != current_active_source {
@@ -1526,6 +1539,8 @@ fn render_target_for(
                 Some(RenderTarget::Dock)
             } else if x11.is_popup_window(*window) {
                 Some(RenderTarget::Popup)
+            } else if x11.is_notification_center_window(*window) {
+                Some(RenderTarget::Notification)
             } else {
                 None
             }
@@ -1556,7 +1571,7 @@ fn render_target_for(
         Event::WorkspacesSnapshot(_) | Event::WorkspaceFocused { .. } => {
             Some(RenderTarget::Workspaces)
         }
-        Event::OutputsChanged(_) => Some(RenderTarget::Dock),
+        Event::OutputsChanged(_) => Some(RenderTarget::Dock.merge(RenderTarget::Notification)),
         Event::X11(platform::x11::X11Event::MotionNotify { .. }) => {
             hover_render_target_for(mouse_target.as_ref(), None)
         }
@@ -1612,7 +1627,10 @@ fn render_target_for(
         | Event::AudioMuteToggled { .. } => Some(RenderTarget::Popup),
         Event::WindowFocused(_) => Some(RenderTarget::DockContext),
         Event::WindowAttentionChanged { .. } | Event::StatusNotifierActionRequested { .. } => None,
-        Event::NotificationsSnapshot(_) => Some(RenderTarget::Notification),
+        Event::NotificationsSnapshot(_) | Event::NotificationsState { .. } => {
+            Some(RenderTarget::Dock.merge(RenderTarget::Notification))
+        }
+        Event::ToggleNotificationCenter(_) => Some(RenderTarget::Notification),
         _ => Some(RenderTarget::All),
     }
 }
@@ -1642,6 +1660,10 @@ fn hover_render_target_for(
         | Some(HitTarget::NetworkInside)
         | Some(HitTarget::NetworkWifi(_))
         | Some(HitTarget::Network) => None,
+        Some(HitTarget::NotificationCenter(_)) => None,
+        Some(HitTarget::NotificationCenterCard(_)) | Some(HitTarget::NotificationCenterEmpty) => {
+            None
+        }
     }
 }
 

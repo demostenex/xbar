@@ -561,6 +561,31 @@ pub fn allocate_context_with_reserved_right<M: TextMeasurer>(
     Option<MenuRect>,
     MenuRect,
 ) {
+    allocate_context_with_reserved_right_and_tail(
+        output,
+        workspaces,
+        menu,
+        datetime,
+        reserved_right,
+        0,
+        measurer,
+    )
+}
+
+pub fn allocate_context_with_reserved_right_and_tail<M: TextMeasurer>(
+    output: &OutputState,
+    workspaces: &[WorkspaceState],
+    menu: &[(MenuItemId, String, bool)],
+    datetime: Option<&str>,
+    reserved_right: i32,
+    tail_width: i32,
+    measurer: &M,
+) -> (
+    Vec<WorkspaceRect>,
+    Vec<MenuRect>,
+    Option<MenuRect>,
+    MenuRect,
+) {
     let output_left = output.x as i32;
     let output_right = output_left + output.width as i32;
     let workspace_natural_width = workspaces
@@ -577,7 +602,7 @@ pub fn allocate_context_with_reserved_right<M: TextMeasurer>(
                 .min(output.width as i32)
         })
         .unwrap_or(0);
-    let datetime_x = (output_right - RIGHT_PADDING - datetime_width).max(output_left);
+    let datetime_x = (output_right - RIGHT_PADDING - datetime_width - tail_width).max(output_left);
     let content_right = datetime_x - if datetime.is_some() { RIGHT_PADDING } else { 0 };
     let content_left = output_left + LEFT_PADDING;
     let workspace_available = content_right
