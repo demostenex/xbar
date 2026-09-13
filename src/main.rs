@@ -358,6 +358,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 event => event,
             };
+            if let Event::EnsureNotificationCenterOpen { target, .. } = &event {
+                x11.request_notification_center_target(*target);
+            }
             let previous_active_source =
                 state.active_menu_endpoint(&registry.lock().expect("registry poisoned"));
             if trace {
@@ -403,6 +406,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Some(target),
             ) = (&event, mouse_target.as_ref())
             {
+                if matches!(
+                    target,
+                    platform::x11::HitTarget::NotificationCenterCard(_)
+                        | platform::x11::HitTarget::NotificationCenterDismiss(_)
+                        | platform::x11::HitTarget::NotificationCenterAction(_, _)
+                        | platform::x11::HitTarget::NotificationCenterActionPagePrev(_)
+                        | platform::x11::HitTarget::NotificationCenterActionPageNext(_)
+                        | platform::x11::HitTarget::NotificationCenterClearAll
+                ) {
+                    x11.clear_notification_center_highlight();
+                }
                 let notification_action_page_changed =
                     match platform::x11::notification_center_button_action(1, target) {
                         Some(platform::x11::NotificationCenterButtonAction::Dismiss(id)) => {
@@ -548,6 +562,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                     Event::X11(platform::x11::X11Event::ButtonPress { .. }),
                     Some(platform::x11::HitTarget::TopLevel(id)),
                 ) => Event::MenuRootClicked(*id),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::NotificationBody(output, history_id)),
+                ) => {
+                    x11.consume_notification_toast(*history_id);
+                    toast_navigation_event(*output, *history_id, &state.notification_history)
+                }
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::NotificationCenter(output)),
@@ -1730,7 +1751,28 @@ fn render_target_for(
             Some(RenderTarget::Dock.merge(RenderTarget::Notification))
         }
         Event::ToggleNotificationCenter(_) => Some(RenderTarget::Notification),
+        Event::EnsureNotificationCenterOpen { .. } | Event::NotificationToastConsumed => {
+            Some(RenderTarget::Notification)
+        }
         _ => Some(RenderTarget::All),
+    }
+}
+
+fn toast_navigation_event(
+    output: crate::core::OutputId,
+    history_id: crate::core::HistoryEntryId,
+    history: &[crate::core::NotificationHistoryEntry],
+) -> Event {
+    if history.is_empty() {
+        Event::NotificationToastConsumed
+    } else {
+        Event::EnsureNotificationCenterOpen {
+            output,
+            target: history
+                .iter()
+                .any(|entry| entry.id == history_id)
+                .then_some(history_id),
+        }
     }
 }
 
@@ -1765,6 +1807,7 @@ fn hover_render_target_for(
         | Some(HitTarget::NotificationCenterAction(_, _))
         | Some(HitTarget::NotificationCenterActionPagePrev(_))
         | Some(HitTarget::NotificationCenterActionPageNext(_))
+        | Some(HitTarget::NotificationBody(_, _))
         | Some(HitTarget::NotificationCenterClearAll)
         | Some(HitTarget::NotificationCenterEmpty) => None,
     }
@@ -1898,7 +1941,7 @@ mod scheduler_tests {
     use super::{
         hover_render_target_for, merge_render_target, notification_action_page_render_target,
         pending_lazy_root_to_schedule, promote_menu_popup_target, render_target_for_changes,
-        should_schedule_invalidation,
+        should_schedule_invalidation, toast_navigation_event,
     };
     use crate::core::{LazyRootOpenPending, MenuEndpoint, MenuItemId, MenuSource, WindowId};
     use crate::platform::x11::{HitTarget, RenderTarget};
@@ -1922,6 +1965,61 @@ mod scheduler_tests {
             watcher_generation,
             layout_request_id,
         }
+    }
+
+    fn history_entry(id: u64) -> crate::core::NotificationHistoryEntry {
+        crate::core::NotificationHistoryEntry {
+            id: crate::core::HistoryEntryId(id),
+            live_notification_id: None,
+            source: crate::core::NotificationSource::Freedesktop,
+            app_name: "app".into(),
+            summary: "summary".into(),
+            body: "body".into(),
+            order: id,
+            received_at: id,
+            updated_at: id,
+        }
+    }
+
+    #[test]
+    fn toast_navigation_targets_the_exact_history_entry() {
+        let history = vec![history_entry(7), history_entry(8)];
+        assert!(matches!(
+            toast_navigation_event(
+                crate::core::OutputId(3),
+                crate::core::HistoryEntryId(8),
+                &history
+            ),
+            crate::core::Event::EnsureNotificationCenterOpen {
+                output: crate::core::OutputId(3),
+                target: Some(crate::core::HistoryEntryId(8)),
+            }
+        ));
+    }
+
+    #[test]
+    fn stale_toast_navigation_opens_without_a_target_when_history_remains() {
+        let history = vec![history_entry(7)];
+        assert!(matches!(
+            toast_navigation_event(
+                crate::core::OutputId(3),
+                crate::core::HistoryEntryId(8),
+                &history
+            ),
+            crate::core::Event::EnsureNotificationCenterOpen { target: None, .. }
+        ));
+    }
+
+    #[test]
+    fn stale_toast_navigation_consumes_only_when_history_is_empty() {
+        assert!(matches!(
+            toast_navigation_event(
+                crate::core::OutputId(3),
+                crate::core::HistoryEntryId(8),
+                &[]
+            ),
+            crate::core::Event::NotificationToastConsumed
+        ));
     }
 
     #[test]

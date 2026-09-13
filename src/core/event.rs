@@ -184,6 +184,11 @@ pub enum Event {
     },
     #[allow(dead_code)]
     ToggleNotificationCenter(super::OutputId),
+    EnsureNotificationCenterOpen {
+        output: super::OutputId,
+        target: Option<super::HistoryEntryId>,
+    },
+    NotificationToastConsumed,
     WindowAttentionChanged {
         window: WindowId,
         app_name: String,

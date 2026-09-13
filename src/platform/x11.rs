@@ -296,6 +296,10 @@ pub struct X11Platform {
     menu_popup_dirty: MenuPopupDirty,
     hover_repaint_active: bool,
     notification: Option<NotificationWindow>,
+    toast_stack: Vec<crate::core::HistoryEntryId>,
+    toast_known_history: HashSet<crate::core::HistoryEntryId>,
+    pending_notification_center_target: Option<crate::core::HistoryEntryId>,
+    notification_center_highlight: Option<crate::core::HistoryEntryId>,
     notification_center: Option<NotificationCenterWindow>,
     pointer_grabbed: bool,
     keyboard_grab_session: Option<u64>,
@@ -559,7 +563,7 @@ struct NetworkPopupWindow {
     wireless: layout::MenuRect,
     access_points: Vec<(NetworkWifiTarget, layout::MenuRect)>,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum PopupHover {
     MenuItem(crate::core::MenuItemId),
     AudioOutputDevice(String),
@@ -571,9 +575,17 @@ enum PopupHover {
 }
 struct NotificationWindow {
     window: u32,
+    output: OutputId,
     width: u16,
     height: u16,
+    cards: Vec<ToastCardHit>,
     backing: Option<PopupBacking>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ToastCardHit {
+    history_id: crate::core::HistoryEntryId,
+    rect: layout::MenuRect,
 }
 
 struct NotificationCenterWindow {
@@ -657,6 +669,7 @@ pub fn notification_center_button_action(
 }
 
 const NOTIFICATION_HEADER_HEIGHT: u16 = 28;
+const MAX_VISIBLE_TOASTS: usize = 5;
 const NOTIFICATION_HEADER_CONTROL_WIDTH: u16 = 68;
 const NOTIFICATION_HEADER_CONTROL_PADDING: u16 = 16;
 const NOTIFICATION_HEADER_RIGHT_MARGIN: u16 = 8;
@@ -1002,6 +1015,105 @@ fn notification_variable_max_scroll(
     start.min(layouts.len().saturating_sub(1))
 }
 
+#[cfg(test)]
+fn notification_history_id_for(
+    history: &[crate::core::NotificationHistoryEntry],
+    notification_id: crate::core::NotificationId,
+) -> Option<crate::core::HistoryEntryId> {
+    history
+        .iter()
+        .find(|entry| entry.live_notification_id == Some(notification_id))
+        .map(|entry| entry.id)
+}
+
+fn reconcile_toast_stack(
+    stack: &mut Vec<crate::core::HistoryEntryId>,
+    known: &mut HashSet<crate::core::HistoryEntryId>,
+    live_history: &[crate::core::HistoryEntryId],
+) {
+    let live = live_history.iter().copied().collect::<HashSet<_>>();
+    known.retain(|id| live.contains(id));
+    let new_history = live_history
+        .iter()
+        .copied()
+        .filter(|id| known.insert(*id))
+        .collect::<Vec<_>>();
+    for history_id in new_history.into_iter().rev() {
+        stack.insert(0, history_id);
+    }
+    stack.retain(|id| live.contains(id));
+    stack.truncate(MAX_VISIBLE_TOASTS);
+}
+
+fn notification_body_hit(
+    notification: &NotificationWindow,
+    window: u32,
+    x: i16,
+    y: i16,
+) -> Option<HitTarget> {
+    if notification.window != window {
+        return None;
+    }
+    notification.cards.iter().find_map(|card| {
+        let rect = card.rect;
+        (x >= rect.x
+            && x < rect.x + rect.width as i16
+            && y >= rect.y
+            && y < rect.y + rect.height as i16)
+            .then_some(HitTarget::NotificationBody(
+                notification.output,
+                card.history_id,
+            ))
+    })
+}
+
+fn notification_target_is_visible(
+    layouts: &[NotificationEntryLayout],
+    viewport_height: u16,
+    scroll: usize,
+    target_index: usize,
+) -> bool {
+    let mut used = 0_u16;
+    for (index, layout) in layouts.iter().enumerate().skip(scroll) {
+        let top = used.saturating_add(if index == scroll && !layout.compact {
+            4
+        } else {
+            0
+        });
+        if index == target_index {
+            return top.saturating_add(layout.card_height) <= viewport_height;
+        }
+        if top.saturating_add(layout.card_height) > viewport_height {
+            return false;
+        }
+        used = used.saturating_add(layout.slot_extent);
+    }
+    false
+}
+
+fn notification_scroll_to_target(
+    layouts: &[NotificationEntryLayout],
+    viewport_height: u16,
+    current: usize,
+    target_index: usize,
+) -> usize {
+    let maximum = notification_variable_max_scroll(layouts, viewport_height);
+    let current = current.min(maximum);
+    for distance in 0..=maximum {
+        let older = current.saturating_sub(distance);
+        if notification_target_is_visible(layouts, viewport_height, older, target_index) {
+            return older;
+        }
+        let newer = current.saturating_add(distance).min(maximum);
+        if newer != older
+            && notification_target_is_visible(layouts, viewport_height, newer, target_index)
+        {
+            return newer;
+        }
+    }
+    current
+}
+
 fn notification_header_rect(width: u16, text_width: u16) -> layout::MenuRect {
     let control_width = NOTIFICATION_HEADER_CONTROL_WIDTH
         .max(text_width.saturating_add(NOTIFICATION_HEADER_CONTROL_PADDING))
@@ -1163,6 +1275,7 @@ pub enum HitTarget {
     NotificationCenterActionPageNext(crate::core::HistoryEntryId),
     NotificationCenterClearAll,
     NotificationCenterEmpty,
+    NotificationBody(OutputId, crate::core::HistoryEntryId),
     TopLevel(crate::core::MenuItemId),
     Item(Vec<crate::core::MenuItemId>),
     Tray(StatusNotifierEndpoint),
@@ -1869,6 +1982,10 @@ impl X11Platform {
             menu_popup_dirty: MenuPopupDirty::None,
             hover_repaint_active: false,
             notification: None,
+            toast_stack: Vec::new(),
+            toast_known_history: HashSet::new(),
+            pending_notification_center_target: None,
+            notification_center_highlight: None,
             notification_center: None,
             pointer_grabbed: false,
             keyboard_grab_session: None,
@@ -2256,6 +2373,26 @@ impl X11Platform {
         self.notification_center
             .as_ref()
             .is_some_and(|center| center.window == window)
+    }
+
+    pub fn consume_notification_toast(&mut self, id: crate::core::HistoryEntryId) {
+        if self.toast_stack.contains(&id) {
+            self.toast_stack.clear();
+            if let Some(notification) = &self.notification {
+                let _ = self.conn.unmap_window(notification.window);
+            }
+        }
+    }
+
+    pub fn request_notification_center_target(
+        &mut self,
+        target: Option<crate::core::HistoryEntryId>,
+    ) {
+        self.pending_notification_center_target = target;
+    }
+
+    pub fn clear_notification_center_highlight(&mut self) {
+        self.notification_center_highlight = None;
     }
 
     pub fn update_notification_center_hover(&mut self, target: Option<&HitTarget>) -> bool {
@@ -3176,7 +3313,26 @@ impl X11Platform {
     }
 
     fn render_notification(&mut self, state: &State) -> Result<(), Box<dyn Error>> {
-        let Some(notification) = state.notifications.last() else {
+        let output = state.outputs.first().ok_or("no output for notification")?;
+        let live_history = state
+            .notification_history
+            .iter()
+            .filter(|entry| {
+                entry.live_notification_id.is_some_and(|id| {
+                    state
+                        .notifications
+                        .iter()
+                        .any(|notification| notification.id == id)
+                })
+            })
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        reconcile_toast_stack(
+            &mut self.toast_stack,
+            &mut self.toast_known_history,
+            &live_history,
+        );
+        if self.toast_stack.is_empty() {
             if let Some(notification) = self.notification.take() {
                 self.text.release_drawable(notification.window);
                 if let Some(backing) = notification.backing {
@@ -3188,15 +3344,60 @@ impl X11Platform {
                 self.conn.destroy_window(notification.window)?.check()?;
             }
             return Ok(());
-        };
-        let output = state.outputs.first().ok_or("no output for notification")?;
+        }
         let width = 360_u16.min(output.width.max(1));
-        let summary = single_line(&notification.summary);
-        let body = single_line(&notification.body);
-        let height = if body.is_empty() { 64 } else { 88 };
         let x =
             (output.x as i32 + output.width as i32 - width as i32 - 10).max(output.x as i32) as i16;
         let y = output.y + BAR_HEIGHT as i16 + 8;
+        let available_height = output.height.saturating_sub(BAR_HEIGHT.saturating_add(16));
+        let mut cards = Vec::new();
+        let mut stack_height = 0_u16;
+        for history_id in &self.toast_stack {
+            let Some(entry) = state
+                .notification_history
+                .iter()
+                .find(|entry| entry.id == *history_id)
+            else {
+                continue;
+            };
+            let Some(notification_id) = entry.live_notification_id else {
+                continue;
+            };
+            let Some(notification) = state
+                .notifications
+                .iter()
+                .find(|notification| notification.id == notification_id)
+            else {
+                continue;
+            };
+            let body = single_line(&notification.body);
+            let card_height = if body.is_empty() { 64 } else { 88 };
+            let gap = if cards.is_empty() { 0 } else { 8 };
+            let required = stack_height.saturating_add(gap).saturating_add(card_height);
+            if required > available_height {
+                break;
+            }
+            stack_height = required;
+            cards.push((
+                *history_id,
+                notification,
+                single_line(&notification.summary),
+                body,
+                layout::MenuRect {
+                    x: 0,
+                    y: stack_height.saturating_sub(card_height) as i16,
+                    width,
+                    height: card_height,
+                },
+            ));
+        }
+        if cards.is_empty() {
+            if let Some(notification) = &self.notification {
+                let _ = self.conn.unmap_window(notification.window);
+            }
+            return Ok(());
+        }
+        let height = stack_height;
         let window = if let Some(window) = &self.notification {
             window.window
         } else {
@@ -3216,7 +3417,7 @@ impl X11Platform {
                 BAR_STYLE.material.background,
                 xproto::CreateWindowAux::new()
                     .override_redirect(1)
-                    .event_mask(EventMask::EXPOSURE),
+                    .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
             )?;
             self.conn
                 .change_property32(
@@ -3246,6 +3447,7 @@ impl X11Platform {
                 )?
                 .check()?;
         }
+        self.conn.map_window(window)?.check()?;
         let backing_replaced = !backing_matches(
             self.notification.as_ref().and_then(|n| n.backing),
             width,
@@ -3286,35 +3488,47 @@ impl X11Platform {
                 .and_then(|n| n.backing)
                 .expect("notification backing")
         };
-        self.conn.poly_fill_rectangle(
-            backing.pixmap,
-            backing.gc,
-            &[xproto::Rectangle {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            }],
-        )?;
-        self.conn.poly_rectangle(
-            backing.pixmap,
-            backing.gc,
-            &[xproto::Rectangle {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            }],
-        )?;
+        for (_, _, _, _, rect) in &cards {
+            self.conn.poly_fill_rectangle(
+                backing.pixmap,
+                backing.gc,
+                &[xproto::Rectangle {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                }],
+            )?;
+            self.conn.poly_rectangle(
+                backing.pixmap,
+                backing.gc,
+                &[xproto::Rectangle {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                }],
+            )?;
+        }
         self.conn.flush()?;
         self.conn.get_input_focus()?.reply()?;
         self.text
             .prepare_drawable("notification", backing.pixmap, self.default_surface)?;
-        self.text
-            .draw_popup_utf8(&summary, 12, 25, BAR_STYLE.material.foreground)?;
-        if !body.is_empty() {
-            self.text
-                .draw_popup_utf8(&body, 12, 52, BAR_STYLE.material.foreground)?;
+        for (_, _, summary, body, rect) in &cards {
+            self.text.draw_popup_utf8(
+                summary,
+                12,
+                i32::from(rect.y) + 25,
+                BAR_STYLE.material.foreground,
+            )?;
+            if !body.is_empty() {
+                self.text.draw_popup_utf8(
+                    body,
+                    12,
+                    i32::from(rect.y) + 52,
+                    BAR_STYLE.material.foreground,
+                )?;
+            }
         }
         self.text.release_drawable(backing.pixmap);
         self.conn
@@ -3332,8 +3546,13 @@ impl X11Platform {
             .check()?;
         self.notification = Some(NotificationWindow {
             window,
+            output: output.id,
             width,
             height,
+            cards: cards
+                .into_iter()
+                .map(|(history_id, _, _, _, rect)| ToastCardHit { history_id, rect })
+                .collect(),
             backing: Some(backing),
         });
         Ok(())
@@ -3341,6 +3560,8 @@ impl X11Platform {
 
     fn render_notification_center(&mut self, state: &State) -> Result<(), Box<dyn Error>> {
         let Some(output_id) = state.notification_center_open else {
+            self.pending_notification_center_target = None;
+            self.notification_center_highlight = None;
             if let Some(center) = self.notification_center.take() {
                 if let Some(backing) = center.backing {
                     self.text.release_drawable(backing.pixmap);
@@ -3390,6 +3611,24 @@ impl X11Platform {
             })
             .unwrap_or(previous_scroll)
             .min(max_scroll);
+        let target = self.pending_notification_center_target.take();
+        let scroll = target
+            .and_then(|target| {
+                state
+                    .notification_history
+                    .iter()
+                    .position(|entry| entry.id == target)
+                    .map(|target_index| {
+                        self.notification_center_highlight = Some(target);
+                        notification_scroll_to_target(
+                            &base_layouts,
+                            viewport_height,
+                            scroll,
+                            target_index,
+                        )
+                    })
+            })
+            .unwrap_or(scroll);
         let mut visible_layouts = Vec::new();
         let mut used_height = 0_u16;
         for (index, entry) in state.notification_history.iter().enumerate().skip(scroll) {
@@ -3737,13 +3976,19 @@ impl X11Platform {
                 .is_some_and(|hover| {
                     matches!(hover, NotificationCenterHover::Card(id) | NotificationCenterHover::Dismiss(id) if id == entry.id)
                 });
+            let highlighted = self.notification_center_highlight == Some(entry.id);
             self.conn
                 .change_gc(
                     backing.gc,
-                    &xproto::ChangeGCAux::new().foreground(
-                        self.glass_surface
-                            .opaque_pixel(if hovered { 0x354052 } else { 0x2b3340 }),
-                    ),
+                    &xproto::ChangeGCAux::new().foreground(self.glass_surface.opaque_pixel(
+                        if hovered {
+                            0x354052
+                        } else if highlighted {
+                            0x3b4658
+                        } else {
+                            0x2b3340
+                        },
+                    )),
                 )?
                 .check()?;
             self.conn.poly_fill_rectangle(
@@ -6215,6 +6460,11 @@ impl X11Platform {
                     });
             }
         }
+        if let Some(notification) = &self.notification {
+            if let Some(target) = notification_body_hit(notification, window, x, y) {
+                return target;
+            }
+        }
         if let Some((_bar, _, ox, oy, items, tray, network, audio, bluetooth)) =
             self.bar_hits.iter().find(|(bar, _, _, _, _, _, _, _, _)| {
                 *bar == window || (self.root == window && root_y < BAR_HEIGHT as i16)
@@ -6586,14 +6836,15 @@ mod tests {
         backing_matches, bar_backing_matches, blur_behind_rect, classify_attention_property_reply,
         classify_property_string_reply, effect_owner_property_value, install_passive_grabs,
         is_xbar_owned_window, menu_popup_dirty_for_interaction_change, menu_popup_slot_for_window,
-        menu_popup_slots_for_item, network_primary_row_label, notification_hover_transition,
-        notification_indicator_hit, notification_indicator_rect, notification_previous_scroll,
-        notification_scroll_target, notification_wheel_direction, popup_effect_owner,
-        popup_hover_for, popup_hover_transition, popup_slot_is_selected, preserve_color_pixel,
-        reconcile_notification_scroll, template_icon_pixel, tray_draw_size, tray_hit,
-        union_menu_rects, AttentionPropertyRead, BarBacking, BarWindow, GlobalPinShortcut,
-        HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot, PopupWindow, RenderTarget,
-        SurfaceWindowGeometry, X11Event, BAR_HEIGHT,
+        menu_popup_slots_for_item, network_primary_row_label, notification_body_hit,
+        notification_history_id_for, notification_hover_transition, notification_indicator_hit,
+        notification_indicator_rect, notification_previous_scroll, notification_scroll_target,
+        notification_wheel_direction, popup_effect_owner, popup_hover_for, popup_hover_transition,
+        popup_slot_is_selected, preserve_color_pixel, reconcile_notification_scroll,
+        reconcile_toast_stack, template_icon_pixel, tray_draw_size, tray_hit, union_menu_rects,
+        AttentionPropertyRead, BarBacking, BarWindow, GlobalPinShortcut, HitTarget, MenuPopupDirty,
+        PopupBacking, PopupHover, PopupSlot, PopupWindow, RenderTarget, SurfaceWindowGeometry,
+        X11Event, BAR_HEIGHT,
     };
     use crate::core::{
         HistoryEntryId, MenuItemId, NotificationActionProjection, NotificationActionView, OutputId,
@@ -6605,6 +6856,7 @@ mod tests {
         view::TrayIconRenderMode,
         view::TrayVisualItem,
     };
+    use std::collections::HashSet;
     use x11rb::errors::ReplyError;
     use x11rb::protocol::xproto::{EventMask, ModMask};
     use x11rb::protocol::{xproto, ErrorKind};
@@ -7947,6 +8199,158 @@ mod tests {
         assert_eq!(rect_b, notification_indicator_rect(&output_b));
     }
 
+    #[test]
+    fn toast_history_identity_resolves_from_the_live_notification() {
+        let history = vec![crate::core::NotificationHistoryEntry {
+            id: HistoryEntryId(41),
+            live_notification_id: Some(crate::core::NotificationId(9)),
+            source: crate::core::NotificationSource::Freedesktop,
+            app_name: "app".into(),
+            summary: "summary".into(),
+            body: "body".into(),
+            order: 1,
+            received_at: 1,
+            updated_at: 1,
+        }];
+        assert_eq!(
+            notification_history_id_for(&history, crate::core::NotificationId(9)),
+            Some(HistoryEntryId(41))
+        );
+        assert_eq!(
+            notification_history_id_for(&history, crate::core::NotificationId(10)),
+            None
+        );
+    }
+
+    #[test]
+    fn toast_body_hit_carries_history_identity_and_respects_bounds() {
+        let notification = super::NotificationWindow {
+            window: 12,
+            output: OutputId(3),
+            width: 360,
+            height: 88,
+            cards: vec![super::ToastCardHit {
+                history_id: HistoryEntryId(41),
+                rect: super::layout::MenuRect {
+                    x: 0,
+                    y: 0,
+                    width: 360,
+                    height: 88,
+                },
+            }],
+            backing: None,
+        };
+        assert_eq!(
+            notification_body_hit(&notification, 12, 10, 10),
+            Some(HitTarget::NotificationBody(OutputId(3), HistoryEntryId(41)))
+        );
+        assert_eq!(notification_body_hit(&notification, 12, 360, 10), None);
+        assert_eq!(notification_body_hit(&notification, 13, 10, 10), None);
+    }
+
+    #[test]
+    fn toast_stack_keeps_five_newest_without_losing_history_identity() {
+        let mut stack = Vec::new();
+        let mut known = HashSet::new();
+        let ids = (1..=15).rev().map(HistoryEntryId).collect::<Vec<_>>();
+        reconcile_toast_stack(&mut stack, &mut known, &ids);
+        assert_eq!(stack, ids[..5]);
+        assert_eq!(known.len(), 15);
+        assert!(!stack.contains(&HistoryEntryId(10)));
+    }
+
+    #[test]
+    fn toast_stack_overflow_and_pruning_never_resurrects_old_entries() {
+        let mut stack = Vec::new();
+        let mut known = HashSet::new();
+        let ids = (1..=6).rev().map(HistoryEntryId).collect::<Vec<_>>();
+        reconcile_toast_stack(&mut stack, &mut known, &ids);
+        assert_eq!(stack, ids[..5]);
+        reconcile_toast_stack(
+            &mut stack,
+            &mut known,
+            &[
+                HistoryEntryId(6),
+                HistoryEntryId(5),
+                HistoryEntryId(3),
+                HistoryEntryId(2),
+            ],
+        );
+        assert_eq!(
+            stack,
+            vec![
+                HistoryEntryId(6),
+                HistoryEntryId(5),
+                HistoryEntryId(3),
+                HistoryEntryId(2)
+            ]
+        );
+        assert!(!stack.contains(&HistoryEntryId(1)));
+    }
+
+    #[test]
+    fn toast_stack_replacement_keeps_one_logical_presentation_in_place() {
+        let mut stack = Vec::new();
+        let mut known = HashSet::new();
+        let initial = [HistoryEntryId(3), HistoryEntryId(2), HistoryEntryId(1)];
+        reconcile_toast_stack(&mut stack, &mut known, &initial);
+        reconcile_toast_stack(&mut stack, &mut known, &initial);
+        assert_eq!(stack, initial);
+        assert_eq!(known.len(), 3);
+    }
+
+    #[test]
+    fn clearing_stack_then_arriving_new_ids_starts_a_new_batch() {
+        let mut stack = Vec::new();
+        let mut known = HashSet::new();
+        reconcile_toast_stack(
+            &mut stack,
+            &mut known,
+            &[HistoryEntryId(15), HistoryEntryId(14), HistoryEntryId(13)],
+        );
+        stack.clear();
+        reconcile_toast_stack(
+            &mut stack,
+            &mut known,
+            &[HistoryEntryId(16), HistoryEntryId(15), HistoryEntryId(14)],
+        );
+        assert_eq!(stack, vec![HistoryEntryId(16)]);
+    }
+
+    #[test]
+    fn five_toast_cards_have_distinct_history_hits() {
+        let cards = (1..=5)
+            .rev()
+            .enumerate()
+            .map(|(index, id)| super::ToastCardHit {
+                history_id: HistoryEntryId(id),
+                rect: super::layout::MenuRect {
+                    x: 0,
+                    y: (index * 72) as i16,
+                    width: 360,
+                    height: 64,
+                },
+            })
+            .collect::<Vec<_>>();
+        let notification = super::NotificationWindow {
+            window: 12,
+            output: OutputId(3),
+            width: 360,
+            height: 352,
+            cards,
+            backing: None,
+        };
+        for (index, expected) in (1..=5).rev().enumerate() {
+            assert_eq!(
+                notification_body_hit(&notification, 12, 8, (index * 72 + 8) as i16),
+                Some(HitTarget::NotificationBody(
+                    OutputId(3),
+                    HistoryEntryId(expected)
+                ))
+            );
+        }
+    }
+
     fn test_history(ids: &[u32]) -> Vec<crate::core::NotificationHistoryEntry> {
         ids.iter()
             .enumerate()
@@ -8343,5 +8747,35 @@ mod tests {
             2,
             "backward suffix must use actual variable slot extents"
         );
+    }
+
+    #[test]
+    fn notification_target_visibility_preserves_or_minimally_moves_entry_scroll() {
+        let layouts = (1..=4)
+            .map(|id| super::notification_entry_layout(HistoryEntryId(id), &[], &[], 352, 120, 0))
+            .collect::<Vec<_>>();
+        assert_eq!(super::notification_scroll_to_target(&layouts, 120, 0, 1), 0);
+        assert_eq!(super::notification_scroll_to_target(&layouts, 120, 0, 2), 1);
+        assert_eq!(super::notification_scroll_to_target(&layouts, 120, 2, 0), 0);
+    }
+
+    #[test]
+    fn notification_target_visibility_uses_variable_card_extents() {
+        let layouts = vec![
+            super::notification_entry_layout(HistoryEntryId(1), &[], &[], 352, 150, 0),
+            super::notification_entry_layout(
+                HistoryEntryId(2),
+                &[NotificationActionView {
+                    key: "reply".into(),
+                    label: "Reply".into(),
+                }],
+                &[40],
+                352,
+                150,
+                0,
+            ),
+            super::notification_entry_layout(HistoryEntryId(3), &[], &[], 352, 150, 0),
+        ];
+        assert_eq!(super::notification_scroll_to_target(&layouts, 150, 0, 2), 1);
     }
 }

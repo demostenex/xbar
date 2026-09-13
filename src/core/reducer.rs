@@ -1713,6 +1713,12 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             };
             true
         }
+        Event::EnsureNotificationCenterOpen { output, .. } => {
+            let changed = state.notification_center_open != Some(output);
+            state.notification_center_open = Some(output);
+            changed
+        }
+        Event::NotificationToastConsumed => false,
         Event::WindowAttentionChanged { .. } => false,
         Event::AudioUnavailable => {
             let audio = super::AudioState::default();
@@ -1866,7 +1872,9 @@ fn bluetooth_visual_state(bluetooth: &super::BluetoothState) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{MenuEndpoint, OutputId, OutputState, WindowId, WorkspaceState};
+    use crate::core::{
+        HistoryEntryId, MenuEndpoint, OutputId, OutputState, WindowId, WorkspaceState,
+    };
     fn ep() -> super::super::MenuEndpoint {
         super::super::MenuEndpoint {
             service: ":1.9".into(),
@@ -3097,6 +3105,71 @@ mod tests {
             &mut MenuRegistry::default(),
         );
         assert_eq!(state.notification_center_open, Some(OutputId(2)));
+    }
+
+    #[test]
+    fn ensure_notification_center_open_is_not_a_toggle() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        assert!(reduce(
+            &mut state,
+            Event::EnsureNotificationCenterOpen {
+                output: OutputId(1),
+                target: Some(HistoryEntryId(7)),
+            },
+            &mut registry,
+        ));
+        assert_eq!(state.notification_center_open, Some(OutputId(1)));
+        assert!(!reduce(
+            &mut state,
+            Event::EnsureNotificationCenterOpen {
+                output: OutputId(1),
+                target: Some(HistoryEntryId(7)),
+            },
+            &mut registry,
+        ));
+        assert_eq!(state.notification_center_open, Some(OutputId(1)));
+    }
+
+    #[test]
+    fn notification_arrival_does_not_change_center_open_state() {
+        let mut state = State {
+            notification_center_open: Some(OutputId(1)),
+            ..Default::default()
+        };
+        let history = |id| super::super::NotificationHistoryEntry {
+            id: HistoryEntryId(id),
+            live_notification_id: None,
+            source: super::super::NotificationSource::Freedesktop,
+            app_name: "app".into(),
+            summary: id.to_string(),
+            body: String::new(),
+            order: id,
+            received_at: id,
+            updated_at: id,
+        };
+        let mut registry = MenuRegistry::default();
+        assert!(reduce(
+            &mut state,
+            Event::NotificationsState {
+                active: Vec::new(),
+                history: vec![history(2)],
+                action_projections: Vec::new(),
+            },
+            &mut registry,
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::NotificationsState {
+                active: Vec::new(),
+                history: vec![history(3), history(2)],
+                action_projections: Vec::new(),
+            },
+            &mut registry,
+        ));
+        assert_eq!(state.notification_center_open, Some(OutputId(1)));
+        assert_eq!(state.notification_history[0].id, HistoryEntryId(3));
+        assert_eq!(state.notification_history[1].id, HistoryEntryId(2));
     }
 
     #[test]
