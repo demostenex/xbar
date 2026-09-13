@@ -106,7 +106,7 @@ impl TextMeasurer for PopupMeasurer<'_> {
     }
 }
 
-const BAR_HEIGHT: u16 = 26;
+const BAR_HEIGHT: u16 = layout::BAR_HEIGHT;
 const XK_G: u32 = 0x0067;
 const XK_M: u32 = 0x006d;
 const XK_NUM_LOCK: u32 = 0xff7f;
@@ -572,6 +572,13 @@ enum PopupHover {
     BluetoothDevice(String),
     NetworkWifi(NetworkWifiTarget),
     NetworkWireless,
+}
+
+#[derive(Clone, Copy)]
+enum BarPopupSource {
+    Audio,
+    Bluetooth,
+    Network,
 }
 struct NotificationWindow {
     window: u32,
@@ -1526,6 +1533,43 @@ fn with_default_border_pixel(attributes: xproto::CreateWindowAux) -> xproto::Cre
 }
 
 impl X11Platform {
+    fn bar_popup_anchor(
+        &self,
+        output_id: OutputId,
+        source: BarPopupSource,
+    ) -> Option<layout::PopupAnchor> {
+        self.bar_hits
+            .iter()
+            .find(|(_, id, ..)| *id == output_id)
+            .and_then(|(_, _, _, _, _, _, network, audio, bluetooth)| {
+                let rect = match source {
+                    BarPopupSource::Audio => audio.as_ref().map(|visual| visual.rect),
+                    BarPopupSource::Bluetooth => bluetooth.as_ref().map(|visual| visual.rect),
+                    BarPopupSource::Network => network.as_ref().map(|visual| visual.rect),
+                }?;
+                Some(layout::PopupAnchor {
+                    output_id,
+                    source_rect: rect,
+                })
+            })
+    }
+
+    fn first_bar_popup_anchor(&self, source: BarPopupSource) -> Option<layout::PopupAnchor> {
+        self.bar_hits
+            .iter()
+            .find_map(|(_, output_id, ..)| self.bar_popup_anchor(*output_id, source))
+    }
+
+    fn notification_popup_anchor(&self, output_id: OutputId) -> Option<layout::PopupAnchor> {
+        self.notification_hits
+            .iter()
+            .find(|(_, id, _)| *id == output_id)
+            .map(|(_, _, source_rect)| layout::PopupAnchor {
+                output_id,
+                source_rect: *source_rect,
+            })
+    }
+
     fn create_surface_window(
         &self,
         surface: SurfaceVisual,
@@ -3691,9 +3735,12 @@ impl X11Platform {
                 .saturating_add(used_height.max(62))
                 .min(available.max(header_height + 62))
         };
-        let x =
-            (output.x as i32 + output.width as i32 - width as i32 - 8).max(output.x as i32) as i16;
-        let y = output.y.saturating_add(BAR_HEIGHT as i16 + 4);
+        let anchor = self
+            .notification_popup_anchor(output_id)
+            .ok_or("no notification bar anchor")?;
+        let placement = layout::place_bar_popup(anchor, width, height, output);
+        let x = placement.popup_rect.x;
+        let y = placement.popup_rect.y;
         let existing = self
             .notification_center
             .as_ref()
@@ -4872,7 +4919,14 @@ impl X11Platform {
             }
             return Ok(());
         }
-        let output = state.outputs.first().ok_or("no output for audio popup")?;
+        let anchor = self
+            .first_bar_popup_anchor(BarPopupSource::Audio)
+            .ok_or("no audio bar anchor")?;
+        let output = state
+            .outputs
+            .iter()
+            .find(|output| output.id == anchor.output_id)
+            .ok_or("no output for audio popup")?;
         let output_count = state.audio.outputs.len().min(8);
         let input_count = state.audio.inputs.len().min(8);
         let content_height = 316 + output_count as u16 * 24 + input_count as u16 * 24;
@@ -4880,12 +4934,7 @@ impl X11Platform {
         let popup_height = content_height
             .max(280)
             .min(output.height.saturating_sub(26).max(1));
-        let rect = layout::MenuRect {
-            x: (output.x as i32 + output.width as i32 - popup_width as i32) as i16,
-            y: output.y + 26,
-            width: popup_width,
-            height: popup_height,
-        };
+        let rect = layout::place_bar_popup(anchor, popup_width, popup_height, output).popup_rect;
         let card_x = rect.x + POPUP_STYLE.outer_padding as i16;
         let card_width = rect.width.saturating_sub(POPUP_STYLE.outer_padding * 2);
         let master_card = layout::MenuRect {
@@ -5264,9 +5313,13 @@ impl X11Platform {
             }
             return Ok(());
         }
+        let anchor = self
+            .first_bar_popup_anchor(BarPopupSource::Bluetooth)
+            .ok_or("no bluetooth bar anchor")?;
         let output = state
             .outputs
-            .first()
+            .iter()
+            .find(|output| output.id == anchor.output_id)
             .ok_or("no output for bluetooth popup")?;
         let mut devices: Vec<_> = state
             .bluetooth
@@ -5284,12 +5337,7 @@ impl X11Platform {
             .min(u32::from(u16::MAX)) as u16)
             .min(output.height.saturating_sub(26).max(1));
         devices.truncate(usize::from(popup_height.saturating_sub(72) / 30));
-        let rect = layout::MenuRect {
-            x: (output.x as i32 + output.width as i32 - popup_width as i32) as i16,
-            y: output.y + 26,
-            width: popup_width,
-            height: popup_height,
-        };
+        let rect = layout::place_bar_popup(anchor, popup_width, popup_height, output).popup_rect;
         let power = layout::MenuRect {
             x: rect.x + rect.width as i16
                 - POPUP_STYLE.outer_padding as i16
@@ -5547,7 +5595,14 @@ impl X11Platform {
             }
             return Ok(());
         }
-        let output = state.outputs.first().ok_or("no output for network popup")?;
+        let anchor = self
+            .first_bar_popup_anchor(BarPopupSource::Network)
+            .ok_or("no network bar anchor")?;
+        let output = state
+            .outputs
+            .iter()
+            .find(|output| output.id == anchor.output_id)
+            .ok_or("no output for network popup")?;
         let popup_width = 380_u16.min(output.width.max(1));
         let card_padding = POPUP_STYLE.card_padding as i16;
         let interface_targets: Vec<_> = state
@@ -5578,12 +5633,7 @@ impl X11Platform {
             .collect();
         let popup_height = layout::network_popup_content_height(&interface_row_counts)
             .min(output.height.saturating_sub(26).max(1));
-        let rect = layout::MenuRect {
-            x: (output.x as i32 + output.width as i32 - popup_width as i32) as i16,
-            y: output.y + 26,
-            width: popup_width,
-            height: popup_height,
-        };
+        let rect = layout::place_bar_popup(anchor, popup_width, popup_height, output).popup_rect;
         let network_layout = layout::network_popup_layout(rect, &interface_row_counts);
         let status_card = network_layout.status_card;
         let available_section = network_layout.available_section;

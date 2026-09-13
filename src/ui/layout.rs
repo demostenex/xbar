@@ -1,6 +1,7 @@
 use crate::core::{ChildrenDisplay, MenuItem, MenuItemId, MenuItemType};
-use crate::core::{OutputState, WorkspaceState};
+use crate::core::{OutputId, OutputState, WorkspaceState};
 use crate::ui::style::{TextMeasurer, BAR_STYLE, POPUP_STYLE};
+pub const BAR_HEIGHT: u16 = 26;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorkspaceRect {
     pub x: i16,
@@ -15,6 +16,59 @@ pub struct MenuRect {
     pub y: i16,
     pub width: u16,
     pub height: u16,
+}
+
+/// The canonical bar control geometry used to place a popup opened from the
+/// bar.  This is presentation data, not a core event payload: callers copy
+/// the current rendered hit rectangle when opening or reconciling a popup.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PopupAnchor {
+    pub output_id: OutputId,
+    pub source_rect: MenuRect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PopupPlacement {
+    pub popup_rect: MenuRect,
+    /// Future caret position, relative to the popup's left edge.  C5A does
+    /// not draw or hit-test this value.
+    pub caret_anchor_x: i16,
+}
+
+/// Non-final structural inset keeping a future caret away from popup edges.
+pub const POPUP_CARET_SAFE_INSET: i16 = 12;
+
+/// Place a top-bar popup over the source control and keep its origin bounded
+/// in the source output.  Signed arithmetic deliberately handles both
+/// non-zero output origins and a popup wider than its output.
+pub fn place_bar_popup(
+    anchor: PopupAnchor,
+    popup_width: u16,
+    popup_height: u16,
+    output: &OutputState,
+) -> PopupPlacement {
+    let output_left = i32::from(output.x);
+    let output_right = output_left + i32::from(output.width);
+    let source_center = i32::from(anchor.source_rect.x) + i32::from(anchor.source_rect.width) / 2;
+    let ideal_x = source_center - i32::from(popup_width) / 2;
+    let maximum_x = (output_right - i32::from(popup_width)).max(output_left);
+    let popup_x = ideal_x.clamp(output_left, maximum_x);
+    let bar_edge_y = i32::from(output.y) + i32::from(BAR_HEIGHT);
+    let output_bottom = i32::from(output.y) + i32::from(output.height);
+    let maximum_y = (output_bottom - i32::from(popup_height)).max(i32::from(output.y));
+    let popup_y = bar_edge_y.clamp(i32::from(output.y), maximum_y);
+    let caret_max = i32::from(popup_width.saturating_sub(1));
+    let caret_inset = i32::from(POPUP_CARET_SAFE_INSET).min(caret_max / 2);
+    let caret_anchor_x = (source_center - popup_x).clamp(caret_inset, caret_max - caret_inset);
+    PopupPlacement {
+        popup_rect: MenuRect {
+            x: popup_x as i16,
+            y: popup_y as i16,
+            width: popup_width,
+            height: popup_height,
+        },
+        caret_anchor_x: caret_anchor_x as i16,
+    }
 }
 
 impl MenuRect {
@@ -430,12 +484,24 @@ pub fn popup_layout_with_measurer<M: TextMeasurer>(
     } else {
         anchor.y as i32 + anchor.height as i32
     };
-    let y = desired_y.clamp(oy, oy + output.height as i32 - height as i32);
-    let rect = MenuRect {
-        x: x as i16,
-        y: y as i16,
-        width,
-        height,
+    let rect = if submenu {
+        MenuRect {
+            x: x as i16,
+            y: desired_y.clamp(oy, oy + output.height as i32 - height as i32) as i16,
+            width,
+            height,
+        }
+    } else {
+        place_bar_popup(
+            PopupAnchor {
+                output_id: output.id,
+                source_rect: anchor,
+            },
+            width,
+            height,
+            output,
+        )
+        .popup_rect
     };
     let content = MenuRect {
         x: rect.x + POPUP_STYLE.outer_padding as i16,
@@ -920,6 +986,97 @@ mod tests {
             y: 20,
             width: 900,
             height: 600,
+        }
+    }
+
+    fn anchor(output: &OutputState, x: i16, width: u16) -> PopupAnchor {
+        PopupAnchor {
+            output_id: output.id,
+            source_rect: MenuRect {
+                x,
+                y: output.y,
+                width,
+                height: BAR_HEIGHT,
+            },
+        }
+    }
+
+    #[test]
+    fn bar_popup_placement_centers_over_source_and_derives_caret_anchor() {
+        let output = output();
+        let placement = place_bar_popup(anchor(&output, 480, 40), 200, 100, &output);
+        assert_eq!(placement.popup_rect.x, 400);
+        assert_eq!(placement.popup_rect.y, output.y + BAR_HEIGHT as i16);
+        assert_eq!(placement.caret_anchor_x, 100);
+    }
+
+    #[test]
+    fn bar_popup_placement_clamps_left_and_keeps_caret_in_safe_bounds() {
+        let output = output();
+        let placement = place_bar_popup(anchor(&output, 102, 4), 200, 100, &output);
+        assert_eq!(placement.popup_rect.x, output.x);
+        assert!(placement.caret_anchor_x >= POPUP_CARET_SAFE_INSET);
+        assert!(placement.caret_anchor_x < 200 - POPUP_CARET_SAFE_INSET);
+    }
+
+    #[test]
+    fn bar_popup_placement_clamps_right_and_tracks_source_after_shift() {
+        let output = output();
+        let placement = place_bar_popup(anchor(&output, 980, 10), 200, 100, &output);
+        assert_eq!(
+            placement.popup_rect.x + placement.popup_rect.width as i16,
+            1000
+        );
+        assert_eq!(placement.caret_anchor_x, 185);
+    }
+
+    #[test]
+    fn bar_popup_placement_preserves_non_zero_output_origin() {
+        let output = OutputState {
+            x: 1920,
+            width: 1920,
+            ..output()
+        };
+        let placement = place_bar_popup(anchor(&output, 2680, 40), 200, 100, &output);
+        assert_eq!(placement.popup_rect.x, 2600);
+        assert!(placement.popup_rect.x >= output.x);
+        assert_eq!(placement.popup_rect.x + 200, 2800);
+    }
+
+    #[test]
+    fn bar_popup_placement_handles_popup_wider_than_output_deterministically() {
+        let output = OutputState {
+            width: 100,
+            ..output()
+        };
+        let placement = place_bar_popup(anchor(&output, 120, 20), 200, 100, &output);
+        assert_eq!(placement.popup_rect.x, output.x);
+        assert_eq!(placement.popup_rect.width, 200);
+        assert!(placement.popup_rect.x >= output.x);
+        assert!(placement.popup_rect.y >= output.y);
+    }
+
+    #[test]
+    fn bar_popup_sources_all_use_the_same_centering_policy() {
+        let output = output();
+        let sources = [
+            ("network", anchor(&output, 200, 24)),
+            ("audio", anchor(&output, 400, 36)),
+            ("bluetooth", anchor(&output, 600, 24)),
+            ("notification", anchor(&output, 800, 28)),
+        ];
+        for (_, source) in sources {
+            let placement = place_bar_popup(source, 200, 100, &output);
+            let source_center =
+                i32::from(source.source_rect.x) + i32::from(source.source_rect.width) / 2;
+            assert_eq!(
+                i32::from(placement.popup_rect.x) + i32::from(placement.caret_anchor_x),
+                source_center.clamp(
+                    i32::from(placement.popup_rect.x) + i32::from(POPUP_CARET_SAFE_INSET),
+                    i32::from(placement.popup_rect.x + placement.popup_rect.width as i16)
+                        - i32::from(POPUP_CARET_SAFE_INSET),
+                )
+            );
         }
     }
     fn ws(n: usize) -> Vec<WorkspaceState> {
