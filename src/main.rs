@@ -986,11 +986,28 @@ fn run() -> Result<(), Box<dyn Error>> {
                 core::MenuPresentationPolicy::Pinned { .. }
             );
             let pending_lazy_root_before = state.menu_interaction.pending_lazy_root.clone();
+            let notification_center_before = state.notification_center_open;
+            let notification_history_before = state.notification_history.clone();
             let reduced = core::reduce(
                 &mut state,
                 translated.clone(),
                 &mut registry.lock().expect("registry poisoned"),
             );
+            if notification_center_toggle_opened(
+                &translated,
+                notification_center_before,
+                state.notification_center_open,
+            ) {
+                x11.consume_notification_toast_stack();
+            }
+            if state.notification_center_open.is_some()
+                && matches!(translated, Event::NotificationsState { .. })
+            {
+                x11.mark_notification_toast_known(notification_history_ids_added(
+                    &notification_history_before,
+                    &state.notification_history,
+                ));
+            }
             if reduced {
                 x11.note_menu_interaction_change(
                     menu_interaction_before.0,
@@ -1850,6 +1867,25 @@ fn notification_action_page_render_target(changed: bool) -> Option<RenderTarget>
     changed.then_some(RenderTarget::Notification)
 }
 
+fn notification_center_toggle_opened(
+    event: &Event,
+    previous: Option<core::OutputId>,
+    current: Option<core::OutputId>,
+) -> bool {
+    matches!(event, Event::ToggleNotificationCenter(output) if previous.is_none() && current == Some(*output))
+}
+
+fn notification_history_ids_added(
+    before: &[core::NotificationHistoryEntry],
+    after: &[core::NotificationHistoryEntry],
+) -> Vec<core::HistoryEntryId> {
+    after
+        .iter()
+        .filter(|entry| !before.iter().any(|previous| previous.id == entry.id))
+        .map(|entry| entry.id)
+        .collect()
+}
+
 fn tray_action_event(
     event: &Event,
     endpoint: &core::StatusNotifierEndpoint,
@@ -1940,6 +1976,7 @@ fn keyboard_event(
 mod scheduler_tests {
     use super::{
         hover_render_target_for, merge_render_target, notification_action_page_render_target,
+        notification_center_toggle_opened, notification_history_ids_added,
         pending_lazy_root_to_schedule, promote_menu_popup_target, render_target_for_changes,
         should_schedule_invalidation, toast_navigation_event,
     };
@@ -1995,6 +2032,41 @@ mod scheduler_tests {
                 target: Some(crate::core::HistoryEntryId(8)),
             }
         ));
+    }
+
+    #[test]
+    fn bell_open_transition_consumes_toasts_only_when_center_was_closed() {
+        let event = crate::core::Event::ToggleNotificationCenter(crate::core::OutputId(3));
+        assert!(notification_center_toggle_opened(
+            &event,
+            None,
+            Some(crate::core::OutputId(3))
+        ));
+        assert!(!notification_center_toggle_opened(
+            &event,
+            Some(crate::core::OutputId(3)),
+            None
+        ));
+        assert!(!notification_center_toggle_opened(
+            &event,
+            Some(crate::core::OutputId(2)),
+            Some(crate::core::OutputId(3))
+        ));
+    }
+
+    #[test]
+    fn center_open_arrivals_are_distinguished_from_existing_history() {
+        let before = [history_entry(3), history_entry(2), history_entry(1)];
+        let after = [
+            history_entry(4),
+            history_entry(3),
+            history_entry(2),
+            history_entry(1),
+        ];
+        assert_eq!(
+            notification_history_ids_added(&before, &after),
+            vec![crate::core::HistoryEntryId(4)]
+        );
     }
 
     #[test]

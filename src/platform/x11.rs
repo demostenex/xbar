@@ -2377,11 +2377,25 @@ impl X11Platform {
 
     pub fn consume_notification_toast(&mut self, id: crate::core::HistoryEntryId) {
         if self.toast_stack.contains(&id) {
-            self.toast_stack.clear();
-            if let Some(notification) = &self.notification {
-                let _ = self.conn.unmap_window(notification.window);
-            }
+            self.consume_notification_toast_stack();
         }
+    }
+
+    pub fn consume_notification_toast_stack(&mut self) {
+        if self.toast_stack.is_empty() {
+            return;
+        }
+        self.toast_stack.clear();
+        if let Some(notification) = &self.notification {
+            let _ = self.conn.unmap_window(notification.window);
+        }
+    }
+
+    pub fn mark_notification_toast_known(
+        &mut self,
+        history_ids: impl IntoIterator<Item = crate::core::HistoryEntryId>,
+    ) {
+        self.toast_known_history.extend(history_ids);
     }
 
     pub fn request_notification_center_target(
@@ -8297,6 +8311,31 @@ mod tests {
         reconcile_toast_stack(&mut stack, &mut known, &initial);
         assert_eq!(stack, initial);
         assert_eq!(known.len(), 3);
+    }
+
+    #[test]
+    fn preknown_center_open_arrival_never_enters_toast_stack() {
+        let mut stack = Vec::new();
+        let mut known = [
+            HistoryEntryId(4),
+            HistoryEntryId(3),
+            HistoryEntryId(2),
+            HistoryEntryId(1),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        reconcile_toast_stack(
+            &mut stack,
+            &mut known,
+            &[
+                HistoryEntryId(4),
+                HistoryEntryId(3),
+                HistoryEntryId(2),
+                HistoryEntryId(1),
+            ],
+        );
+        assert!(stack.is_empty());
+        assert_eq!(known.len(), 4);
     }
 
     #[test]
