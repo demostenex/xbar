@@ -38,6 +38,10 @@ fn notification_scroll_trace_enabled() -> bool {
     std::env::var_os("XBAR_TRACE_NOTIFICATION_SCROLL").is_some()
 }
 
+fn notification_ui_trace_enabled() -> bool {
+    std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some()
+}
+
 /// Render an eligible template pixel while retaining its source alpha as
 /// antialiasing. Color tray pixmaps bypass this function entirely.
 fn template_icon_pixel(pixel: u32, foreground: u32, background: u32) -> Option<u32> {
@@ -578,15 +582,102 @@ struct NotificationCenterWindow {
     width: u16,
     height: u16,
     backing: Option<PopupBacking>,
-    card_hits: Vec<(crate::core::HistoryEntryId, layout::MenuRect)>,
-    hover: Option<crate::core::HistoryEntryId>,
+    card_hits: Vec<NotificationCardHit>,
+    clear_all_rect: Option<layout::MenuRect>,
+    hover: Option<NotificationCenterHover>,
     scroll: usize,
     scroll_changed: bool,
     dirty: bool,
 }
 
-fn notification_visible_capacity(output_height: u16) -> usize {
-    usize::from(output_height.saturating_sub(BAR_HEIGHT + 12) / 62).max(1)
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NotificationCardHit {
+    id: crate::core::HistoryEntryId,
+    card_rect: layout::MenuRect,
+    dismiss_rect: layout::MenuRect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotificationCenterHover {
+    Card(crate::core::HistoryEntryId),
+    Dismiss(crate::core::HistoryEntryId),
+    ClearAll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotificationCenterButtonAction {
+    Dismiss(crate::core::HistoryEntryId),
+    ClearAll,
+}
+
+pub fn notification_center_button_action(
+    button: u8,
+    target: &HitTarget,
+) -> Option<NotificationCenterButtonAction> {
+    if button != 1 {
+        return None;
+    }
+    match target {
+        HitTarget::NotificationCenterDismiss(id) => {
+            Some(NotificationCenterButtonAction::Dismiss(*id))
+        }
+        HitTarget::NotificationCenterClearAll => Some(NotificationCenterButtonAction::ClearAll),
+        _ => None,
+    }
+}
+
+const NOTIFICATION_HEADER_HEIGHT: u16 = 28;
+const NOTIFICATION_HEADER_CONTROL_WIDTH: u16 = 68;
+const NOTIFICATION_HEADER_CONTROL_PADDING: u16 = 16;
+const NOTIFICATION_HEADER_RIGHT_MARGIN: u16 = 8;
+const NOTIFICATION_HEADER_CONTROL_BACKGROUND: u32 = 0x2b3340;
+const NOTIFICATION_HEADER_CONTROL_HOVER_BACKGROUND: u32 = 0x354052;
+
+fn notification_header_rect(width: u16, text_width: u16) -> layout::MenuRect {
+    let control_width = NOTIFICATION_HEADER_CONTROL_WIDTH
+        .max(text_width.saturating_add(NOTIFICATION_HEADER_CONTROL_PADDING))
+        .min(width);
+    let right_margin = NOTIFICATION_HEADER_RIGHT_MARGIN.min(width - control_width);
+    layout::MenuRect {
+        x: (width - control_width - right_margin) as i16,
+        y: 4,
+        width: control_width,
+        height: 20,
+    }
+}
+
+fn notification_header_for_history(
+    width: u16,
+    text_width: u16,
+    has_history: bool,
+) -> Option<layout::MenuRect> {
+    has_history.then(|| notification_header_rect(width, text_width))
+}
+
+fn notification_header_text_baseline(rect: layout::MenuRect, metrics: style::FontMetrics) -> i16 {
+    rect.y + metrics.centered_baseline(rect.height)
+}
+
+fn notification_header_text_origin(rect: layout::MenuRect, baseline: i16) -> (i32, i32) {
+    (i32::from(rect.x) + 8, i32::from(baseline))
+}
+
+fn notification_dismiss_rect(card: layout::MenuRect) -> layout::MenuRect {
+    layout::MenuRect {
+        x: card.x + card.width.saturating_sub(24) as i16,
+        y: card.y + 4,
+        width: 20,
+        height: 20,
+    }
+}
+
+fn notification_visible_capacity(output_height: u16, has_header: bool) -> usize {
+    let header = if has_header {
+        NOTIFICATION_HEADER_HEIGHT
+    } else {
+        0
+    };
+    usize::from(output_height.saturating_sub(BAR_HEIGHT + 12 + header) / 62).max(1)
 }
 
 fn notification_max_scroll(history_len: usize, visible_capacity: usize) -> usize {
@@ -636,9 +727,9 @@ fn reconcile_notification_scroll(
 }
 
 fn notification_hover_transition(
-    old: Option<crate::core::HistoryEntryId>,
-    next: Option<crate::core::HistoryEntryId>,
-) -> (Option<crate::core::HistoryEntryId>, bool) {
+    old: Option<NotificationCenterHover>,
+    next: Option<NotificationCenterHover>,
+) -> (Option<NotificationCenterHover>, bool) {
     (next, old != next)
 }
 
@@ -686,6 +777,8 @@ pub enum HitTarget {
     #[allow(dead_code)]
     NotificationCenter(OutputId),
     NotificationCenterCard(crate::core::HistoryEntryId),
+    NotificationCenterDismiss(crate::core::HistoryEntryId),
+    NotificationCenterClearAll,
     NotificationCenterEmpty,
     TopLevel(crate::core::MenuItemId),
     Item(Vec<crate::core::MenuItemId>),
@@ -1788,12 +1881,17 @@ impl X11Platform {
         };
         let next = match target {
             Some(HitTarget::NotificationCenterCard(id))
-                if center
-                    .card_hits
-                    .iter()
-                    .any(|(candidate, _)| candidate == id) =>
+                if center.card_hits.iter().any(|hit| hit.id == *id) =>
             {
-                Some(*id)
+                Some(NotificationCenterHover::Card(*id))
+            }
+            Some(HitTarget::NotificationCenterDismiss(id))
+                if center.card_hits.iter().any(|hit| hit.id == *id) =>
+            {
+                Some(NotificationCenterHover::Dismiss(*id))
+            }
+            Some(HitTarget::NotificationCenterClearAll) if center.clear_all_rect.is_some() => {
+                Some(NotificationCenterHover::ClearAll)
             }
             _ => None,
         };
@@ -1816,7 +1914,8 @@ impl X11Platform {
         else {
             return false;
         };
-        let capacity = notification_visible_capacity(output.height);
+        let capacity =
+            notification_visible_capacity(output.height, !state.notification_history.is_empty());
         let Some(_) = notification_wheel_direction(button) else {
             return false;
         };
@@ -1863,9 +1962,13 @@ impl X11Platform {
         true
     }
 
-    fn install_notification_center_wheel_grabs(&self, window: u32) -> (String, String) {
-        let mut outcomes = Vec::with_capacity(2);
-        for (button, label) in [(ButtonIndex::M4, "button4"), (ButtonIndex::M5, "button5")] {
+    fn install_notification_center_button_grabs(&self, window: u32) -> (String, String, String) {
+        let mut outcomes = Vec::with_capacity(3);
+        for (button, label) in [
+            (ButtonIndex::M1, "button1"),
+            (ButtonIndex::M4, "button4"),
+            (ButtonIndex::M5, "button5"),
+        ] {
             let result = self.conn.grab_button(
                 true,
                 window,
@@ -1884,7 +1987,7 @@ impl X11Platform {
                 },
                 Err(error) => format!("ERROR:{error}"),
             };
-            if notification_scroll_trace_enabled() {
+            if notification_scroll_trace_enabled() || notification_ui_trace_enabled() {
                 eprintln!(
                     "notification-center grab {}: xid={} result={}",
                     label, window, outcome
@@ -1892,7 +1995,7 @@ impl X11Platform {
             }
             outcomes.push(outcome);
         }
-        (outcomes.remove(0), outcomes.remove(0))
+        (outcomes.remove(0), outcomes.remove(0), outcomes.remove(0))
     }
     pub fn acquire_instance(&mut self) -> Result<bool, Box<dyn Error>> {
         let window = self.conn.generate_id()?;
@@ -2817,14 +2920,15 @@ impl X11Platform {
         };
         let width = 360_u16.min(output.width.max(1));
         let available = output.height.saturating_sub(BAR_HEIGHT + 12);
-        let visible_capacity = notification_visible_capacity(output.height);
+        let visible_capacity =
+            notification_visible_capacity(output.height, !state.notification_history.is_empty());
         let previous = self.notification_center.as_ref();
         let same_output = previous.is_some_and(|center| center.output == output_id);
         let previous_scroll =
             notification_previous_scroll(same_output, previous.map_or(0, |center| center.scroll));
         let user_scrolled = same_output && previous.is_some_and(|center| center.scroll_changed);
         let previous_anchor = (!user_scrolled && previous_scroll > 0)
-            .then(|| previous.and_then(|center| center.card_hits.first().map(|(id, _)| *id)));
+            .then(|| previous.and_then(|center| center.card_hits.first().map(|hit| hit.id)));
         let scroll = reconcile_notification_scroll(
             previous_scroll,
             previous_anchor.flatten(),
@@ -2854,12 +2958,18 @@ impl X11Platform {
                 cards
             );
         }
+        let has_header = !state.notification_history.is_empty();
+        let header_height = if has_header {
+            NOTIFICATION_HEADER_HEIGHT
+        } else {
+            0
+        };
         let height = if state.notification_history.is_empty() {
             62
         } else {
-            (visible_capacity as u16)
-                .saturating_mul(62)
-                .min(available.max(62))
+            header_height
+                .saturating_add((visible_capacity as u16).saturating_mul(62))
+                .min(available.max(header_height.saturating_add(62)))
         };
         let x =
             (output.x as i32 + output.width as i32 - width as i32 - 8).max(output.x as i32) as i16;
@@ -2894,11 +3004,12 @@ impl X11Platform {
                     .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
             )?;
             self.conn.map_window(window)?.check()?;
-            let (grab_button4, grab_button5) = self.install_notification_center_wheel_grabs(window);
-            if notification_scroll_trace_enabled() {
+            let (grab_button1, grab_button4, grab_button5) =
+                self.install_notification_center_button_grabs(window);
+            if notification_scroll_trace_enabled() || notification_ui_trace_enabled() {
                 eprintln!(
-                    "notification-center create: xid={} output={} geometry={}x{}+{}+{} event_mask=EXPOSURE|BUTTON_PRESS grab_button4={} grab_button5={}",
-                    window, output_id.0, width, height, x, y, grab_button4, grab_button5
+                    "notification-center create: xid={} output={} geometry={}x{}+{}+{} event_mask=EXPOSURE|BUTTON_PRESS grab_button1={} grab_button4={} grab_button5={}",
+                    window, output_id.0, width, height, x, y, grab_button1, grab_button4, grab_button5
                 );
             }
             window
@@ -2990,6 +3101,81 @@ impl X11Platform {
                 height,
             }],
         )?;
+        let clear_all_text_width = self.text.measure_popup_width("Clear All");
+        let clear_all_rect =
+            notification_header_for_history(width, clear_all_text_width, has_header);
+        if let Some(rect) = clear_all_rect {
+            let clear_all_hovered = self
+                .notification_center
+                .as_ref()
+                .is_some_and(|center| center.hover == Some(NotificationCenterHover::ClearAll));
+            self.conn
+                .change_gc(
+                    backing.gc,
+                    &xproto::ChangeGCAux::new().foreground(self.glass_surface.opaque_pixel(
+                        if clear_all_hovered {
+                            NOTIFICATION_HEADER_CONTROL_HOVER_BACKGROUND
+                        } else {
+                            NOTIFICATION_HEADER_CONTROL_BACKGROUND
+                        },
+                    )),
+                )?
+                .check()?;
+            self.conn.poly_fill_rectangle(
+                backing.pixmap,
+                backing.gc,
+                &[xproto::Rectangle {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                }],
+            )?;
+            self.conn.flush()?;
+            self.conn.get_input_focus()?.reply()?;
+            self.text.prepare_drawable(
+                "notification-center",
+                backing.pixmap,
+                self.glass_surface,
+            )?;
+            let baseline = notification_header_text_baseline(rect, self.text.popup_metrics());
+            self.text.draw_popup_utf8(
+                "Notification Center",
+                12,
+                notification_header_text_baseline(
+                    layout::MenuRect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height: NOTIFICATION_HEADER_HEIGHT,
+                    },
+                    self.text.popup_metrics(),
+                ) as i32,
+                BAR_STYLE.material.foreground,
+            )?;
+            let (clear_all_x, clear_all_baseline) = notification_header_text_origin(rect, baseline);
+            if notification_ui_trace_enabled() {
+                eprintln!(
+                    "notification-center clear-all-render: rect=({}, {}, {}, {}) text_width={} text_origin=({}, {}) clip=none foreground=0x{:06x} target=pixmap=0x{:x}",
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                    clear_all_text_width,
+                    clear_all_x,
+                    clear_all_baseline,
+                    BAR_STYLE.material.foreground,
+                    backing.pixmap,
+                );
+            }
+            self.text.draw_popup_utf8(
+                "Clear All",
+                clear_all_x,
+                clear_all_baseline,
+                BAR_STYLE.material.foreground,
+            )?;
+            self.text.release_drawable(backing.pixmap);
+        }
         let mut card_hits = Vec::with_capacity(cards);
         for (index, entry) in state
             .notification_history
@@ -2998,19 +3184,24 @@ impl X11Platform {
             .take(cards)
             .enumerate()
         {
-            let top = (index as u16).saturating_mul(62);
+            let top = header_height.saturating_add((index as u16).saturating_mul(62));
             let card_rect = layout::MenuRect {
                 x: 4,
                 y: (top + 4) as i16,
                 width: width.saturating_sub(8),
                 height: 54,
             };
-            card_hits.push((entry.id, card_rect));
+            let dismiss_rect = notification_dismiss_rect(card_rect);
+            card_hits.push(NotificationCardHit {
+                id: entry.id,
+                card_rect,
+                dismiss_rect,
+            });
             let hovered = self
                 .notification_center
                 .as_ref()
                 .and_then(|center| center.hover)
-                == Some(entry.id);
+                .is_some_and(|hover| matches!(hover, NotificationCenterHover::Card(id) | NotificationCenterHover::Dismiss(id) if id == entry.id));
             self.conn
                 .change_gc(
                     backing.gc,
@@ -3043,21 +3234,27 @@ impl X11Platform {
                 &entry.app_name
             };
             self.text.draw_popup_utf8(
-                title,
+                &notification_card_line(title),
                 12,
                 i32::from(top) + 20,
                 BAR_STYLE.material.foreground,
             )?;
             self.text.draw_popup_utf8(
-                &single_line(&entry.summary),
+                &notification_card_line(&entry.summary),
                 12,
                 i32::from(top) + 38,
                 BAR_STYLE.material.foreground,
             )?;
             self.text.draw_popup_utf8(
-                &single_line(&entry.body),
+                &notification_card_line(&entry.body),
                 12,
                 i32::from(top) + 54,
+                BAR_STYLE.material.foreground,
+            )?;
+            self.text.draw_popup_utf8(
+                "×",
+                i32::from(dismiss_rect.x) + 5,
+                i32::from(dismiss_rect.y) + 16,
                 BAR_STYLE.material.foreground,
             )?;
             self.text.release_drawable(backing.pixmap);
@@ -3091,7 +3288,12 @@ impl X11Platform {
             .notification_center
             .as_ref()
             .and_then(|center| center.hover)
-            .filter(|id| card_hits.iter().any(|(candidate, _)| candidate == id));
+            .filter(|hover| match hover {
+                NotificationCenterHover::Card(id) | NotificationCenterHover::Dismiss(id) => {
+                    card_hits.iter().any(|hit| hit.id == *id)
+                }
+                NotificationCenterHover::ClearAll => clear_all_rect.is_some(),
+            });
         self.notification_center = Some(NotificationCenterWindow {
             window,
             output: output_id,
@@ -3099,6 +3301,7 @@ impl X11Platform {
             height,
             backing: Some(backing),
             card_hits,
+            clear_all_rect,
             hover,
             scroll,
             scroll_changed: false,
@@ -5264,6 +5467,20 @@ impl X11Platform {
             _ => return HitTarget::Outside,
         };
         if let Some(center) = &self.notification_center {
+            if notification_ui_trace_enabled() {
+                if let X11Event::ButtonPress {
+                    button,
+                    root_x,
+                    root_y,
+                    ..
+                } = event
+                {
+                    eprintln!(
+                        "notification-center ui-button: event={} center={} detail={} event_x={} event_y={} root_x={} root_y={}",
+                        window, center.window, button, x, y, root_x, root_y
+                    );
+                }
+            }
             if notification_scroll_trace_enabled() {
                 if let X11Event::ButtonPress { button, .. } = event {
                     eprintln!(
@@ -5278,17 +5495,53 @@ impl X11Platform {
             if center.window == window {
                 let local_x = x;
                 let local_y = y;
+                if notification_ui_trace_enabled() && matches!(event, X11Event::ButtonPress { .. })
+                {
+                    eprintln!(
+                        "notification-center ui-hit: point=({}, {}) clear_all_rect={:?} card_count={}",
+                        local_x, local_y, center.clear_all_rect, center.card_hits.len()
+                    );
+                }
+                if center.clear_all_rect.is_some_and(|rect| {
+                    local_x >= rect.x
+                        && local_x < rect.x + rect.width as i16
+                        && local_y >= rect.y
+                        && local_y < rect.y + rect.height as i16
+                }) {
+                    if notification_ui_trace_enabled() {
+                        eprintln!("notification-center ui-action: action=ClearAll");
+                    }
+                    return HitTarget::NotificationCenterClearAll;
+                }
                 return center
                     .card_hits
                     .iter()
-                    .find(|(_, rect)| {
-                        local_x >= rect.x
-                            && local_x < rect.x + rect.width as i16
-                            && local_y >= rect.y
-                            && local_y < rect.y + rect.height as i16
+                    .find_map(|hit| {
+                        let in_rect = |rect: layout::MenuRect| {
+                            local_x >= rect.x
+                                && local_x < rect.x + rect.width as i16
+                                && local_y >= rect.y
+                                && local_y < rect.y + rect.height as i16
+                        };
+                        if in_rect(hit.dismiss_rect) {
+                            if notification_ui_trace_enabled() {
+                                eprintln!("notification-center ui-hit: matched_card={} dismiss_contains=true", hit.id.0);
+                                eprintln!("notification-center ui-action: action=Dismiss({})", hit.id.0);
+                            }
+                            Some(HitTarget::NotificationCenterDismiss(hit.id))
+                        } else if in_rect(hit.card_rect) {
+                            Some(HitTarget::NotificationCenterCard(hit.id))
+                        } else {
+                            None
+                        }
                     })
-                    .map(|(id, _)| HitTarget::NotificationCenterCard(*id))
-                    .unwrap_or(HitTarget::NotificationCenterEmpty);
+                    .unwrap_or_else(|| {
+                        if notification_ui_trace_enabled() {
+                            eprintln!("notification-center ui-hit: matched_card=NONE dismiss_contains=false");
+                            eprintln!("notification-center ui-action: action=NONE");
+                        }
+                        HitTarget::NotificationCenterEmpty
+                    });
             }
         }
         if let Some((_bar, _, ox, oy, items, tray, network, audio, bluetooth)) =
@@ -5639,6 +5892,10 @@ fn single_line(text: &str) -> String {
         .collect()
 }
 
+fn notification_card_line(text: &str) -> String {
+    single_line(text).chars().take(34).collect()
+}
+
 fn is_xbar_owned_window(
     window: u32,
     root: u32,
@@ -5672,6 +5929,7 @@ mod tests {
     };
     use crate::ui::{
         layout::{MenuRect, PopupItemRect, PopupLayout},
+        style,
         view::TrayIconRenderMode,
         view::TrayVisualItem,
     };
@@ -6784,10 +7042,26 @@ mod tests {
     fn notification_hover_transitions_dirty_only_on_identity_change() {
         let a = crate::core::HistoryEntryId(1);
         let b = crate::core::HistoryEntryId(2);
-        assert!(notification_hover_transition(None, Some(a)).1);
-        assert!(!notification_hover_transition(Some(a), Some(a)).1);
-        assert!(notification_hover_transition(Some(a), Some(b)).1);
-        assert!(notification_hover_transition(Some(a), None).1);
+        assert!(
+            notification_hover_transition(None, Some(super::NotificationCenterHover::Card(a))).1
+        );
+        assert!(
+            !notification_hover_transition(
+                Some(super::NotificationCenterHover::Card(a)),
+                Some(super::NotificationCenterHover::Card(a))
+            )
+            .1
+        );
+        assert!(
+            notification_hover_transition(
+                Some(super::NotificationCenterHover::Card(a)),
+                Some(super::NotificationCenterHover::Card(b))
+            )
+            .1
+        );
+        assert!(
+            notification_hover_transition(Some(super::NotificationCenterHover::Card(a)), None).1
+        );
         assert!(!notification_hover_transition(None, None).1);
     }
 
@@ -6804,6 +7078,112 @@ mod tests {
         assert_eq!(cards[0].1, rect);
         let empty: Vec<(crate::core::HistoryEntryId, MenuRect)> = Vec::new();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn notification_dismiss_rect_is_inside_card() {
+        let card = MenuRect {
+            x: 4,
+            y: 32,
+            width: 352,
+            height: 54,
+        };
+        let dismiss = super::notification_dismiss_rect(card);
+        assert!(dismiss.x >= card.x);
+        assert!(dismiss.y >= card.y);
+        assert!(dismiss.x + dismiss.width as i16 <= card.x + card.width as i16);
+        assert!(dismiss.y + dismiss.height as i16 <= card.y + card.height as i16);
+    }
+
+    #[test]
+    fn notification_center_button_actions_require_explicit_controls() {
+        let id = crate::core::HistoryEntryId(9);
+        assert_eq!(
+            super::notification_center_button_action(1, &HitTarget::NotificationCenterDismiss(id)),
+            Some(super::NotificationCenterButtonAction::Dismiss(id))
+        );
+        assert_eq!(
+            super::notification_center_button_action(1, &HitTarget::NotificationCenterClearAll),
+            Some(super::NotificationCenterButtonAction::ClearAll)
+        );
+        assert_eq!(
+            super::notification_center_button_action(1, &HitTarget::NotificationCenterCard(id)),
+            None
+        );
+        assert_eq!(
+            super::notification_center_button_action(5, &HitTarget::NotificationCenterDismiss(id)),
+            None
+        );
+    }
+
+    #[test]
+    fn notification_header_control_only_exists_for_non_empty_history() {
+        assert_eq!(
+            super::notification_header_for_history(360, 48, true)
+                .expect("non-empty history has header control")
+                .width,
+            68
+        );
+        assert!(super::notification_header_for_history(360, 48, false).is_none());
+    }
+
+    #[test]
+    fn notification_header_control_text_is_inside_and_centered_by_popup_metrics() {
+        let rect = super::notification_header_rect(360, 64);
+        let metrics = style::FontMetrics {
+            ascent: 12,
+            descent: 4,
+        };
+        let baseline = super::notification_header_text_baseline(rect, metrics);
+
+        assert!(baseline - metrics.ascent >= rect.y);
+        assert!(baseline + metrics.descent <= rect.y + rect.height as i16);
+        assert_eq!(baseline, 18);
+        assert_eq!(
+            super::notification_header_text_origin(rect, baseline),
+            (280, 18)
+        );
+        assert_ne!(
+            super::NOTIFICATION_HEADER_CONTROL_BACKGROUND,
+            super::NOTIFICATION_HEADER_CONTROL_HOVER_BACKGROUND
+        );
+    }
+
+    #[test]
+    fn notification_header_control_fits_text_and_center_without_overlapping_title() {
+        let center_width = 360;
+        let text_width = 64;
+        let rect = super::notification_header_rect(center_width, text_width);
+        let title = MenuRect {
+            x: 12,
+            y: 4,
+            width: 144,
+            height: 20,
+        };
+
+        assert!(rect.x >= 0);
+        assert!(rect.x + rect.width as i16 <= center_width as i16);
+        assert!(rect.width >= text_width + super::NOTIFICATION_HEADER_CONTROL_PADDING);
+        assert!(title.x + title.width as i16 <= rect.x);
+
+        let narrow = super::notification_header_rect(80, text_width);
+        assert_eq!(narrow.x, 0);
+        assert_eq!(narrow.width, 80);
+        assert!(narrow.x + narrow.width as i16 <= 80);
+    }
+
+    #[test]
+    fn notification_header_reserves_space_before_first_card() {
+        let header_bottom = super::NOTIFICATION_HEADER_HEIGHT as i16;
+        let first_card = MenuRect {
+            x: 4,
+            y: (super::NOTIFICATION_HEADER_HEIGHT + 4) as i16,
+            width: 352,
+            height: 54,
+        };
+
+        assert!(first_card.y >= header_bottom);
+        assert_eq!(first_card.y - header_bottom, 4);
     }
 
     #[test]

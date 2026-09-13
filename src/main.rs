@@ -385,6 +385,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     Event::X11(platform::x11::X11Event::ButtonPress { button, .. }),
                     Some(
                         platform::x11::HitTarget::NotificationCenterCard(_)
+                        | platform::x11::HitTarget::NotificationCenterDismiss(_)
+                        | platform::x11::HitTarget::NotificationCenterClearAll
                         | platform::x11::HitTarget::NotificationCenterEmpty,
                     ),
                 ) if *button == 4 || *button == 5 => {
@@ -392,6 +394,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 _ => false,
             };
+            if let (
+                Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                Some(target),
+            ) = (&event, mouse_target.as_ref())
+            {
+                match platform::x11::notification_center_button_action(1, target) {
+                    Some(platform::x11::NotificationCenterButtonAction::Dismiss(id)) => {
+                        if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
+                            eprintln!("notification-center dismiss-request: history_id={} enqueue=attempt", id.0);
+                        }
+                        dbus.dismiss_notification_history_entry(id);
+                    }
+                    Some(platform::x11::NotificationCenterButtonAction::ClearAll) => {
+                        if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
+                            eprintln!("notification-center clear-request: enqueue=attempt");
+                        }
+                        dbus.clear_notification_history();
+                    }
+                    None => {}
+                }
+            }
             let popup_hover_changed = matches!(
                 event,
                 Event::X11(platform::x11::X11Event::MotionNotify { .. })
@@ -1604,7 +1627,12 @@ fn render_target_for(
         Event::X11(platform::x11::X11Event::ButtonPress { button: 4 | 5, .. })
             if matches!(
                 mouse_target,
-                Some(HitTarget::NotificationCenterCard(_) | HitTarget::NotificationCenterEmpty)
+                Some(
+                    HitTarget::NotificationCenterCard(_)
+                        | HitTarget::NotificationCenterDismiss(_)
+                        | HitTarget::NotificationCenterClearAll
+                        | HitTarget::NotificationCenterEmpty,
+                )
             ) =>
         {
             Some(RenderTarget::Notification)
@@ -1695,9 +1723,10 @@ fn hover_render_target_for(
         | Some(HitTarget::NetworkWifi(_))
         | Some(HitTarget::Network) => None,
         Some(HitTarget::NotificationCenter(_)) => None,
-        Some(HitTarget::NotificationCenterCard(_)) | Some(HitTarget::NotificationCenterEmpty) => {
-            None
-        }
+        Some(HitTarget::NotificationCenterCard(_))
+        | Some(HitTarget::NotificationCenterDismiss(_))
+        | Some(HitTarget::NotificationCenterClearAll)
+        | Some(HitTarget::NotificationCenterEmpty) => None,
     }
 }
 

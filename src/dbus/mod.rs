@@ -2170,6 +2170,12 @@ async fn run(
                     .lock()
                     .expect("notification store poisoned")
                     .dismiss_history_entry(id);
+                if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
+                    eprintln!(
+                        "notification-center dismiss-handle: history_id={} store_changed={}",
+                        id.0, changed
+                    );
+                }
                 if changed {
                     notifications::publish(
                         &notification_store,
@@ -2177,6 +2183,9 @@ async fn run(
                         &events,
                         &wake,
                     );
+                    if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
+                        eprintln!("notification-center dismiss-publish: published=true");
+                    }
                 }
             }
             Either::Request(Ok(Request::ClearNotificationHistory)) => {
@@ -2184,6 +2193,12 @@ async fn run(
                     .lock()
                     .expect("notification store poisoned")
                     .clear_history();
+                if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
+                    eprintln!(
+                        "notification-center clear-handle: store_changed={}",
+                        changed
+                    );
+                }
                 if changed {
                     notifications::publish(
                         &notification_store,
