@@ -312,6 +312,8 @@ pub struct NotificationHistoryEntry {
     pub summary: String,
     pub body: String,
     pub order: u64,
+    pub received_at: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

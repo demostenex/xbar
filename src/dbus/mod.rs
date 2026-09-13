@@ -9,6 +9,7 @@ use crate::core::{
 mod ai_usage;
 mod gmenu;
 mod menu;
+use crate::notification_persistence::{LoadResult, Persistence};
 use crate::notifications::{self, SharedStore, SharedTimer, REASON_CLOSED, REASON_EXPIRED};
 use async_channel::{Receiver, Sender};
 use futures_lite::StreamExt;
@@ -629,11 +630,28 @@ struct NotificationServer {
     events: EventQueue,
     wake: Arc<Mutex<UnixStream>>,
     sound: Option<crate::notification_sound::NotificationSoundSender>,
+    persistence: Arc<Mutex<Persistence>>,
 }
 
 impl NotificationServer {
     fn publish(&self) {
         notifications::publish(&self.store, &self.timer, &self.events, &self.wake);
+    }
+
+    fn persist_history(&self) {
+        let history = self
+            .store
+            .lock()
+            .expect("notification store poisoned")
+            .history_snapshot();
+        if let Err(error) = self
+            .persistence
+            .lock()
+            .expect("notification persistence poisoned")
+            .save(&history)
+        {
+            eprintln!("xbar: notification persistence save failed: {error}");
+        }
     }
 }
 
@@ -674,6 +692,7 @@ impl NotificationServer {
         if let Some(sound) = &self.sound {
             let _ = sound.try_decision(sound_decision);
         }
+        self.persist_history();
         self.publish();
         Ok(id.0)
     }
@@ -690,6 +709,7 @@ impl NotificationServer {
             .expect("notification store poisoned")
             .close(id)
         {
+            self.persist_history();
             self.publish();
             NotificationServer::notification_closed(&emitter, id.0, REASON_CLOSED)
                 .await
@@ -1598,7 +1618,21 @@ async fn run(
     notification_timer: SharedTimer,
 ) -> zbus::Result<()> {
     let wake = Arc::new(Mutex::new(writer));
-    let notification_store = Arc::new(Mutex::new(notifications::Store::default()));
+    let mut persistence = Persistence::from_environment();
+    let restored = persistence.load();
+    let restored_entries = match restored {
+        LoadResult::Disabled => Vec::new(),
+        LoadResult::Empty => Vec::new(),
+        LoadResult::Loaded(entries) => entries,
+        LoadResult::Invalid(error) => {
+            eprintln!("xbar: notification persistence ignored: {error}");
+            Vec::new()
+        }
+    };
+    let mut store = notifications::Store::default();
+    store.restore_pending(restored_entries);
+    let notification_store = Arc::new(Mutex::new(store));
+    let persistence = Arc::new(Mutex::new(persistence));
     let sound_bridge = crate::notification_sound::NotificationSoundBridge::spawn();
     let sound_sender = sound_bridge.as_ref().and_then(|bridge| bridge.sender());
     let mut builder = zbus::connection::Builder::session()?.serve_at(
@@ -1617,6 +1651,7 @@ async fn run(
             events: Arc::clone(&events),
             wake: Arc::clone(&wake),
             sound: sound_sender,
+            persistence: Arc::clone(&persistence),
         },
     )?;
     let connection = builder
@@ -1626,6 +1661,7 @@ async fn run(
         .replace_existing_names(false)
         .build()
         .await?;
+    notifications::publish(&notification_store, &notification_timer, &events, &wake);
     let dbus = zbus::fdo::DBusProxy::new(&connection).await?;
     let mut owner_changes = dbus.receive_name_owner_changed().await?;
     let mut sni_owner = dbus
@@ -2177,6 +2213,17 @@ async fn run(
                     );
                 }
                 if changed {
+                    let history = notification_store
+                        .lock()
+                        .expect("notification store poisoned")
+                        .history_snapshot();
+                    if let Err(error) = persistence
+                        .lock()
+                        .expect("notification persistence poisoned")
+                        .save(&history)
+                    {
+                        eprintln!("xbar: notification persistence save failed: {error}");
+                    }
                     notifications::publish(
                         &notification_store,
                         &notification_timer,
@@ -2200,6 +2247,17 @@ async fn run(
                     );
                 }
                 if changed {
+                    let history = notification_store
+                        .lock()
+                        .expect("notification store poisoned")
+                        .history_snapshot();
+                    if let Err(error) = persistence
+                        .lock()
+                        .expect("notification persistence poisoned")
+                        .save(&history)
+                    {
+                        eprintln!("xbar: notification persistence save failed: {error}");
+                    }
                     notifications::publish(
                         &notification_store,
                         &notification_timer,

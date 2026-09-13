@@ -7253,6 +7253,8 @@ mod tests {
                 summary: String::new(),
                 body: String::new(),
                 order: order as u64,
+                received_at: 0,
+                updated_at: 0,
             })
             .collect()
     }

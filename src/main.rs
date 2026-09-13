@@ -4,6 +4,7 @@ mod core;
 mod dbus;
 mod i3;
 mod logging;
+mod notification_persistence;
 mod notification_sound;
 mod notifications;
 mod platform;
