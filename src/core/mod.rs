@@ -18,9 +18,10 @@ pub use state::{
     HistoryEntryId, KeyboardGrabState, LazyRootOpenPending, MenuNavigationSession,
     MenuPresentation, MenuPresentationPolicy, MenuState, NetworkAccessPoint, NetworkConnectivity,
     NetworkLinkKind, NetworkPendingAction, NetworkState, NetworkStatus, NetworkWifiTarget,
-    Notification, NotificationHistoryEntry, NotificationId, NotificationSource, OutputId,
-    OutputState, PluginId, PluginStatus, PluginSummary, State, UsageMeter, UsageStatus,
-    UsageSummary, UsageValue, WifiDevice, WindowId, WorkspaceState,
+    Notification, NotificationActionProjection, NotificationActionView, NotificationHistoryEntry,
+    NotificationId, NotificationSource, OutputId, OutputState, PluginId, PluginStatus,
+    PluginSummary, State, UsageMeter, UsageStatus, UsageSummary, UsageValue, WifiDevice, WindowId,
+    WorkspaceState,
 };
 pub use status_notifier::{
     parse_notifier_item_id, StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierIcon,

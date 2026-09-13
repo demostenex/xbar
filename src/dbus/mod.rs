@@ -10,9 +10,7 @@ mod ai_usage;
 mod gmenu;
 mod menu;
 use crate::notification_persistence::{LoadResult, Persistence};
-use crate::notifications::{
-    self, SharedStore, SharedTimer, REASON_CLOSED, REASON_DISMISSED, REASON_EXPIRED,
-};
+use crate::notifications::{self, SharedStore, SharedTimer, REASON_CLOSED, REASON_EXPIRED};
 use async_channel::{Receiver, Sender};
 use futures_lite::StreamExt;
 use std::collections::hash_map::Entry;
@@ -205,6 +203,8 @@ enum Request {
     ClearNotificationHistory,
     #[allow(dead_code)]
     InvokeNotificationDefault(HistoryEntryId),
+    #[allow(dead_code)]
+    InvokeNotificationAction(HistoryEntryId, String),
     WindowAttention {
         window: crate::core::WindowId,
         app_name: String,
@@ -474,6 +474,13 @@ impl DbusBridge {
             .try_send(Request::InvokeNotificationDefault(id));
     }
 
+    #[allow(dead_code)]
+    pub fn invoke_notification_action(&self, id: HistoryEntryId, action_key: String) {
+        let _ = self
+            .requests
+            .try_send(Request::InvokeNotificationAction(id, action_key));
+    }
+
     pub fn window_attention(
         &self,
         window: crate::core::WindowId,
@@ -666,10 +673,14 @@ impl NotificationServer {
     }
 }
 
+fn notification_capabilities() -> Vec<String> {
+    vec!["body".into(), "actions".into()]
+}
+
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl NotificationServer {
     async fn get_capabilities(&self) -> Vec<String> {
-        vec!["body".into()]
+        notification_capabilities()
     }
 
     async fn get_server_information(&self) -> (String, String, String, String) {
@@ -1637,6 +1648,54 @@ async fn watch_bluetooth(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_notification_action(
+    connection: &zbus::Connection,
+    notification_store: &SharedStore,
+    notification_timer: &SharedTimer,
+    events: &EventQueue,
+    wake: &Arc<Mutex<UnixStream>>,
+    persistence: &Arc<Mutex<Persistence>>,
+    history_id: HistoryEntryId,
+    action_key: String,
+) -> zbus::Result<()> {
+    let invocation = notification_store
+        .lock()
+        .expect("notification store poisoned")
+        .invoke_action(history_id, &action_key);
+    let Some(invocation) = invocation else {
+        return Ok(());
+    };
+    let effects = notifications::action_protocol_effects(&invocation);
+    let emitter = zbus::object_server::SignalEmitter::new(connection, NOTIFICATIONS_PATH)?;
+    let notifications::ActionProtocolEffect::ActionInvoked {
+        notification_id,
+        action_key,
+    } = &effects[0]
+    else {
+        unreachable!("action protocol plan always starts with ActionInvoked");
+    };
+    NotificationServer::action_invoked(&emitter, notification_id.0, action_key).await?;
+    if let Some(notifications::ActionProtocolEffect::NotificationClosed { reason, .. }) =
+        effects.get(1)
+    {
+        let history = notification_store
+            .lock()
+            .expect("notification store poisoned")
+            .history_snapshot();
+        if let Err(error) = persistence
+            .lock()
+            .expect("notification persistence poisoned")
+            .save(&history)
+        {
+            eprintln!("xbar: notification persistence save failed: {error}");
+        }
+        notifications::publish(notification_store, notification_timer, events, wake);
+        NotificationServer::notification_closed(&emitter, notification_id.0, *reason).await?;
+    }
+    Ok(())
+}
+
 async fn run(
     events: EventQueue,
     writer: UnixStream,
@@ -2295,46 +2354,30 @@ async fn run(
                 }
             }
             Either::Request(Ok(Request::InvokeNotificationDefault(history_id))) => {
-                let invocation = notification_store
-                    .lock()
-                    .expect("notification store poisoned")
-                    .invoke_default_action(history_id);
-                let Some(invocation) = invocation else {
-                    continue;
-                };
-                let emitter =
-                    zbus::object_server::SignalEmitter::new(&connection, NOTIFICATIONS_PATH)?;
-                NotificationServer::action_invoked(
-                    &emitter,
-                    invocation.notification_id.0,
-                    &invocation.action_key,
+                handle_notification_action(
+                    &connection,
+                    &notification_store,
+                    &notification_timer,
+                    &events,
+                    &wake,
+                    &persistence,
+                    history_id,
+                    "default".into(),
                 )
                 .await?;
-                if invocation.close_reason == Some(REASON_DISMISSED) {
-                    let history = notification_store
-                        .lock()
-                        .expect("notification store poisoned")
-                        .history_snapshot();
-                    if let Err(error) = persistence
-                        .lock()
-                        .expect("notification persistence poisoned")
-                        .save(&history)
-                    {
-                        eprintln!("xbar: notification persistence save failed: {error}");
-                    }
-                    notifications::publish(
-                        &notification_store,
-                        &notification_timer,
-                        &events,
-                        &wake,
-                    );
-                    NotificationServer::notification_closed(
-                        &emitter,
-                        invocation.notification_id.0,
-                        REASON_DISMISSED,
-                    )
-                    .await?;
-                }
+            }
+            Either::Request(Ok(Request::InvokeNotificationAction(history_id, action_key))) => {
+                handle_notification_action(
+                    &connection,
+                    &notification_store,
+                    &notification_timer,
+                    &events,
+                    &wake,
+                    &persistence,
+                    history_id,
+                    action_key,
+                )
+                .await?;
             }
             Either::Request(Ok(Request::NotificationTimerFired)) => {
                 let ids =
@@ -2856,11 +2899,19 @@ mod ai_usage_bridge_tests {
 
 #[cfg(test)]
 mod status_notifier_tests {
-    use super::{choose_sni_icon, select_pixmap};
+    use super::{choose_sni_icon, notification_capabilities, select_pixmap};
     use crate::core::status_notifier::format_notifier_item_id;
     use crate::core::{
         parse_notifier_item_id, StatusNotifierEndpoint, StatusNotifierIcon, StatusNotifierStatus,
     };
+
+    #[test]
+    fn notification_capabilities_advertise_actions_without_action_icons() {
+        assert_eq!(notification_capabilities(), ["body", "actions"]);
+        assert!(!notification_capabilities()
+            .iter()
+            .any(|capability| capability == "action-icons"));
+    }
 
     #[test]
     fn registration_forms_resolve_to_service_and_path() {

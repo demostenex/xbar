@@ -1,6 +1,6 @@
 use crate::core::{
-    Event, HistoryEntryId, Notification, NotificationHistoryEntry, NotificationId,
-    NotificationSource, WindowId,
+    Event, HistoryEntryId, Notification, NotificationActionProjection, NotificationActionView,
+    NotificationHistoryEntry, NotificationId, NotificationSource, WindowId,
 };
 use std::collections::BTreeMap;
 use std::io;
@@ -62,6 +62,32 @@ pub struct ActionInvocation {
     pub action_key: String,
     pub close_reason: Option<u32>,
     pub pending_changed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActionProtocolEffect {
+    ActionInvoked {
+        notification_id: NotificationId,
+        action_key: String,
+    },
+    NotificationClosed {
+        notification_id: NotificationId,
+        reason: u32,
+    },
+}
+
+pub fn action_protocol_effects(invocation: &ActionInvocation) -> Vec<ActionProtocolEffect> {
+    let mut effects = vec![ActionProtocolEffect::ActionInvoked {
+        notification_id: invocation.notification_id,
+        action_key: invocation.action_key.clone(),
+    }];
+    if let Some(reason) = invocation.close_reason {
+        effects.push(ActionProtocolEffect::NotificationClosed {
+            notification_id: invocation.notification_id,
+            reason,
+        });
+    }
+    effects
 }
 
 pub fn parse_notification_actions(values: Vec<String>) -> Vec<NotificationAction> {
@@ -410,14 +436,23 @@ impl Store {
             .unwrap_or(0);
     }
 
+    #[allow(dead_code)]
     pub fn invoke_default_action(
         &mut self,
         history_id: HistoryEntryId,
     ) -> Option<ActionInvocation> {
+        self.invoke_action(history_id, "default")
+    }
+
+    pub fn invoke_action(
+        &mut self,
+        history_id: HistoryEntryId,
+        action_key: &str,
+    ) -> Option<ActionInvocation> {
         let entry = self.history.iter().find(|entry| entry.id == history_id)?;
         let notification_id = entry.live_notification_id?;
         let record = self.records.get(&notification_id)?;
-        if !record.actions.iter().any(|action| action.key == "default") {
+        if !record.actions.iter().any(|action| action.key == action_key) {
             return None;
         }
         let resident = record.resident;
@@ -427,7 +462,7 @@ impl Store {
         }
         Some(ActionInvocation {
             notification_id,
-            action_key: "default".into(),
+            action_key: action_key.into(),
             close_reason: (!resident).then_some(REASON_DISMISSED),
             pending_changed: !resident,
         })
@@ -496,6 +531,27 @@ impl Store {
 
     pub fn history_snapshot(&self) -> Vec<NotificationHistoryEntry> {
         self.history.clone()
+    }
+
+    pub fn action_projection_snapshot(&self) -> Vec<NotificationActionProjection> {
+        self.history
+            .iter()
+            .filter_map(|entry| {
+                let notification_id = entry.live_notification_id?;
+                let record = self.records.get(&notification_id)?;
+                Some(NotificationActionProjection {
+                    history_id: entry.id,
+                    actions: record
+                        .actions
+                        .iter()
+                        .map(|action| NotificationActionView {
+                            key: action.key.clone(),
+                            label: action.label.clone(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -610,9 +666,13 @@ pub fn publish(
         .lock()
         .expect("notification timer poisoned")
         .rearm(deadline);
-    let (snapshot, history) = {
+    let (snapshot, history, action_projections) = {
         let store = store.lock().expect("notification store poisoned");
-        (store.snapshot(), store.history_snapshot())
+        (
+            store.snapshot(),
+            store.history_snapshot(),
+            store.action_projection_snapshot(),
+        )
     };
     crate::dbus::push_event(
         events,
@@ -620,6 +680,7 @@ pub fn publish(
         Event::NotificationsState {
             active: snapshot,
             history,
+            action_projections,
         },
     );
 }
@@ -643,9 +704,13 @@ pub fn expire(
         .lock()
         .expect("notification timer poisoned")
         .rearm(deadline);
-    let (snapshot, history) = {
+    let (snapshot, history, action_projections) = {
         let store = store.lock().expect("notification store poisoned");
-        (store.snapshot(), store.history_snapshot())
+        (
+            store.snapshot(),
+            store.history_snapshot(),
+            store.action_projection_snapshot(),
+        )
     };
     crate::dbus::push_event(
         events,
@@ -653,6 +718,7 @@ pub fn expire(
         Event::NotificationsState {
             active: snapshot,
             history,
+            action_projections,
         },
     );
     ids
@@ -1045,6 +1111,199 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn generic_action_invocation_uses_key_and_projects_only_live_pending_actions() {
+        let mut store = Store::default();
+        let id = store
+            .notify_with_disposition_at_with_actions(
+                0,
+                "app".into(),
+                "one".into(),
+                String::new(),
+                0,
+                100,
+                vec![NotificationAction {
+                    key: "reply".into(),
+                    label: "Responder".into(),
+                }],
+                true,
+            )
+            .0;
+        let history_id = store.history[0].id;
+        assert_eq!(
+            store.action_projection_snapshot()[0].actions,
+            vec![NotificationActionView {
+                key: "reply".into(),
+                label: "Responder".into(),
+            }]
+        );
+        let invocation = store
+            .invoke_action(history_id, "reply")
+            .expect("explicit action should resolve");
+        assert_eq!(invocation.notification_id, id);
+        assert_eq!(invocation.action_key, "reply");
+        assert!(!invocation.pending_changed);
+        assert!(store.invoke_action(history_id, "Responder").is_none());
+        assert_eq!(store.history.len(), 1);
+
+        let mut expired = Store::default();
+        let id = expired
+            .notify_with_disposition_at_with_actions(
+                0,
+                "app".into(),
+                "one".into(),
+                String::new(),
+                1,
+                100,
+                vec![NotificationAction {
+                    key: "reply".into(),
+                    label: "Responder".into(),
+                }],
+                true,
+            )
+            .0;
+        let expired_history = expired.history[0].id;
+        expired.expired(Instant::now() + Duration::from_secs(1));
+        assert!(expired.action_projection_snapshot().is_empty());
+        assert!(expired.invoke_action(expired_history, "reply").is_none());
+        assert!(expired.records.is_empty());
+        assert_ne!(id, NotificationId(0));
+
+        let mut restored = Store::default();
+        restored.restore_pending(vec![NotificationHistoryEntry {
+            id: HistoryEntryId(9),
+            live_notification_id: None,
+            source: NotificationSource::Freedesktop,
+            app_name: "app".into(),
+            summary: "restored".into(),
+            body: String::new(),
+            order: 1,
+            received_at: 1,
+            updated_at: 1,
+        }]);
+        assert!(restored.action_projection_snapshot().is_empty());
+    }
+
+    #[test]
+    fn explicit_action_effects_cover_resident_nonresident_and_stale_replacement() {
+        let mut non_resident = Store::default();
+        let id = non_resident
+            .notify_with_disposition_at_with_actions(
+                0,
+                "app".into(),
+                "one".into(),
+                String::new(),
+                0,
+                100,
+                vec![NotificationAction {
+                    key: "reply".into(),
+                    label: "Reply".into(),
+                }],
+                false,
+            )
+            .0;
+        let history_id = non_resident.history[0].id;
+        let invocation = non_resident
+            .invoke_action(history_id, "reply")
+            .expect("explicit non-resident action should resolve");
+        assert_eq!(
+            action_protocol_effects(&invocation),
+            vec![
+                ActionProtocolEffect::ActionInvoked {
+                    notification_id: id,
+                    action_key: "reply".into(),
+                },
+                ActionProtocolEffect::NotificationClosed {
+                    notification_id: id,
+                    reason: REASON_DISMISSED,
+                },
+            ]
+        );
+        assert!(non_resident.records.is_empty());
+        assert!(non_resident.history.is_empty());
+
+        let mut resident = Store::default();
+        let id = resident
+            .notify_with_disposition_at_with_actions(
+                0,
+                "app".into(),
+                "one".into(),
+                String::new(),
+                0,
+                100,
+                vec![NotificationAction {
+                    key: "reply".into(),
+                    label: "Reply".into(),
+                }],
+                true,
+            )
+            .0;
+        let history_id = resident.history[0].id;
+        let timestamps = (
+            resident.history[0].received_at,
+            resident.history[0].updated_at,
+        );
+        let invocation = resident
+            .invoke_action(history_id, "reply")
+            .expect("explicit resident action should resolve");
+        assert_eq!(
+            action_protocol_effects(&invocation),
+            vec![ActionProtocolEffect::ActionInvoked {
+                notification_id: id,
+                action_key: "reply".into(),
+            }]
+        );
+        assert!(resident.records.contains_key(&id));
+        assert_eq!(resident.history[0].id, history_id);
+        assert_eq!(
+            (
+                resident.history[0].received_at,
+                resident.history[0].updated_at
+            ),
+            timestamps
+        );
+        assert!(resident.invoke_action(history_id, "reply").is_some());
+
+        let mut stale = Store::default();
+        let id = stale
+            .notify_with_disposition_at_with_actions(
+                0,
+                "app".into(),
+                "one".into(),
+                String::new(),
+                0,
+                100,
+                vec![
+                    NotificationAction {
+                        key: "reply".into(),
+                        label: "Reply".into(),
+                    },
+                    NotificationAction {
+                        key: "archive".into(),
+                        label: "Archive".into(),
+                    },
+                ],
+                true,
+            )
+            .0;
+        let history_id = stale.history[0].id;
+        stale.notify_with_disposition_at_with_actions(
+            id.0,
+            "app".into(),
+            "replacement".into(),
+            String::new(),
+            0,
+            200,
+            vec![NotificationAction {
+                key: "archive".into(),
+                label: "Archive".into(),
+            }],
+            true,
+        );
+        assert!(stale.invoke_action(history_id, "reply").is_none());
+        assert!(stale.invoke_action(history_id, "archive").is_some());
     }
 
     #[test]

@@ -180,6 +180,7 @@ pub enum Event {
     NotificationsState {
         active: Vec<super::Notification>,
         history: Vec<super::NotificationHistoryEntry>,
+        action_projections: Vec<super::state::NotificationActionProjection>,
     },
     #[allow(dead_code)]
     ToggleNotificationCenter(super::OutputId),

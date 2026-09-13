@@ -387,6 +387,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     Some(
                         platform::x11::HitTarget::NotificationCenterCard(_)
                         | platform::x11::HitTarget::NotificationCenterDismiss(_)
+                        | platform::x11::HitTarget::NotificationCenterAction(_, _)
+                        | platform::x11::HitTarget::NotificationCenterActionPagePrev(_)
+                        | platform::x11::HitTarget::NotificationCenterActionPageNext(_)
                         | platform::x11::HitTarget::NotificationCenterClearAll
                         | platform::x11::HitTarget::NotificationCenterEmpty,
                     ),
@@ -400,29 +403,53 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Some(target),
             ) = (&event, mouse_target.as_ref())
             {
-                match platform::x11::notification_center_button_action(1, target) {
-                    Some(platform::x11::NotificationCenterButtonAction::Dismiss(id)) => {
-                        if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
-                            eprintln!("notification-center dismiss-request: history_id={} enqueue=attempt", id.0);
+                let notification_action_page_changed =
+                    match platform::x11::notification_center_button_action(1, target) {
+                        Some(platform::x11::NotificationCenterButtonAction::Dismiss(id)) => {
+                            if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
+                                eprintln!("notification-center dismiss-request: history_id={} enqueue=attempt", id.0);
+                            }
+                            dbus.dismiss_notification_history_entry(id);
+                            false
                         }
-                        dbus.dismiss_notification_history_entry(id);
-                    }
-                    Some(platform::x11::NotificationCenterButtonAction::ClearAll) => {
-                        if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
-                            eprintln!("notification-center clear-request: enqueue=attempt");
+                        Some(platform::x11::NotificationCenterButtonAction::ClearAll) => {
+                            if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
+                                eprintln!("notification-center clear-request: enqueue=attempt");
+                            }
+                            dbus.clear_notification_history();
+                            false
                         }
-                        dbus.clear_notification_history();
-                    }
-                    Some(platform::x11::NotificationCenterButtonAction::InvokeDefault(id)) => {
-                        if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
-                            eprintln!(
+                        Some(platform::x11::NotificationCenterButtonAction::InvokeDefault(id)) => {
+                            if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
+                                eprintln!(
                                 "notification-center default-action-request: history_id={} enqueue=attempt",
                                 id.0
                             );
+                            }
+                            dbus.invoke_notification_default(id);
+                            false
                         }
-                        dbus.invoke_notification_default(id);
-                    }
-                    None => {}
+                        Some(platform::x11::NotificationCenterButtonAction::InvokeAction(
+                            id,
+                            key,
+                        )) => {
+                            dbus.invoke_notification_action(id, key);
+                            false
+                        }
+                        Some(platform::x11::NotificationCenterButtonAction::ActionPagePrev(id)) => {
+                            x11.previous_notification_action_page(id)
+                        }
+                        Some(platform::x11::NotificationCenterButtonAction::ActionPageNext(id)) => {
+                            x11.next_notification_action_page(id)
+                        }
+                        None => false,
+                    };
+                if notification_action_page_changed {
+                    dirty = true;
+                    render_target = merge_render_target(
+                        render_target,
+                        notification_action_page_render_target(true),
+                    );
                 }
             }
             let popup_hover_changed = matches!(
@@ -1735,6 +1762,9 @@ fn hover_render_target_for(
         Some(HitTarget::NotificationCenter(_)) => None,
         Some(HitTarget::NotificationCenterCard(_))
         | Some(HitTarget::NotificationCenterDismiss(_))
+        | Some(HitTarget::NotificationCenterAction(_, _))
+        | Some(HitTarget::NotificationCenterActionPagePrev(_))
+        | Some(HitTarget::NotificationCenterActionPageNext(_))
         | Some(HitTarget::NotificationCenterClearAll)
         | Some(HitTarget::NotificationCenterEmpty) => None,
     }
@@ -1771,6 +1801,10 @@ fn render_target_for_changes(
     let semantic_target = reduced.then_some(semantic_target).flatten();
     let popup_hover_target = popup_hover_changed.then_some(RenderTarget::Popup);
     merge_render_target(semantic_target, popup_hover_target)
+}
+
+fn notification_action_page_render_target(changed: bool) -> Option<RenderTarget> {
+    changed.then_some(RenderTarget::Notification)
 }
 
 fn tray_action_event(
@@ -1862,8 +1896,9 @@ fn keyboard_event(
 #[cfg(test)]
 mod scheduler_tests {
     use super::{
-        hover_render_target_for, merge_render_target, pending_lazy_root_to_schedule,
-        promote_menu_popup_target, render_target_for_changes, should_schedule_invalidation,
+        hover_render_target_for, merge_render_target, notification_action_page_render_target,
+        pending_lazy_root_to_schedule, promote_menu_popup_target, render_target_for_changes,
+        should_schedule_invalidation,
     };
     use crate::core::{LazyRootOpenPending, MenuEndpoint, MenuItemId, MenuSource, WindowId};
     use crate::platform::x11::{HitTarget, RenderTarget};
@@ -1926,6 +1961,15 @@ mod scheduler_tests {
             pending_lazy_root_to_schedule(Some(&before), Some(&after)),
             None
         );
+    }
+
+    #[test]
+    fn changed_notification_action_page_requests_notification_render() {
+        assert_eq!(
+            notification_action_page_render_target(true),
+            Some(RenderTarget::Notification)
+        );
+        assert_eq!(notification_action_page_render_target(false), None);
     }
 
     #[test]

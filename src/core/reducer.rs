@@ -1690,11 +1690,18 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 true
             }
         }
-        Event::NotificationsState { active, history } => {
-            let changed = state.notifications != active || state.notification_history != history;
+        Event::NotificationsState {
+            active,
+            history,
+            action_projections,
+        } => {
+            let changed = state.notifications != active
+                || state.notification_history != history
+                || state.notification_action_projections != action_projections;
             if changed {
                 state.notifications = active;
                 state.notification_history = history;
+                state.notification_action_projections = action_projections;
             }
             changed
         }

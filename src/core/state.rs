@@ -304,6 +304,18 @@ pub struct Notification {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotificationActionView {
+    pub key: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotificationActionProjection {
+    pub history_id: HistoryEntryId,
+    pub actions: Vec<NotificationActionView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NotificationHistoryEntry {
     pub id: HistoryEntryId,
     pub live_notification_id: Option<NotificationId>,
@@ -445,6 +457,7 @@ pub struct State {
     pub audio_popup_open: bool,
     pub notifications: Vec<Notification>,
     pub notification_history: Vec<NotificationHistoryEntry>,
+    pub notification_action_projections: Vec<NotificationActionProjection>,
     pub notification_center_open: Option<OutputId>,
     pub audio_dragging: bool,
     pub audio_drag_input: bool,

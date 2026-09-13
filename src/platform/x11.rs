@@ -1,6 +1,6 @@
 use crate::core::{
-    GtkMenuEndpoint, MenuItemId, NetworkWifiTarget, OutputId, OutputState, State,
-    StatusNotifierEndpoint, WindowId,
+    GtkMenuEndpoint, MenuItemId, NetworkWifiTarget, NotificationActionProjection,
+    NotificationActionView, OutputId, OutputState, State, StatusNotifierEndpoint, WindowId,
 };
 use crate::ui::style::{self, TextMeasurer, BAR_STYLE, POPUP_STYLE};
 use crate::ui::{layout, view};
@@ -586,28 +586,45 @@ struct NotificationCenterWindow {
     clear_all_rect: Option<layout::MenuRect>,
     hover: Option<NotificationCenterHover>,
     scroll: usize,
+    action_pages: HashMap<crate::core::HistoryEntryId, usize>,
     scroll_changed: bool,
     dirty: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+struct NotificationActionHit {
+    key: String,
+    label: String,
+    rect: layout::MenuRect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct NotificationCardHit {
     id: crate::core::HistoryEntryId,
     card_rect: layout::MenuRect,
-    dismiss_rect: layout::MenuRect,
+    dismiss_rect: Option<layout::MenuRect>,
+    action_rects: Vec<NotificationActionHit>,
+    pager_prev_rect: Option<layout::MenuRect>,
+    pager_next_rect: Option<layout::MenuRect>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum NotificationCenterHover {
     Card(crate::core::HistoryEntryId),
     Dismiss(crate::core::HistoryEntryId),
+    Action(crate::core::HistoryEntryId, String),
+    ActionPagePrev(crate::core::HistoryEntryId),
+    ActionPageNext(crate::core::HistoryEntryId),
     ClearAll,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NotificationCenterButtonAction {
     Dismiss(crate::core::HistoryEntryId),
     ClearAll,
+    InvokeAction(crate::core::HistoryEntryId, String),
+    ActionPagePrev(crate::core::HistoryEntryId),
+    ActionPageNext(crate::core::HistoryEntryId),
     InvokeDefault(crate::core::HistoryEntryId),
 }
 
@@ -623,6 +640,15 @@ pub fn notification_center_button_action(
             Some(NotificationCenterButtonAction::Dismiss(*id))
         }
         HitTarget::NotificationCenterClearAll => Some(NotificationCenterButtonAction::ClearAll),
+        HitTarget::NotificationCenterAction(id, key) => Some(
+            NotificationCenterButtonAction::InvokeAction(*id, key.clone()),
+        ),
+        HitTarget::NotificationCenterActionPagePrev(id) => {
+            Some(NotificationCenterButtonAction::ActionPagePrev(*id))
+        }
+        HitTarget::NotificationCenterActionPageNext(id) => {
+            Some(NotificationCenterButtonAction::ActionPageNext(*id))
+        }
         HitTarget::NotificationCenterCard(id) => {
             Some(NotificationCenterButtonAction::InvokeDefault(*id))
         }
@@ -636,6 +662,345 @@ const NOTIFICATION_HEADER_CONTROL_PADDING: u16 = 16;
 const NOTIFICATION_HEADER_RIGHT_MARGIN: u16 = 8;
 const NOTIFICATION_HEADER_CONTROL_BACKGROUND: u32 = 0x2b3340;
 const NOTIFICATION_HEADER_CONTROL_HOVER_BACKGROUND: u32 = 0x354052;
+const NOTIFICATION_BASE_CARD_HEIGHT: u16 = 54;
+const NOTIFICATION_CARD_SLOT_GAP: u16 = 8;
+const NOTIFICATION_ACTION_HEIGHT: u16 = 24;
+const NOTIFICATION_ACTION_PADDING: u16 = 16;
+const NOTIFICATION_ACTION_GAP: u16 = 4;
+const NOTIFICATION_ACTION_ROW_GAP: u16 = 4;
+const NOTIFICATION_ACTION_TOP_GAP: u16 = 4;
+const NOTIFICATION_ACTION_BOTTOM_GAP: u16 = 4;
+const NOTIFICATION_ACTION_PAGER_WIDTH: u16 = 20;
+
+#[derive(Clone, Debug, PartialEq)]
+struct NotificationActionLayout {
+    key: String,
+    label: String,
+    width: u16,
+    row: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NotificationEntryLayout {
+    id: crate::core::HistoryEntryId,
+    card_height: u16,
+    slot_extent: u16,
+    actions: Vec<NotificationActionLayout>,
+    page: usize,
+    page_count: usize,
+    compact: bool,
+}
+
+fn explicit_action_views(actions: &[NotificationActionView]) -> Vec<NotificationActionView> {
+    let mut seen = HashSet::new();
+    actions
+        .iter()
+        .filter(|action| action.key != "default" && seen.insert(action.key.clone()))
+        .cloned()
+        .collect()
+}
+
+fn pack_action_rows(
+    actions: &[NotificationActionView],
+    measured_widths: &[u16],
+    available_width: u16,
+) -> Vec<NotificationActionLayout> {
+    let mut row = 0;
+    let mut row_width = 0_u16;
+    actions
+        .iter()
+        .zip(measured_widths.iter().copied())
+        .map(|(action, measured_width)| {
+            let width = measured_width
+                .saturating_add(NOTIFICATION_ACTION_PADDING)
+                .min(available_width.max(1));
+            if row_width > 0
+                && row_width
+                    .saturating_add(NOTIFICATION_ACTION_GAP)
+                    .saturating_add(width)
+                    > available_width
+            {
+                row += 1;
+                row_width = 0;
+            }
+            if row_width > 0 {
+                row_width = row_width.saturating_add(NOTIFICATION_ACTION_GAP);
+            }
+            row_width = row_width.saturating_add(width);
+            NotificationActionLayout {
+                key: action.key.clone(),
+                label: action.label.clone(),
+                width,
+                row,
+            }
+        })
+        .collect()
+}
+
+fn action_row_count(actions: &[NotificationActionLayout]) -> usize {
+    actions.last().map_or(0, |action| action.row + 1)
+}
+
+fn fit_action_label(label: &str, max_width: u16, measure: impl Fn(&str) -> u16) -> String {
+    if measure(label) <= max_width {
+        return label.to_owned();
+    }
+    let mut fitted = String::new();
+    for character in label.chars() {
+        let mut candidate = fitted.clone();
+        candidate.push(character);
+        if measure(&candidate) > max_width {
+            break;
+        }
+        fitted = candidate;
+    }
+    fitted
+}
+
+fn normal_action_card_height(action_rows: usize) -> u16 {
+    if action_rows == 0 {
+        NOTIFICATION_BASE_CARD_HEIGHT
+    } else {
+        NOTIFICATION_BASE_CARD_HEIGHT
+            .saturating_add(NOTIFICATION_ACTION_TOP_GAP)
+            .saturating_add((action_rows as u16).saturating_mul(NOTIFICATION_ACTION_HEIGHT))
+            .saturating_add(
+                (action_rows.saturating_sub(1) as u16).saturating_mul(NOTIFICATION_ACTION_ROW_GAP),
+            )
+            .saturating_add(NOTIFICATION_ACTION_BOTTOM_GAP)
+    }
+}
+
+fn action_pages(
+    actions: &[NotificationActionView],
+    measured_widths: &[u16],
+    available_width: u16,
+    max_rows: usize,
+) -> Vec<Vec<NotificationActionView>> {
+    if actions.is_empty() {
+        return Vec::new();
+    }
+    let max_rows = max_rows.max(1);
+    let mut pages = Vec::new();
+    let mut page = Vec::new();
+    for (action, width) in actions.iter().cloned().zip(measured_widths.iter().copied()) {
+        let mut candidate = page.clone();
+        candidate.push(action.clone());
+        let candidate_widths = candidate
+            .iter()
+            .map(|item| {
+                actions
+                    .iter()
+                    .position(|original| original.key == item.key && original.label == item.label)
+                    .and_then(|index| measured_widths.get(index).copied())
+                    .unwrap_or(width)
+            })
+            .collect::<Vec<_>>();
+        if !page.is_empty()
+            && action_row_count(&pack_action_rows(
+                &candidate,
+                &candidate_widths,
+                available_width,
+            )) > max_rows
+        {
+            pages.push(page);
+            page = vec![action];
+        } else {
+            page = candidate;
+        }
+    }
+    if !page.is_empty() {
+        pages.push(page);
+    }
+    pages
+}
+
+fn compact_action_pages(actions: &[NotificationActionView]) -> Vec<Vec<NotificationActionView>> {
+    actions.iter().cloned().map(|action| vec![action]).collect()
+}
+
+fn notification_entry_layout(
+    id: crate::core::HistoryEntryId,
+    actions: &[NotificationActionView],
+    measured_widths: &[u16],
+    card_width: u16,
+    viewport_height: u16,
+    requested_page: usize,
+) -> NotificationEntryLayout {
+    let available_width = card_width.saturating_sub(24);
+    let explicit = explicit_action_views(actions);
+    let explicit_widths = explicit
+        .iter()
+        .map(|action| {
+            actions
+                .iter()
+                .position(|original| original.key == action.key && original.label == action.label)
+                .and_then(|index| measured_widths.get(index).copied())
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    let normal_actions = pack_action_rows(&explicit, &explicit_widths, available_width);
+    let normal_rows = action_row_count(&normal_actions);
+    let normal_height = normal_action_card_height(normal_rows);
+    if normal_height <= viewport_height {
+        return NotificationEntryLayout {
+            id,
+            card_height: normal_height,
+            slot_extent: normal_height.saturating_add(NOTIFICATION_CARD_SLOT_GAP),
+            actions: normal_actions,
+            page: 0,
+            page_count: 1,
+            compact: false,
+        };
+    }
+
+    const COMPACT_MIN_NORMAL_VIEWPORT: u16 = NOTIFICATION_BASE_CARD_HEIGHT
+        + NOTIFICATION_ACTION_TOP_GAP
+        + NOTIFICATION_ACTION_HEIGHT
+        + NOTIFICATION_ACTION_HEIGHT
+        + NOTIFICATION_ACTION_BOTTOM_GAP;
+    if viewport_height <= COMPACT_MIN_NORMAL_VIEWPORT {
+        let compact_height = viewport_height;
+        if explicit.is_empty() || compact_height < NOTIFICATION_ACTION_HEIGHT {
+            return NotificationEntryLayout {
+                id,
+                card_height: compact_height,
+                slot_extent: compact_height.saturating_add(NOTIFICATION_CARD_SLOT_GAP),
+                actions: Vec::new(),
+                page: 0,
+                page_count: explicit.len().max(1),
+                compact: true,
+            };
+        }
+        let pages = compact_action_pages(&explicit);
+        let page = requested_page.min(pages.len().saturating_sub(1));
+        let page_actions = pages.get(page).cloned().unwrap_or_default();
+        let page_widths = page_actions
+            .iter()
+            .map(|action| {
+                explicit
+                    .iter()
+                    .position(|original| original.key == action.key)
+                    .and_then(|index| explicit_widths.get(index).copied())
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+        let compact_width =
+            available_width.saturating_sub(24_u16.saturating_add(if pages.len() > 1 {
+                NOTIFICATION_ACTION_PAGER_WIDTH
+                    .saturating_mul(2)
+                    .saturating_add(NOTIFICATION_ACTION_GAP.saturating_mul(2))
+            } else {
+                0
+            }));
+        let page_layout = pack_action_rows(&page_actions, &page_widths, compact_width);
+        return NotificationEntryLayout {
+            id,
+            card_height: compact_height,
+            slot_extent: compact_height.saturating_add(NOTIFICATION_CARD_SLOT_GAP),
+            actions: page_layout,
+            page,
+            page_count: pages.len(),
+            compact: true,
+        };
+    }
+    let pager_height = NOTIFICATION_ACTION_HEIGHT;
+    let action_area = viewport_height
+        .saturating_sub(NOTIFICATION_BASE_CARD_HEIGHT)
+        .saturating_sub(NOTIFICATION_ACTION_TOP_GAP)
+        .saturating_sub(NOTIFICATION_ACTION_BOTTOM_GAP)
+        .saturating_sub(pager_height);
+    let max_rows = usize::from(
+        (action_area.saturating_add(NOTIFICATION_ACTION_ROW_GAP))
+            / (NOTIFICATION_ACTION_HEIGHT + NOTIFICATION_ACTION_ROW_GAP),
+    )
+    .max(1);
+    let pages = action_pages(&explicit, &explicit_widths, available_width, max_rows);
+    let page = requested_page.min(pages.len().saturating_sub(1));
+    let page_actions = pages.get(page).cloned().unwrap_or_default();
+    let page_widths = page_actions
+        .iter()
+        .map(|action| {
+            explicit
+                .iter()
+                .position(|original| original.key == action.key && original.label == action.label)
+                .and_then(|index| explicit_widths.get(index).copied())
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    let page_layout = pack_action_rows(&page_actions, &page_widths, available_width);
+    let card_height = viewport_height.max(
+        NOTIFICATION_BASE_CARD_HEIGHT
+            .saturating_add(NOTIFICATION_ACTION_TOP_GAP)
+            .saturating_add(NOTIFICATION_ACTION_HEIGHT)
+            .saturating_add(pager_height)
+            .saturating_add(NOTIFICATION_ACTION_BOTTOM_GAP),
+    );
+    NotificationEntryLayout {
+        id,
+        card_height,
+        slot_extent: card_height.saturating_add(NOTIFICATION_CARD_SLOT_GAP),
+        actions: page_layout,
+        page,
+        page_count: pages.len(),
+        compact: false,
+    }
+}
+
+fn notification_action_projection(
+    projections: &[NotificationActionProjection],
+    id: crate::core::HistoryEntryId,
+) -> &[NotificationActionView] {
+    projections
+        .iter()
+        .find(|projection| projection.history_id == id)
+        .map_or(&[], |projection| projection.actions.as_slice())
+}
+
+fn notification_layout_for_history(
+    history: &[crate::core::NotificationHistoryEntry],
+    projections: &[NotificationActionProjection],
+    width: u16,
+    viewport_height: u16,
+    measure: impl Fn(&str) -> u16,
+) -> Vec<NotificationEntryLayout> {
+    history
+        .iter()
+        .map(|entry| {
+            let actions = notification_action_projection(projections, entry.id);
+            let widths = actions
+                .iter()
+                .map(|action| measure(&action.label))
+                .collect::<Vec<_>>();
+            notification_entry_layout(
+                entry.id,
+                actions,
+                &widths,
+                width.saturating_sub(8),
+                viewport_height,
+                0,
+            )
+        })
+        .collect()
+}
+
+fn notification_variable_max_scroll(
+    layouts: &[NotificationEntryLayout],
+    viewport_height: u16,
+) -> usize {
+    let mut used = 0_u16;
+    let mut start = layouts.len();
+    for (index, layout) in layouts.iter().enumerate().rev() {
+        let extent = layout.slot_extent;
+        if start == layouts.len() || used.saturating_add(extent) <= viewport_height {
+            start = index;
+            used = used.saturating_add(extent);
+        } else {
+            break;
+        }
+    }
+    start.min(layouts.len().saturating_sub(1))
+}
 
 fn notification_header_rect(width: u16, text_width: u16) -> layout::MenuRect {
     let control_width = NOTIFICATION_HEADER_CONTROL_WIDTH
@@ -672,6 +1037,16 @@ fn notification_dismiss_rect(card: layout::MenuRect) -> layout::MenuRect {
         y: card.y + 4,
         width: 20,
         height: 20,
+    }
+}
+
+fn notification_pager_row_y(card: layout::MenuRect, compact: bool) -> i16 {
+    if compact {
+        card.y + card.height as i16 - NOTIFICATION_ACTION_HEIGHT as i16
+    } else {
+        card.y + card.height as i16
+            - NOTIFICATION_ACTION_BOTTOM_GAP as i16
+            - NOTIFICATION_ACTION_HEIGHT as i16
     }
 }
 
@@ -718,6 +1093,7 @@ fn notification_wheel_direction(button: u8) -> Option<i8> {
     }
 }
 
+#[allow(dead_code)]
 fn reconcile_notification_scroll(
     previous: usize,
     anchor: Option<crate::core::HistoryEntryId>,
@@ -734,7 +1110,7 @@ fn notification_hover_transition(
     old: Option<NotificationCenterHover>,
     next: Option<NotificationCenterHover>,
 ) -> (Option<NotificationCenterHover>, bool) {
-    (next, old != next)
+    (next.clone(), old != next)
 }
 
 #[cfg(test)]
@@ -782,6 +1158,9 @@ pub enum HitTarget {
     NotificationCenter(OutputId),
     NotificationCenterCard(crate::core::HistoryEntryId),
     NotificationCenterDismiss(crate::core::HistoryEntryId),
+    NotificationCenterAction(crate::core::HistoryEntryId, String),
+    NotificationCenterActionPagePrev(crate::core::HistoryEntryId),
+    NotificationCenterActionPageNext(crate::core::HistoryEntryId),
     NotificationCenterClearAll,
     NotificationCenterEmpty,
     TopLevel(crate::core::MenuItemId),
@@ -1894,12 +2273,35 @@ impl X11Platform {
             {
                 Some(NotificationCenterHover::Dismiss(*id))
             }
+            Some(HitTarget::NotificationCenterAction(id, key))
+                if center.card_hits.iter().any(|hit| {
+                    hit.id == *id && hit.action_rects.iter().any(|action| action.key == *key)
+                }) =>
+            {
+                Some(NotificationCenterHover::Action(*id, key.clone()))
+            }
+            Some(HitTarget::NotificationCenterActionPagePrev(id))
+                if center
+                    .card_hits
+                    .iter()
+                    .any(|hit| hit.id == *id && hit.pager_prev_rect.is_some()) =>
+            {
+                Some(NotificationCenterHover::ActionPagePrev(*id))
+            }
+            Some(HitTarget::NotificationCenterActionPageNext(id))
+                if center
+                    .card_hits
+                    .iter()
+                    .any(|hit| hit.id == *id && hit.pager_next_rect.is_some()) =>
+            {
+                Some(NotificationCenterHover::ActionPageNext(*id))
+            }
             Some(HitTarget::NotificationCenterClearAll) if center.clear_all_rect.is_some() => {
                 Some(NotificationCenterHover::ClearAll)
             }
             _ => None,
         };
-        let (hover, changed) = notification_hover_transition(center.hover, next);
+        let (hover, changed) = notification_hover_transition(center.hover.clone(), next);
         if changed {
             center.hover = hover;
             center.dirty = true;
@@ -1964,6 +2366,36 @@ impl X11Platform {
             );
         }
         true
+    }
+
+    pub fn previous_notification_action_page(&mut self, id: crate::core::HistoryEntryId) -> bool {
+        let Some(center) = self.notification_center.as_mut() else {
+            return false;
+        };
+        let page = center.action_pages.entry(id).or_default();
+        let next = page.saturating_sub(1);
+        if *page != next {
+            *page = next;
+            center.dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn next_notification_action_page(&mut self, id: crate::core::HistoryEntryId) -> bool {
+        let Some(center) = self.notification_center.as_mut() else {
+            return false;
+        };
+        let page = center.action_pages.entry(id).or_default();
+        let next = page.saturating_add(1);
+        if *page != next {
+            *page = next;
+            center.dirty = true;
+            true
+        } else {
+            false
+        }
     }
 
     fn install_notification_center_button_grabs(&self, window: u32) -> (String, String, String) {
@@ -2924,56 +3356,87 @@ impl X11Platform {
         };
         let width = 360_u16.min(output.width.max(1));
         let available = output.height.saturating_sub(BAR_HEIGHT + 12);
-        let visible_capacity =
-            notification_visible_capacity(output.height, !state.notification_history.is_empty());
-        let previous = self.notification_center.as_ref();
-        let same_output = previous.is_some_and(|center| center.output == output_id);
-        let previous_scroll =
-            notification_previous_scroll(same_output, previous.map_or(0, |center| center.scroll));
-        let user_scrolled = same_output && previous.is_some_and(|center| center.scroll_changed);
-        let previous_anchor = (!user_scrolled && previous_scroll > 0)
-            .then(|| previous.and_then(|center| center.card_hits.first().map(|hit| hit.id)));
-        let scroll = reconcile_notification_scroll(
-            previous_scroll,
-            previous_anchor.flatten(),
-            &state.notification_history,
-            visible_capacity,
-        );
-        let cards = state
-            .notification_history
-            .iter()
-            .skip(scroll)
-            .take(visible_capacity)
-            .count();
-        if notification_scroll_trace_enabled() {
-            let first_visible = state
-                .notification_history
-                .iter()
-                .skip(scroll)
-                .take(cards)
-                .next()
-                .map_or_else(|| "NONE".to_owned(), |entry| entry.id.0.to_string());
-            eprintln!(
-                "notification-center render: scroll={} history_len={} capacity={} first_visible_id={} visible_count={}",
-                scroll,
-                state.notification_history.len(),
-                visible_capacity,
-                first_visible,
-                cards
-            );
-        }
         let has_header = !state.notification_history.is_empty();
         let header_height = if has_header {
             NOTIFICATION_HEADER_HEIGHT
         } else {
             0
         };
+        let viewport_height = available.saturating_sub(header_height);
+        let previous = self.notification_center.as_ref();
+        let same_output = previous.is_some_and(|center| center.output == output_id);
+        let previous_scroll =
+            notification_previous_scroll(same_output, previous.map_or(0, |center| center.scroll));
+        let previous_action_pages =
+            previous.map_or_else(HashMap::new, |center| center.action_pages.clone());
+        let user_scrolled = same_output && previous.is_some_and(|center| center.scroll_changed);
+        let previous_anchor = (!user_scrolled && previous_scroll > 0)
+            .then(|| previous.and_then(|center| center.card_hits.first().map(|hit| hit.id)));
+        let base_layouts = notification_layout_for_history(
+            &state.notification_history,
+            &state.notification_action_projections,
+            width,
+            viewport_height,
+            |label| self.text.measure_popup_width(label),
+        );
+        let max_scroll = notification_variable_max_scroll(&base_layouts, viewport_height);
+        let scroll = previous_anchor
+            .flatten()
+            .and_then(|anchor| {
+                state
+                    .notification_history
+                    .iter()
+                    .position(|entry| entry.id == anchor)
+            })
+            .unwrap_or(previous_scroll)
+            .min(max_scroll);
+        let mut visible_layouts = Vec::new();
+        let mut used_height = 0_u16;
+        for (index, entry) in state.notification_history.iter().enumerate().skip(scroll) {
+            let actions =
+                notification_action_projection(&state.notification_action_projections, entry.id);
+            let widths = actions
+                .iter()
+                .map(|action| self.text.measure_popup_width(&action.label))
+                .collect::<Vec<_>>();
+            let layout = notification_entry_layout(
+                entry.id,
+                actions,
+                &widths,
+                width.saturating_sub(8),
+                viewport_height,
+                previous_action_pages.get(&entry.id).copied().unwrap_or(0),
+            );
+            if visible_layouts.is_empty()
+                || used_height.saturating_add(layout.slot_extent) <= viewport_height
+            {
+                used_height = used_height.saturating_add(layout.slot_extent);
+                visible_layouts.push((index, layout));
+            } else {
+                break;
+            }
+        }
+        let cards = visible_layouts.len();
+        if notification_scroll_trace_enabled() {
+            let first_visible = visible_layouts
+                .first()
+                .and_then(|(index, _)| state.notification_history.get(*index))
+                .map_or_else(|| "NONE".to_owned(), |entry| entry.id.0.to_string());
+            eprintln!(
+                "notification-center render: scroll={} history_len={} max_scroll={} first_visible_id={} visible_count={}",
+                scroll,
+                state.notification_history.len(),
+                max_scroll,
+                first_visible,
+                cards
+            );
+        }
         let height = if state.notification_history.is_empty() {
             62
         } else {
             header_height
-                .saturating_add((visible_capacity as u16).saturating_mul(62))
-                .min(available.max(header_height.saturating_add(62)))
+                .saturating_add(used_height.max(62))
+                .min(available.max(header_height + 62))
         };
         let x =
             (output.x as i32 + output.width as i32 - width as i32 - 8).max(output.x as i32) as i16;
@@ -3181,31 +3644,99 @@ impl X11Platform {
             self.text.release_drawable(backing.pixmap);
         }
         let mut card_hits = Vec::with_capacity(cards);
-        for (index, entry) in state
-            .notification_history
-            .iter()
-            .skip(scroll)
-            .take(cards)
-            .enumerate()
-        {
-            let top = header_height.saturating_add((index as u16).saturating_mul(62));
+        let mut layout_cursor = header_height;
+        let mut action_pages = HashMap::new();
+        for (history_index, entry_layout) in &visible_layouts {
+            let entry = &state.notification_history[*history_index];
+            let top = layout_cursor;
             let card_rect = layout::MenuRect {
                 x: 4,
-                y: (top + 4) as i16,
+                y: (top + u16::from(!entry_layout.compact) * 4) as i16,
                 width: width.saturating_sub(8),
-                height: 54,
+                height: entry_layout.card_height,
             };
-            let dismiss_rect = notification_dismiss_rect(card_rect);
+            let dismiss_rect = (!entry_layout.compact || card_rect.height >= 24)
+                .then_some(notification_dismiss_rect(card_rect));
+            let mut action_rects = Vec::new();
+            let mut row = 0;
+            let action_row_y = if entry_layout.compact {
+                card_rect.y + card_rect.height as i16 - NOTIFICATION_ACTION_HEIGHT as i16
+            } else {
+                card_rect.y + (NOTIFICATION_BASE_CARD_HEIGHT + NOTIFICATION_ACTION_TOP_GAP) as i16
+            };
+            let mut action_x = if entry_layout.compact && entry_layout.page_count > 1 {
+                card_rect.x + 12 + NOTIFICATION_ACTION_PAGER_WIDTH as i16 + 4
+            } else {
+                card_rect.x + 12
+            };
+            for action in &entry_layout.actions {
+                if action.row != row {
+                    row = action.row;
+                    action_x = if entry_layout.compact && entry_layout.page_count > 1 {
+                        card_rect.x + 12 + NOTIFICATION_ACTION_PAGER_WIDTH as i16 + 4
+                    } else {
+                        card_rect.x + 12
+                    };
+                }
+                let rect = layout::MenuRect {
+                    x: action_x,
+                    y: if entry_layout.compact {
+                        action_row_y
+                    } else {
+                        action_row_y
+                            + (action.row as i16
+                                * (NOTIFICATION_ACTION_HEIGHT + NOTIFICATION_ACTION_ROW_GAP) as i16)
+                    },
+                    width: action.width,
+                    height: NOTIFICATION_ACTION_HEIGHT,
+                };
+                action_rects.push(NotificationActionHit {
+                    key: action.key.clone(),
+                    label: fit_action_label(
+                        &action.label,
+                        rect.width.saturating_sub(NOTIFICATION_ACTION_PADDING),
+                        |label| self.text.measure_popup_width(label),
+                    ),
+                    rect,
+                });
+                action_x += action.width as i16 + NOTIFICATION_ACTION_GAP as i16;
+            }
+            let pager_row_y = notification_pager_row_y(card_rect, entry_layout.compact);
+            let pager_prev_rect = (entry_layout.page_count > 1).then_some(layout::MenuRect {
+                x: card_rect.x + 12,
+                y: pager_row_y,
+                width: NOTIFICATION_ACTION_PAGER_WIDTH,
+                height: NOTIFICATION_ACTION_HEIGHT,
+            });
+            let pager_next_rect = (entry_layout.page_count > 1).then_some(layout::MenuRect {
+                x: if entry_layout.compact {
+                    card_rect.x + card_rect.width as i16
+                        - 12
+                        - NOTIFICATION_ACTION_PAGER_WIDTH as i16
+                        - 24
+                } else {
+                    card_rect.x + 12 + NOTIFICATION_ACTION_PAGER_WIDTH as i16 + 4
+                },
+                y: pager_row_y,
+                width: NOTIFICATION_ACTION_PAGER_WIDTH,
+                height: NOTIFICATION_ACTION_HEIGHT,
+            });
             card_hits.push(NotificationCardHit {
                 id: entry.id,
                 card_rect,
                 dismiss_rect,
+                action_rects: action_rects.clone(),
+                pager_prev_rect,
+                pager_next_rect,
             });
+            action_pages.insert(entry.id, entry_layout.page);
             let hovered = self
                 .notification_center
                 .as_ref()
-                .and_then(|center| center.hover)
-                .is_some_and(|hover| matches!(hover, NotificationCenterHover::Card(id) | NotificationCenterHover::Dismiss(id) if id == entry.id));
+                .and_then(|center| center.hover.clone())
+                .is_some_and(|hover| {
+                    matches!(hover, NotificationCenterHover::Card(id) | NotificationCenterHover::Dismiss(id) if id == entry.id)
+                });
             self.conn
                 .change_gc(
                     backing.gc,
@@ -3225,6 +3756,69 @@ impl X11Platform {
                     height: card_rect.height,
                 }],
             )?;
+            for action in &action_rects {
+                let action_hovered = self.notification_center.as_ref().is_some_and(|center| {
+                    center.hover.as_ref().is_some_and(|hover| {
+                        matches!(hover, NotificationCenterHover::Action(id, key) if *id == entry.id && key == &action.key)
+                    })
+                });
+                self.conn
+                    .change_gc(
+                        backing.gc,
+                        &xproto::ChangeGCAux::new().foreground(
+                            self.glass_surface.opaque_pixel(if action_hovered {
+                                0x3f4d61
+                            } else {
+                                0x354052
+                            }),
+                        ),
+                    )?
+                    .check()?;
+                self.conn.poly_fill_rectangle(
+                    backing.pixmap,
+                    backing.gc,
+                    &[xproto::Rectangle {
+                        x: action.rect.x,
+                        y: action.rect.y,
+                        width: action.rect.width,
+                        height: action.rect.height,
+                    }],
+                )?;
+            }
+            for (rect, glyph) in [(pager_prev_rect, "<"), (pager_next_rect, ">")].into_iter() {
+                if let Some(rect) = rect {
+                    let hovered = self.notification_center.as_ref().is_some_and(|center| {
+                        center.hover.as_ref().is_some_and(|hover| {
+                            (glyph == "<"
+                                && matches!(hover, NotificationCenterHover::ActionPagePrev(id) if *id == entry.id))
+                                || (glyph == ">"
+                                    && matches!(hover, NotificationCenterHover::ActionPageNext(id) if *id == entry.id))
+                        })
+                    });
+                    self.conn
+                        .change_gc(
+                            backing.gc,
+                            &xproto::ChangeGCAux::new().foreground(
+                                self.glass_surface.opaque_pixel(if hovered {
+                                    0x3f4d61
+                                } else {
+                                    0x2b3340
+                                }),
+                            ),
+                        )?
+                        .check()?;
+                    self.conn.poly_fill_rectangle(
+                        backing.pixmap,
+                        backing.gc,
+                        &[xproto::Rectangle {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: rect.height,
+                        }],
+                    )?;
+                }
+            }
             self.conn.flush()?;
             self.conn.get_input_focus()?.reply()?;
             self.text.prepare_drawable(
@@ -3237,31 +3831,73 @@ impl X11Platform {
             } else {
                 &entry.app_name
             };
-            self.text.draw_popup_utf8(
-                &notification_card_line(title),
-                12,
-                i32::from(top) + 20,
-                BAR_STYLE.material.foreground,
-            )?;
-            self.text.draw_popup_utf8(
-                &notification_card_line(&entry.summary),
-                12,
-                i32::from(top) + 38,
-                BAR_STYLE.material.foreground,
-            )?;
-            self.text.draw_popup_utf8(
-                &notification_card_line(&entry.body),
-                12,
-                i32::from(top) + 54,
-                BAR_STYLE.material.foreground,
-            )?;
-            self.text.draw_popup_utf8(
-                "×",
-                i32::from(dismiss_rect.x) + 5,
-                i32::from(dismiss_rect.y) + 16,
-                BAR_STYLE.material.foreground,
-            )?;
+            let content_bottom = if entry_layout.compact {
+                let has_action_row =
+                    !entry_layout.actions.is_empty() || entry_layout.page_count > 1;
+                if has_action_row {
+                    card_rect.y + card_rect.height as i16 - NOTIFICATION_ACTION_HEIGHT as i16
+                } else {
+                    card_rect.y + card_rect.height as i16
+                }
+            } else {
+                card_rect.y + card_rect.height as i16
+            };
+            if card_rect.y + 20 <= content_bottom {
+                self.text.draw_popup_utf8(
+                    &notification_card_line(title),
+                    12,
+                    i32::from(card_rect.y) + 20,
+                    BAR_STYLE.material.foreground,
+                )?;
+            }
+            if card_rect.y + 38 <= content_bottom {
+                self.text.draw_popup_utf8(
+                    &notification_card_line(&entry.summary),
+                    12,
+                    i32::from(card_rect.y) + 38,
+                    BAR_STYLE.material.foreground,
+                )?;
+            }
+            if card_rect.y + 54 <= content_bottom {
+                self.text.draw_popup_utf8(
+                    &notification_card_line(&entry.body),
+                    12,
+                    i32::from(card_rect.y) + 54,
+                    BAR_STYLE.material.foreground,
+                )?;
+            }
+            if let Some(dismiss_rect) = dismiss_rect {
+                self.text.draw_popup_utf8(
+                    "×",
+                    i32::from(dismiss_rect.x) + 5,
+                    i32::from(dismiss_rect.y) + 16,
+                    BAR_STYLE.material.foreground,
+                )?;
+            }
+            let action_baseline_offset = self
+                .text
+                .popup_metrics()
+                .centered_baseline(NOTIFICATION_ACTION_HEIGHT);
+            for action in &action_rects {
+                self.text.draw_popup_utf8(
+                    &action.label,
+                    action.rect.x as i32 + 8,
+                    action.rect.y as i32 + i32::from(action_baseline_offset),
+                    BAR_STYLE.material.foreground,
+                )?;
+            }
+            for (rect, glyph) in [(pager_prev_rect, "<"), (pager_next_rect, ">")].into_iter() {
+                if let Some(rect) = rect {
+                    self.text.draw_popup_utf8(
+                        glyph,
+                        rect.x as i32 + 6,
+                        rect.y as i32 + i32::from(action_baseline_offset),
+                        BAR_STYLE.material.foreground,
+                    )?;
+                }
+            }
             self.text.release_drawable(backing.pixmap);
+            layout_cursor = layout_cursor.saturating_add(entry_layout.slot_extent);
         }
         if state.notification_history.is_empty() {
             self.conn.flush()?;
@@ -3291,9 +3927,14 @@ impl X11Platform {
         let hover = self
             .notification_center
             .as_ref()
-            .and_then(|center| center.hover)
+            .and_then(|center| center.hover.clone())
             .filter(|hover| match hover {
                 NotificationCenterHover::Card(id) | NotificationCenterHover::Dismiss(id) => {
+                    card_hits.iter().any(|hit| hit.id == *id)
+                }
+                NotificationCenterHover::Action(id, _)
+                | NotificationCenterHover::ActionPagePrev(id)
+                | NotificationCenterHover::ActionPageNext(id) => {
                     card_hits.iter().any(|hit| hit.id == *id)
                 }
                 NotificationCenterHover::ClearAll => clear_all_rect.is_some(),
@@ -3306,6 +3947,15 @@ impl X11Platform {
             backing: Some(backing),
             card_hits,
             clear_all_rect,
+            action_pages: action_pages
+                .into_iter()
+                .filter_map(|(id, page)| {
+                    visible_layouts
+                        .iter()
+                        .find(|(_, layout)| layout.id == id)
+                        .map(|(_, layout)| (id, page.min(layout.page_count.saturating_sub(1))))
+                })
+                .collect(),
             hover,
             scroll,
             scroll_changed: false,
@@ -5527,12 +6177,29 @@ impl X11Platform {
                                 && local_y >= rect.y
                                 && local_y < rect.y + rect.height as i16
                         };
-                        if in_rect(hit.dismiss_rect) {
+                        if hit.dismiss_rect.is_some_and(in_rect) {
                             if notification_ui_trace_enabled() {
                                 eprintln!("notification-center ui-hit: matched_card={} dismiss_contains=true", hit.id.0);
                                 eprintln!("notification-center ui-action: action=Dismiss({})", hit.id.0);
                             }
                             Some(HitTarget::NotificationCenterDismiss(hit.id))
+                        } else if hit
+                            .pager_prev_rect
+                            .is_some_and(in_rect)
+                        {
+                            Some(HitTarget::NotificationCenterActionPagePrev(hit.id))
+                        } else if hit
+                            .pager_next_rect
+                            .is_some_and(in_rect)
+                        {
+                            Some(HitTarget::NotificationCenterActionPageNext(hit.id))
+                        } else if let Some(action) =
+                            hit.action_rects.iter().find(|action| in_rect(action.rect))
+                        {
+                            Some(HitTarget::NotificationCenterAction(
+                                hit.id,
+                                action.key.clone(),
+                            ))
                         } else if in_rect(hit.card_rect) {
                             Some(HitTarget::NotificationCenterCard(hit.id))
                         } else {
@@ -5929,7 +6596,8 @@ mod tests {
         SurfaceWindowGeometry, X11Event, BAR_HEIGHT,
     };
     use crate::core::{
-        MenuItemId, OutputId, OutputState, StatusNotifierEndpoint, StatusNotifierIcon,
+        HistoryEntryId, MenuItemId, NotificationActionProjection, NotificationActionView, OutputId,
+        OutputState, StatusNotifierEndpoint, StatusNotifierIcon,
     };
     use crate::ui::{
         layout::{MenuRect, PopupItemRect, PopupLayout},
@@ -7125,6 +7793,35 @@ mod tests {
     }
 
     #[test]
+    fn notification_center_button_actions_preserve_action_and_pager_identity() {
+        let id = crate::core::HistoryEntryId(10);
+        assert_eq!(
+            super::notification_center_button_action(
+                1,
+                &HitTarget::NotificationCenterAction(id, "reply".into())
+            ),
+            Some(super::NotificationCenterButtonAction::InvokeAction(
+                id,
+                "reply".into()
+            ))
+        );
+        assert_eq!(
+            super::notification_center_button_action(
+                1,
+                &HitTarget::NotificationCenterActionPagePrev(id)
+            ),
+            Some(super::NotificationCenterButtonAction::ActionPagePrev(id))
+        );
+        assert_eq!(
+            super::notification_center_button_action(
+                1,
+                &HitTarget::NotificationCenterActionPageNext(id)
+            ),
+            Some(super::NotificationCenterButtonAction::ActionPageNext(id))
+        );
+    }
+
+    #[test]
     fn notification_header_control_only_exists_for_non_empty_history() {
         assert_eq!(
             super::notification_header_for_history(360, 48, true)
@@ -7338,5 +8035,313 @@ mod tests {
         assert_eq!(notification_wheel_direction(5), Some(1));
         assert_eq!(notification_wheel_direction(1), None);
         assert_eq!(notification_wheel_direction(6), None);
+    }
+
+    #[test]
+    fn explicit_actions_exclude_default_and_deduplicate_by_first_key() {
+        let actions = vec![
+            NotificationActionView {
+                key: "default".into(),
+                label: "Open".into(),
+            },
+            NotificationActionView {
+                key: "reply".into(),
+                label: "Reply".into(),
+            },
+            NotificationActionView {
+                key: "reply".into(),
+                label: "Reply again".into(),
+            },
+            NotificationActionView {
+                key: "".into(),
+                label: "Empty key".into(),
+            },
+        ];
+        let visible = super::explicit_action_views(&actions);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].label, "Reply");
+        assert_eq!(visible[1].key, "");
+    }
+
+    #[test]
+    fn variable_action_layout_keeps_legacy_cards_and_wraps_rows() {
+        let no_actions = super::notification_entry_layout(HistoryEntryId(1), &[], &[], 352, 500, 0);
+        assert_eq!(no_actions.card_height, 54);
+        assert_eq!(no_actions.slot_extent, 62);
+
+        let actions = vec![
+            NotificationActionView {
+                key: "reply".into(),
+                label: "Reply".into(),
+            },
+            NotificationActionView {
+                key: "archive".into(),
+                label: "Archive".into(),
+            },
+        ];
+        let layout =
+            super::notification_entry_layout(HistoryEntryId(2), &actions, &[100, 100], 120, 500, 0);
+        assert_eq!(layout.card_height, 114);
+        assert_eq!(
+            layout
+                .actions
+                .iter()
+                .map(|action| action.row)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let one_row =
+            super::notification_entry_layout(HistoryEntryId(3), &actions, &[20, 20], 352, 500, 0);
+        assert_eq!(one_row.card_height, 86);
+        assert_eq!(one_row.slot_extent, 94);
+    }
+
+    #[test]
+    fn action_labels_are_bounded_without_byte_based_measurement() {
+        let label = super::fit_action_label("非常に長い通知アクション", 24, |text| {
+            text.chars().count() as u16 * 8
+        });
+        assert!(label.chars().count() <= 3);
+        assert_eq!(
+            super::fit_action_label("Reply", 80, |text| text.len() as u16),
+            "Reply"
+        );
+    }
+
+    #[test]
+    fn oversized_action_layout_pages_every_action_and_clamps_page() {
+        let actions = (0..7)
+            .map(|index| NotificationActionView {
+                key: format!("action-{index}"),
+                label: format!("Action {index}"),
+            })
+            .collect::<Vec<_>>();
+        let widths = vec![40; actions.len()];
+        let mut reachable = std::collections::HashSet::new();
+        let first =
+            super::notification_entry_layout(HistoryEntryId(4), &actions, &widths, 120, 110, 0);
+        assert!(first.page_count > 1);
+        assert!(first.card_height <= 110);
+        for page in 0..first.page_count {
+            let layout = super::notification_entry_layout(
+                HistoryEntryId(4),
+                &actions,
+                &widths,
+                120,
+                110,
+                page,
+            );
+            for action in layout.actions {
+                reachable.insert(action.key);
+            }
+        }
+        assert_eq!(reachable.len(), actions.len());
+        let clamped = super::notification_entry_layout(
+            HistoryEntryId(4),
+            &actions,
+            &widths,
+            120,
+            110,
+            usize::MAX,
+        );
+        assert_eq!(clamped.page, clamped.page_count - 1);
+    }
+
+    #[test]
+    fn compact_layout_is_bounded_and_has_a_safe_tiny_viewport_policy() {
+        let actions = vec![
+            NotificationActionView {
+                key: "reply".into(),
+                label: "Reply".into(),
+            },
+            NotificationActionView {
+                key: "archive".into(),
+                label: "Archive".into(),
+            },
+        ];
+        let widths = vec![200, 200];
+        for viewport in [150, 110, 94, 86, 70, 54, 24] {
+            let layout = super::notification_entry_layout(
+                HistoryEntryId(5),
+                &actions,
+                &widths,
+                352,
+                viewport,
+                0,
+            );
+            assert!(layout.card_height <= viewport);
+            assert!(layout.compact || viewport >= 110);
+            if (24..110).contains(&viewport) {
+                assert_eq!(layout.actions.len(), 1);
+                assert_eq!(layout.page_count, 2);
+            }
+        }
+        let tiny =
+            super::notification_entry_layout(HistoryEntryId(5), &actions, &widths, 352, 23, 0);
+        assert!(tiny.compact);
+        assert!(tiny.actions.is_empty());
+        assert!(tiny.card_height <= 23);
+    }
+
+    #[test]
+    fn compact_pages_clamp_and_return_to_normal_layout() {
+        let actions = vec![
+            NotificationActionView {
+                key: "reply".into(),
+                label: "Reply".into(),
+            },
+            NotificationActionView {
+                key: "archive".into(),
+                label: "Archive".into(),
+            },
+        ];
+        let widths = vec![200, 200];
+        let compact = super::notification_entry_layout(
+            HistoryEntryId(6),
+            &actions,
+            &widths,
+            352,
+            94,
+            usize::MAX,
+        );
+        assert_eq!(compact.page, 1);
+        assert_eq!(compact.actions[0].key, "archive");
+        let normal = super::notification_entry_layout(
+            HistoryEntryId(6),
+            &actions,
+            &widths,
+            352,
+            500,
+            compact.page,
+        );
+        assert!(!normal.compact);
+        assert_eq!(normal.page, 0);
+        assert_eq!(normal.page_count, 1);
+        assert_eq!(normal.actions.len(), 2);
+    }
+
+    #[test]
+    fn normal_pagination_keeps_the_pager_visible_after_all_action_rows() {
+        let actions = (1..=45)
+            .map(|index| NotificationActionView {
+                key: format!("a{index}"),
+                label: format!("Action {index} Long Label"),
+            })
+            .collect::<Vec<_>>();
+        let widths = vec![120; actions.len()];
+        let layout =
+            super::notification_entry_layout(HistoryEntryId(7), &actions, &widths, 352, 500, 0);
+        assert!(!layout.compact);
+        assert!(layout.page_count > 1);
+        assert_eq!(
+            layout.actions.last().map(|action| action.key.as_str()),
+            Some("a28")
+        );
+
+        let card = super::layout::MenuRect {
+            x: 4,
+            y: 28,
+            width: 352,
+            height: layout.card_height,
+        };
+        let action_bottom = layout
+            .actions
+            .last()
+            .map(|action| {
+                card.y
+                    + (super::NOTIFICATION_BASE_CARD_HEIGHT + super::NOTIFICATION_ACTION_TOP_GAP)
+                        as i16
+                    + (action.row as i16
+                        * (super::NOTIFICATION_ACTION_HEIGHT + super::NOTIFICATION_ACTION_ROW_GAP)
+                            as i16)
+                    + super::NOTIFICATION_ACTION_HEIGHT as i16
+            })
+            .expect("page 0 has actions");
+        let pager_y = super::notification_pager_row_y(card, false);
+        assert!(pager_y >= action_bottom);
+        assert!(pager_y + super::NOTIFICATION_ACTION_HEIGHT as i16 <= card.y + card.height as i16);
+
+        let mut reachable = std::collections::HashSet::new();
+        for page in 0..layout.page_count {
+            let page_layout = super::notification_entry_layout(
+                HistoryEntryId(7),
+                &actions,
+                &widths,
+                352,
+                500,
+                page,
+            );
+            reachable.extend(page_layout.actions.into_iter().map(|action| action.key));
+        }
+        assert_eq!(reachable.len(), 45);
+        assert!(reachable.contains("a45"));
+
+        let twelve = super::notification_entry_layout(
+            HistoryEntryId(8),
+            &actions[..12],
+            &widths[..12],
+            352,
+            500,
+            0,
+        );
+        assert_eq!(twelve.page_count, 1);
+        assert_eq!(twelve.actions.len(), 12);
+    }
+
+    #[test]
+    fn variable_layout_max_scroll_matches_fixed_slot_pages() {
+        let history = (0..5)
+            .map(|id| crate::core::NotificationHistoryEntry {
+                id: HistoryEntryId(id + 1),
+                live_notification_id: None,
+                source: crate::core::NotificationSource::Freedesktop,
+                app_name: "app".into(),
+                summary: id.to_string(),
+                body: String::new(),
+                order: id,
+                received_at: id,
+                updated_at: id,
+            })
+            .collect::<Vec<_>>();
+        let layouts = super::notification_layout_for_history(
+            &history,
+            &Vec::<NotificationActionProjection>::new(),
+            360,
+            186,
+            |_| 40,
+        );
+        assert_eq!(super::notification_variable_max_scroll(&layouts, 186), 2);
+
+        let mixed = vec![
+            super::notification_entry_layout(HistoryEntryId(1), &[], &[], 352, 186, 0),
+            super::notification_entry_layout(
+                HistoryEntryId(2),
+                &[NotificationActionView {
+                    key: "reply".into(),
+                    label: "Reply".into(),
+                }],
+                &[40],
+                352,
+                186,
+                0,
+            ),
+            super::notification_entry_layout(
+                HistoryEntryId(3),
+                &[NotificationActionView {
+                    key: "reply".into(),
+                    label: "Reply".into(),
+                }],
+                &[40],
+                352,
+                186,
+                0,
+            ),
+            super::notification_entry_layout(HistoryEntryId(4), &[], &[], 352, 186, 0),
+        ];
+        assert_eq!(
+            super::notification_variable_max_scroll(&mixed, 186),
+            2,
+            "backward suffix must use actual variable slot extents"
+        );
     }
 }
