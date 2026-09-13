@@ -608,6 +608,7 @@ enum NotificationCenterHover {
 pub enum NotificationCenterButtonAction {
     Dismiss(crate::core::HistoryEntryId),
     ClearAll,
+    InvokeDefault(crate::core::HistoryEntryId),
 }
 
 pub fn notification_center_button_action(
@@ -622,6 +623,9 @@ pub fn notification_center_button_action(
             Some(NotificationCenterButtonAction::Dismiss(*id))
         }
         HitTarget::NotificationCenterClearAll => Some(NotificationCenterButtonAction::ClearAll),
+        HitTarget::NotificationCenterCard(id) => {
+            Some(NotificationCenterButtonAction::InvokeDefault(*id))
+        }
         _ => None,
     }
 }
@@ -7096,7 +7100,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_center_button_actions_require_explicit_controls() {
+    fn notification_center_button_actions_include_default_card_action() {
         let id = crate::core::HistoryEntryId(9);
         assert_eq!(
             super::notification_center_button_action(1, &HitTarget::NotificationCenterDismiss(id)),
@@ -7108,10 +7112,14 @@ mod tests {
         );
         assert_eq!(
             super::notification_center_button_action(1, &HitTarget::NotificationCenterCard(id)),
-            None
+            Some(super::NotificationCenterButtonAction::InvokeDefault(id))
         );
         assert_eq!(
             super::notification_center_button_action(5, &HitTarget::NotificationCenterDismiss(id)),
+            None
+        );
+        assert_eq!(
+            super::notification_center_button_action(4, &HitTarget::NotificationCenterCard(id)),
             None
         );
     }

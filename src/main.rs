@@ -413,6 +413,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                         }
                         dbus.clear_notification_history();
                     }
+                    Some(platform::x11::NotificationCenterButtonAction::InvokeDefault(id)) => {
+                        if std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some() {
+                            eprintln!(
+                                "notification-center default-action-request: history_id={} enqueue=attempt",
+                                id.0
+                            );
+                        }
+                        dbus.invoke_notification_default(id);
+                    }
                     None => {}
                 }
             }

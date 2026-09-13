@@ -10,7 +10,9 @@ mod ai_usage;
 mod gmenu;
 mod menu;
 use crate::notification_persistence::{LoadResult, Persistence};
-use crate::notifications::{self, SharedStore, SharedTimer, REASON_CLOSED, REASON_EXPIRED};
+use crate::notifications::{
+    self, SharedStore, SharedTimer, REASON_CLOSED, REASON_DISMISSED, REASON_EXPIRED,
+};
 use async_channel::{Receiver, Sender};
 use futures_lite::StreamExt;
 use std::collections::hash_map::Entry;
@@ -201,6 +203,8 @@ enum Request {
     DismissNotificationHistoryEntry(HistoryEntryId),
     #[allow(dead_code)]
     ClearNotificationHistory,
+    #[allow(dead_code)]
+    InvokeNotificationDefault(HistoryEntryId),
     WindowAttention {
         window: crate::core::WindowId,
         app_name: String,
@@ -463,6 +467,13 @@ impl DbusBridge {
         let _ = self.requests.try_send(Request::ClearNotificationHistory);
     }
 
+    #[allow(dead_code)]
+    pub fn invoke_notification_default(&self, id: HistoryEntryId) {
+        let _ = self
+            .requests
+            .try_send(Request::InvokeNotificationDefault(id));
+    }
+
     pub fn window_attention(
         &self,
         window: crate::core::WindowId,
@@ -678,16 +689,26 @@ impl NotificationServer {
         _app_icon: String,
         summary: String,
         body: String,
-        _actions: Vec<String>,
+        actions: Vec<String>,
         hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> zbus::fdo::Result<u32> {
         let parsed_hints = notifications::parse_sound_hints(&hints);
+        let actions = notifications::parse_notification_actions(actions);
+        let resident = notifications::parse_resident_hint(&hints);
         let (id, delivery) = self
             .store
             .lock()
             .expect("notification store poisoned")
-            .notify_with_disposition(replaces_id, app_name, summary, body, expire_timeout);
+            .notify_with_actions(
+                replaces_id,
+                app_name,
+                summary,
+                body,
+                expire_timeout,
+                actions,
+                resident,
+            );
         let sound_decision = notifications::decide_notification_sound(delivery, &parsed_hints);
         if let Some(sound) = &self.sound {
             let _ = sound.try_decision(sound_decision);
@@ -723,6 +744,13 @@ impl NotificationServer {
         emitter: &zbus::object_server::SignalEmitter<'_>,
         id: u32,
         reason: u32,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn action_invoked(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+        id: u32,
+        action_key: &str,
     ) -> zbus::Result<()>;
 }
 
@@ -2264,6 +2292,48 @@ async fn run(
                         &events,
                         &wake,
                     );
+                }
+            }
+            Either::Request(Ok(Request::InvokeNotificationDefault(history_id))) => {
+                let invocation = notification_store
+                    .lock()
+                    .expect("notification store poisoned")
+                    .invoke_default_action(history_id);
+                let Some(invocation) = invocation else {
+                    continue;
+                };
+                let emitter =
+                    zbus::object_server::SignalEmitter::new(&connection, NOTIFICATIONS_PATH)?;
+                NotificationServer::action_invoked(
+                    &emitter,
+                    invocation.notification_id.0,
+                    &invocation.action_key,
+                )
+                .await?;
+                if invocation.close_reason == Some(REASON_DISMISSED) {
+                    let history = notification_store
+                        .lock()
+                        .expect("notification store poisoned")
+                        .history_snapshot();
+                    if let Err(error) = persistence
+                        .lock()
+                        .expect("notification persistence poisoned")
+                        .save(&history)
+                    {
+                        eprintln!("xbar: notification persistence save failed: {error}");
+                    }
+                    notifications::publish(
+                        &notification_store,
+                        &notification_timer,
+                        &events,
+                        &wake,
+                    );
+                    NotificationServer::notification_closed(
+                        &emitter,
+                        invocation.notification_id.0,
+                        REASON_DISMISSED,
+                    )
+                    .await?;
                 }
             }
             Either::Request(Ok(Request::NotificationTimerFired)) => {
