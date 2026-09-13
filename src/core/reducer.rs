@@ -1703,7 +1703,12 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.notification_history = history;
                 state.notification_action_projections = action_projections;
             }
-            changed
+            let valid_groups = super::notification_group_keys(&state.notification_history);
+            let before_groups = state.expanded_notification_groups.len();
+            state
+                .expanded_notification_groups
+                .retain(|key| valid_groups.contains(key));
+            changed || before_groups != state.expanded_notification_groups.len()
         }
         Event::ToggleNotificationCenter(output) => {
             state.notification_center_open = match state.notification_center_open {
@@ -1713,11 +1718,25 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             };
             true
         }
-        Event::EnsureNotificationCenterOpen { output, .. } => {
+        Event::EnsureNotificationCenterOpen { output, target } => {
+            let expansion_changed = target
+                .and_then(|history_id| {
+                    super::notification_group_for_history_id(
+                        &state.notification_history,
+                        history_id,
+                    )
+                })
+                .is_some_and(|key| state.expanded_notification_groups.insert(key));
             let changed = state.notification_center_open != Some(output);
             state.notification_center_open = Some(output);
-            changed
+            changed || expansion_changed
         }
+        Event::ExpandNotificationGroup(key) => {
+            let is_group =
+                super::notification_group_keys(&state.notification_history).contains(&key);
+            is_group && state.expanded_notification_groups.insert(key)
+        }
+        Event::CollapseNotificationGroup(key) => state.expanded_notification_groups.remove(&key),
         Event::NotificationToastConsumed => false,
         Event::WindowAttentionChanged { .. } => false,
         Event::AudioUnavailable => {
@@ -3170,6 +3189,211 @@ mod tests {
         assert_eq!(state.notification_center_open, Some(OutputId(1)));
         assert_eq!(state.notification_history[0].id, HistoryEntryId(3));
         assert_eq!(state.notification_history[1].id, HistoryEntryId(2));
+    }
+
+    fn notification_history_entry(
+        id: u64,
+        app_name: &str,
+    ) -> super::super::NotificationHistoryEntry {
+        super::super::NotificationHistoryEntry {
+            id: HistoryEntryId(id),
+            live_notification_id: None,
+            source: super::super::NotificationSource::Freedesktop,
+            app_name: app_name.into(),
+            summary: id.to_string(),
+            body: String::new(),
+            order: id,
+            received_at: id,
+            updated_at: id,
+        }
+    }
+
+    fn notification_state(history: Vec<super::super::NotificationHistoryEntry>) -> Event {
+        Event::NotificationsState {
+            active: Vec::new(),
+            history,
+            action_projections: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn notification_group_expansion_is_explicit_and_singletons_are_noop() {
+        let key = super::super::GroupKey::ApplicationName("Discord".into());
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        reduce(
+            &mut state,
+            notification_state(vec![
+                notification_history_entry(2, "Discord"),
+                notification_history_entry(1, "Discord"),
+            ]),
+            &mut registry,
+        );
+        assert!(reduce(
+            &mut state,
+            Event::ExpandNotificationGroup(key.clone()),
+            &mut registry,
+        ));
+        assert!(state.expanded_notification_groups.contains(&key));
+        assert!(reduce(
+            &mut state,
+            Event::CollapseNotificationGroup(key.clone()),
+            &mut registry,
+        ));
+        assert!(!state.expanded_notification_groups.contains(&key));
+
+        reduce(
+            &mut state,
+            notification_state(vec![notification_history_entry(1, "Discord")]),
+            &mut registry,
+        );
+        assert!(!reduce(
+            &mut state,
+            Event::ExpandNotificationGroup(key.clone()),
+            &mut registry,
+        ));
+        assert!(!state.expanded_notification_groups.contains(&key));
+    }
+
+    #[test]
+    fn notification_group_reconciliation_prunes_singletons_and_preserves_real_groups() {
+        let key = super::super::GroupKey::ApplicationName("Discord".into());
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        reduce(
+            &mut state,
+            notification_state(vec![
+                notification_history_entry(3, "Discord"),
+                notification_history_entry(2, "Discord"),
+                notification_history_entry(1, "Discord"),
+            ]),
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::ExpandNotificationGroup(key.clone()),
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            notification_state(vec![
+                notification_history_entry(3, "Discord"),
+                notification_history_entry(2, "Discord"),
+            ]),
+            &mut registry,
+        );
+        assert!(state.expanded_notification_groups.contains(&key));
+        reduce(
+            &mut state,
+            notification_state(vec![notification_history_entry(2, "Discord")]),
+            &mut registry,
+        );
+        assert!(!state.expanded_notification_groups.contains(&key));
+        reduce(
+            &mut state,
+            notification_state(vec![
+                notification_history_entry(4, "Discord"),
+                notification_history_entry(2, "Discord"),
+            ]),
+            &mut registry,
+        );
+        assert!(!state.expanded_notification_groups.contains(&key));
+    }
+
+    #[test]
+    fn ensure_notification_target_expands_only_its_group() {
+        let discord = super::super::GroupKey::ApplicationName("Discord".into());
+        let slack = super::super::GroupKey::ApplicationName("Slack".into());
+        let teams = super::super::GroupKey::ApplicationName("Teams".into());
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        reduce(
+            &mut state,
+            notification_state(vec![
+                notification_history_entry(4, "Discord"),
+                notification_history_entry(3, "Slack"),
+                notification_history_entry(2, "Discord"),
+                notification_history_entry(1, "Slack"),
+                notification_history_entry(0, "Teams"),
+            ]),
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::ExpandNotificationGroup(slack.clone()),
+            &mut registry,
+        );
+        assert!(reduce(
+            &mut state,
+            Event::EnsureNotificationCenterOpen {
+                output: OutputId(1),
+                target: Some(HistoryEntryId(2)),
+            },
+            &mut registry,
+        ));
+        assert_eq!(state.notification_center_open, Some(OutputId(1)));
+        assert!(state.expanded_notification_groups.contains(&discord));
+        assert!(state.expanded_notification_groups.contains(&slack));
+        assert!(!state.expanded_notification_groups.contains(&teams));
+        assert_eq!(state.notification_history.len(), 5);
+        assert_eq!(state.notification_history[2].id, HistoryEntryId(2));
+    }
+
+    #[test]
+    fn notification_member_move_rederives_membership_without_duplicates() {
+        let group_a = super::super::GroupKey::ApplicationName("A".into());
+        let group_b = super::super::GroupKey::ApplicationName("B".into());
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        reduce(
+            &mut state,
+            notification_state(vec![
+                notification_history_entry(2, "A"),
+                notification_history_entry(1, "A"),
+                notification_history_entry(3, "B"),
+            ]),
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::ExpandNotificationGroup(group_a.clone()),
+            &mut registry,
+        );
+
+        // HistoryEntryId(1) changes application identity and moves to the
+        // authoritative newest position, as a real replacement does.
+        reduce(
+            &mut state,
+            notification_state(vec![
+                notification_history_entry(1, "B"),
+                notification_history_entry(2, "A"),
+                notification_history_entry(3, "B"),
+            ]),
+            &mut registry,
+        );
+        let items = super::super::notification_center_items(
+            &state.notification_history,
+            &state.expanded_notification_groups,
+        );
+        let b = items
+            .iter()
+            .find(|item| item.group_key() == Some(&group_b))
+            .expect("new B group");
+        assert!(items.iter().all(|item| item.group_key() != Some(&group_a)));
+        assert!(items
+            .iter()
+            .any(|item| { item.group_key().is_none() && item.members() == [HistoryEntryId(2)] }));
+        assert_eq!(b.members(), &[HistoryEntryId(1), HistoryEntryId(3)]);
+        assert_eq!(
+            items
+                .iter()
+                .flat_map(|item| item.members().iter())
+                .filter(|id| **id == HistoryEntryId(1))
+                .count(),
+            1
+        );
+        assert!(!state.expanded_notification_groups.contains(&group_a));
+        assert!(!state.expanded_notification_groups.contains(&group_b));
     }
 
     #[test]

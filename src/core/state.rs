@@ -328,6 +328,238 @@ pub struct NotificationHistoryEntry {
     pub updated_at: u64,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum GroupKey {
+    ApplicationName(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NotificationCenterItem {
+    Single {
+        member: HistoryEntryId,
+    },
+    Group {
+        key: GroupKey,
+        members: Vec<HistoryEntryId>,
+        expanded: bool,
+    },
+}
+
+impl NotificationCenterItem {
+    pub fn members(&self) -> &[HistoryEntryId] {
+        match self {
+            Self::Single { member } => std::slice::from_ref(member),
+            Self::Group { members, .. } => members,
+        }
+    }
+
+    pub fn group_key(&self) -> Option<&GroupKey> {
+        match self {
+            Self::Single { .. } => None,
+            Self::Group { key, .. } => Some(key),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn front_member(&self) -> HistoryEntryId {
+        self.members()[0]
+    }
+
+    #[allow(dead_code)]
+    pub fn is_expanded(&self) -> bool {
+        matches!(self, Self::Group { expanded: true, .. })
+    }
+}
+
+#[cfg(test)]
+mod notification_group_tests {
+    use super::*;
+
+    fn entry(id: u64, app_name: &str) -> NotificationHistoryEntry {
+        NotificationHistoryEntry {
+            id: HistoryEntryId(id),
+            live_notification_id: None,
+            source: NotificationSource::Freedesktop,
+            app_name: app_name.into(),
+            summary: id.to_string(),
+            body: String::new(),
+            order: id,
+            received_at: id,
+            updated_at: id,
+        }
+    }
+
+    fn group_items(entries: &[NotificationHistoryEntry]) -> Vec<NotificationCenterItem> {
+        notification_center_items(entries, &Default::default())
+    }
+
+    #[test]
+    fn same_app_forms_one_newest_first_group() {
+        let items = group_items(&[
+            entry(3, "Discord"),
+            entry(2, "Discord"),
+            entry(1, "Discord"),
+        ]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].group_key(),
+            Some(&GroupKey::ApplicationName("Discord".into()))
+        );
+        assert_eq!(
+            items[0].members(),
+            &[HistoryEntryId(3), HistoryEntryId(2), HistoryEntryId(1)]
+        );
+        assert_eq!(items[0].front_member(), HistoryEntryId(3));
+        assert!(!items[0].is_expanded());
+    }
+
+    #[test]
+    fn different_apps_keep_first_newest_occurrence_order() {
+        let items = group_items(&[
+            entry(2, "Discord"),
+            entry(4, "Slack"),
+            entry(1, "Discord"),
+            entry(3, "Slack"),
+        ]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].group_key(),
+            Some(&GroupKey::ApplicationName("Discord".into()))
+        );
+        assert_eq!(items[0].members(), &[HistoryEntryId(2), HistoryEntryId(1)]);
+        assert_eq!(
+            items[1].group_key(),
+            Some(&GroupKey::ApplicationName("Slack".into()))
+        );
+        assert_eq!(items[1].members(), &[HistoryEntryId(4), HistoryEntryId(3)]);
+    }
+
+    #[test]
+    fn empty_names_are_independent_singles_and_names_are_exact() {
+        let items = group_items(&[
+            entry(4, ""),
+            entry(3, ""),
+            entry(2, "Discord"),
+            entry(1, "discord"),
+        ]);
+        assert!(matches!(
+            items[0],
+            NotificationCenterItem::Single {
+                member: HistoryEntryId(4)
+            }
+        ));
+        assert!(matches!(
+            items[1],
+            NotificationCenterItem::Single {
+                member: HistoryEntryId(3)
+            }
+        ));
+        assert_eq!(items[2].group_key(), None);
+        assert_eq!(items[3].group_key(), None);
+    }
+
+    #[test]
+    fn expansion_is_derived_without_redundant_member_count() {
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(GroupKey::ApplicationName("Discord".into()));
+        let items = notification_center_items(
+            &[entry(2, "Discord"), entry(1, "Discord"), entry(9, "Slack")],
+            &expanded,
+        );
+        assert!(items[0].is_expanded());
+        assert_eq!(items[0].members().len(), 2);
+        assert_eq!(items[1].members().len(), 1);
+    }
+
+    #[test]
+    fn group_transitions_follow_authoritative_members() {
+        let key = GroupKey::ApplicationName("Discord".into());
+        let expanded = std::collections::HashSet::from([key.clone()]);
+        let group =
+            notification_center_items(&[entry(2, "Discord"), entry(1, "Discord")], &expanded);
+        assert!(group[0].is_expanded());
+        let singleton = notification_center_items(&[entry(1, "Discord")], &expanded);
+        assert!(matches!(
+            singleton[0],
+            NotificationCenterItem::Single { .. }
+        ));
+        assert!(!singleton[0].is_expanded());
+        assert!(notification_center_items(&[], &expanded).is_empty());
+    }
+
+    #[test]
+    fn target_lookup_returns_only_real_group_members() {
+        let history = [entry(3, "Discord"), entry(2, "Discord"), entry(1, "Slack")];
+        assert_eq!(
+            notification_group_for_history_id(&history, HistoryEntryId(2)),
+            Some(GroupKey::ApplicationName("Discord".into()))
+        );
+        assert_eq!(
+            notification_group_for_history_id(&history, HistoryEntryId(1)),
+            None
+        );
+        assert_eq!(
+            notification_group_for_history_id(&history, HistoryEntryId(99)),
+            None
+        );
+    }
+}
+
+pub fn notification_center_items(
+    history: &[NotificationHistoryEntry],
+    expanded_groups: &std::collections::HashSet<GroupKey>,
+) -> Vec<NotificationCenterItem> {
+    let mut items = Vec::new();
+    let mut group_positions = std::collections::HashMap::new();
+
+    for entry in history {
+        let Some(key) =
+            (!entry.app_name.is_empty()).then(|| GroupKey::ApplicationName(entry.app_name.clone()))
+        else {
+            items.push(NotificationCenterItem::Single { member: entry.id });
+            continue;
+        };
+
+        if let Some(&position) = group_positions.get(&key) {
+            match &mut items[position] {
+                NotificationCenterItem::Single { member } => {
+                    let first = *member;
+                    items[position] = NotificationCenterItem::Group {
+                        expanded: expanded_groups.contains(&key),
+                        key: key.clone(),
+                        members: vec![first, entry.id],
+                    };
+                }
+                NotificationCenterItem::Group { members, .. } => members.push(entry.id),
+            }
+        } else {
+            group_positions.insert(key, items.len());
+            items.push(NotificationCenterItem::Single { member: entry.id });
+        }
+    }
+
+    items
+}
+
+pub fn notification_group_keys(
+    history: &[NotificationHistoryEntry],
+) -> std::collections::HashSet<GroupKey> {
+    notification_center_items(history, &Default::default())
+        .into_iter()
+        .filter_map(|item| item.group_key().cloned())
+        .collect()
+}
+
+pub fn notification_group_for_history_id(
+    history: &[NotificationHistoryEntry],
+    history_id: HistoryEntryId,
+) -> Option<GroupKey> {
+    notification_center_items(history, &Default::default())
+        .into_iter()
+        .find(|item| item.members().contains(&history_id))
+        .and_then(|item| item.group_key().cloned())
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum NotificationSource {
     #[default]
@@ -459,6 +691,7 @@ pub struct State {
     pub notification_history: Vec<NotificationHistoryEntry>,
     pub notification_action_projections: Vec<NotificationActionProjection>,
     pub notification_center_open: Option<OutputId>,
+    pub expanded_notification_groups: std::collections::HashSet<GroupKey>,
     pub audio_dragging: bool,
     pub audio_drag_input: bool,
     pub status_notifiers: super::StatusNotifierRegistry,

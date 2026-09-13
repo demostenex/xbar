@@ -188,6 +188,10 @@ pub enum Event {
         output: super::OutputId,
         target: Option<super::HistoryEntryId>,
     },
+    #[allow(dead_code)]
+    ExpandNotificationGroup(super::GroupKey),
+    #[allow(dead_code)]
+    CollapseNotificationGroup(super::GroupKey),
     NotificationToastConsumed,
     WindowAttentionChanged {
         window: WindowId,
