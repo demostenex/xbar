@@ -2,7 +2,7 @@ use crate::core::{
     GtkMenuEndpoint, MenuItemId, NetworkWifiTarget, NotificationActionProjection,
     NotificationActionView, OutputId, OutputState, State, StatusNotifierEndpoint, WindowId,
 };
-use crate::ui::style::{self, FontMetrics, TextMeasurer, BAR_STYLE, POPUP_STYLE};
+use crate::ui::style::{self, FontMetrics, TextMeasurer, BAR_STYLE, POPUP_STYLE, TOAST_STYLE};
 use crate::ui::{layout, view};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -276,7 +276,6 @@ pub struct X11Platform {
     text: X11Text,
     conn: XCBConnection,
     root: u32,
-    default_surface: SurfaceVisual,
     // One platform-owned colormap is intentionally shared by every xbar-owned
     // glass window using this visual. It is released only after all such
     // windows and their Xft drawables are gone.
@@ -600,6 +599,7 @@ struct ToastCardHit {
 struct ToastRenderItem {
     history_id: crate::core::HistoryEntryId,
     title: String,
+    secondary: String,
     body: String,
     rect: layout::MenuRect,
     rear_rects: Vec<layout::MenuRect>,
@@ -761,25 +761,37 @@ pub fn notification_center_button_action(
     }
 }
 
-const NOTIFICATION_HEADER_HEIGHT: u16 = 28;
+const NOTIFICATION_HEADER_HEIGHT: u16 = 42;
+const NOTIFICATION_CENTER_WIDTH: u16 = 420;
 const NOTIFICATION_OUTER_PADDING: u16 = POPUP_STYLE.outer_padding;
 const NOTIFICATION_GROUP_CONTAINER_INSET: i16 = POPUP_STYLE.card_padding as i16;
-const NOTIFICATION_CARD_CONTENT_PADDING: i16 = POPUP_STYLE.card_padding as i16;
+const NOTIFICATION_CARD_CONTENT_PADDING: i16 = 12;
+const NOTIFICATION_CARD_RADIUS: u16 = 11;
+const NOTIFICATION_GROUP_HEADER_RADIUS: u16 = 10;
+const NOTIFICATION_ACTION_RADIUS: u16 = 8;
+const NOTIFICATION_CLEAR_ALL_RADIUS: u16 = 8;
+const NOTIFICATION_DISMISS_HOVER_RADIUS: u16 = 9;
 const MAX_VISIBLE_TOASTS: usize = 5;
-const NOTIFICATION_HEADER_CONTROL_WIDTH: u16 = 68;
-const NOTIFICATION_HEADER_CONTROL_PADDING: u16 = 16;
+const TOAST_WIDTH: u16 = 400;
+const TOAST_CARD_RADIUS: u16 = NOTIFICATION_CARD_RADIUS;
+const TOAST_CARD_INSET: i16 = 10;
+const TOAST_CARD_PADDING: i16 = 12;
+const TOAST_CARD_GAP: u16 = 8;
+const TOAST_CANVAS_CLEAR: style::Rgba = style::Rgba::new(0, 0, 0, 0);
+const NOTIFICATION_HEADER_CONTROL_WIDTH: u16 = 76;
+const NOTIFICATION_HEADER_CONTROL_PADDING: u16 = 20;
 const NOTIFICATION_HEADER_RIGHT_MARGIN: u16 = 8;
 const NOTIFICATION_HEADER_CONTROL_BACKGROUND: u32 = 0x2b3340;
 const NOTIFICATION_HEADER_CONTROL_HOVER_BACKGROUND: u32 = 0x354052;
-const NOTIFICATION_BASE_CARD_HEIGHT: u16 = 54;
+const NOTIFICATION_BASE_CARD_HEIGHT: u16 = 78;
 const NOTIFICATION_CARD_SLOT_GAP: u16 = 8;
 const NOTIFICATION_SCROLL_STEP: u16 = 62;
-const NOTIFICATION_ACTION_HEIGHT: u16 = 24;
-const NOTIFICATION_ACTION_PADDING: u16 = 16;
+const NOTIFICATION_ACTION_HEIGHT: u16 = 30;
+const NOTIFICATION_ACTION_PADDING: u16 = 20;
 const NOTIFICATION_ACTION_GAP: u16 = 4;
 const NOTIFICATION_ACTION_ROW_GAP: u16 = 4;
-const NOTIFICATION_ACTION_TOP_GAP: u16 = 4;
-const NOTIFICATION_ACTION_BOTTOM_GAP: u16 = 4;
+const NOTIFICATION_ACTION_TOP_GAP: u16 = 8;
+const NOTIFICATION_ACTION_BOTTOM_GAP: u16 = 8;
 const NOTIFICATION_ACTION_PAGER_WIDTH: u16 = 20;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -801,21 +813,59 @@ struct NotificationEntryLayout {
     compact: bool,
 }
 
-const NOTIFICATION_GROUP_HEADER_HEIGHT: u16 = 24;
+const NOTIFICATION_GROUP_HEADER_HEIGHT: u16 = 34;
 const NOTIFICATION_GROUP_INTERNAL_GAP: u16 = POPUP_STYLE.card_gap;
 const NOTIFICATION_GROUP_REAR_OFFSET: i16 = 4;
 const NOTIFICATION_GROUP_REAR_INSET: i16 = 4;
 
-fn notification_center_outer_background(surface: SurfaceVisual) -> u32 {
+fn toast_canvas_background(surface: SurfaceVisual) -> style::Rgba {
     match surface.kind {
-        SurfaceKind::Argb | SurfaceKind::Default => {
-            surface.background_pixel(POPUP_STYLE.material.background)
-        }
+        SurfaceKind::Argb => TOAST_CANVAS_CLEAR,
+        SurfaceKind::Default => BAR_STYLE.material.background,
     }
 }
 
-fn notification_group_container_rect(bounds: layout::MenuRect) -> layout::MenuRect {
-    bounds
+fn toast_card_geometry(
+    width: u16,
+    item_y: u16,
+    card_height: u16,
+    grouped: bool,
+    member_count: usize,
+) -> (layout::MenuRect, Vec<layout::MenuRect>) {
+    let card_x = TOAST_CARD_INSET;
+    let card_width = width.saturating_sub((TOAST_CARD_INSET as u16).saturating_mul(2));
+    let rect = layout::MenuRect {
+        x: card_x,
+        y: (item_y + if grouped { 4 } else { 0 }) as i16,
+        width: card_width,
+        height: card_height,
+    };
+    let rear_rects = if grouped {
+        (0..member_count.min(3).saturating_sub(1))
+            .map(|layer| layout::MenuRect {
+                x: rect.x - 4 * (layer as i16 + 1),
+                y: rect.y,
+                width: card_width.saturating_add(4 * (layer as u16 + 1)),
+                height: card_height,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (rect, rear_rects)
+}
+
+fn notification_center_width(output_width: u16) -> u16 {
+    NOTIFICATION_CENTER_WIDTH.min(output_width.max(1))
+}
+
+fn notification_rounded_inner_rect(rect: layout::MenuRect) -> layout::MenuRect {
+    layout::MenuRect {
+        x: rect.x.saturating_add(1),
+        y: rect.y.saturating_add(1),
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1060,7 +1110,10 @@ fn notification_entry_layout(
                 .unwrap_or(0)
         })
         .collect::<Vec<_>>();
-    let normal_actions = pack_action_rows(&explicit, &explicit_widths, available_width);
+    let mut normal_actions = pack_action_rows(&explicit, &explicit_widths, available_width);
+    if normal_actions.len() == 1 {
+        normal_actions[0].width = available_width;
+    }
     let normal_rows = action_row_count(&normal_actions);
     let normal_height = normal_action_card_height(normal_rows);
     if normal_height <= viewport_height {
@@ -1149,7 +1202,10 @@ fn notification_entry_layout(
                 .unwrap_or(0)
         })
         .collect::<Vec<_>>();
-    let page_layout = pack_action_rows(&page_actions, &page_widths, available_width);
+    let mut page_layout = pack_action_rows(&page_actions, &page_widths, available_width);
+    if page_layout.len() == 1 {
+        page_layout[0].width = available_width;
+    }
     let card_height = viewport_height.max(
         NOTIFICATION_BASE_CARD_HEIGHT
             .saturating_add(NOTIFICATION_ACTION_TOP_GAP)
@@ -1275,7 +1331,7 @@ fn notification_center_layout(
                 ) else {
                     continue;
                 };
-                card.rect.y = 4;
+                card.rect.y = 0;
                 result.push(NotificationCenterLayoutItem::Single { card });
             }
             crate::core::NotificationCenterItem::Group {
@@ -1365,13 +1421,10 @@ fn notification_center_layout(
                     let rear_count = members.len().min(3).saturating_sub(1);
                     let rear_rects = (0..rear_count)
                         .map(|layer| layout::MenuRect {
-                            x: NOTIFICATION_OUTER_PADDING as i16
-                                + NOTIFICATION_GROUP_REAR_INSET * (layer as i16 + 1),
-                            y: NOTIFICATION_GROUP_REAR_OFFSET * layer as i16,
-                            width: width.saturating_sub(
-                                NOTIFICATION_OUTER_PADDING * 2
-                                    + (NOTIFICATION_GROUP_REAR_INSET * 2 * (layer as i16 + 1))
-                                        as u16,
+                            x: front.rect.x - NOTIFICATION_GROUP_REAR_INSET * (layer as i16 + 1),
+                            y: front.rect.y,
+                            width: front.rect.width.saturating_add(
+                                (NOTIFICATION_GROUP_REAR_INSET * (layer as i16 + 1)) as u16,
                             ),
                             height: front.rect.height,
                         })
@@ -1651,9 +1704,9 @@ fn notification_header_rect(width: u16, text_width: u16) -> layout::MenuRect {
     let right_margin = NOTIFICATION_HEADER_RIGHT_MARGIN.min(width - control_width);
     layout::MenuRect {
         x: (width - control_width - right_margin) as i16,
-        y: 4,
+        y: 8,
         width: control_width,
-        height: 20,
+        height: 26,
     }
 }
 
@@ -2076,6 +2129,10 @@ const fn frame_policy_property_value(policy: FramePolicy) -> [u32; 1] {
     [policy as u32]
 }
 
+const fn notification_center_frame_policy() -> FramePolicy {
+    FramePolicy::Request
+}
+
 fn with_default_border_pixel(attributes: xproto::CreateWindowAux) -> xproto::CreateWindowAux {
     if attributes.border_pixel.is_none() && attributes.border_pixmap.is_none() {
         attributes.border_pixel(0)
@@ -2131,6 +2188,28 @@ impl X11Platform {
         background: style::Rgba,
         attributes: xproto::CreateWindowAux,
     ) -> Result<(), Box<dyn Error>> {
+        self.create_surface_window_with_effect(
+            surface,
+            role,
+            window,
+            geometry,
+            background,
+            attributes,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_surface_window_with_effect(
+        &self,
+        surface: SurfaceVisual,
+        role: SurfaceRole,
+        window: u32,
+        geometry: SurfaceWindowGeometry,
+        background: style::Rgba,
+        attributes: xproto::CreateWindowAux,
+        apply_effect: bool,
+    ) -> Result<(), Box<dyn Error>> {
         let attributes = with_default_border_pixel(attributes)
             .colormap(surface.colormap)
             .background_pixel(surface.background_pixel(background));
@@ -2149,7 +2228,9 @@ impl X11Platform {
                 &attributes,
             )?
             .check()?;
-        self.apply_surface_effect(surface, role, window, geometry)?;
+        if apply_effect {
+            self.apply_surface_effect(surface, role, window, geometry)?;
+        }
         self.set_xomposite_frame_policy(window, role.frame_policy())?;
         Ok(())
     }
@@ -2302,7 +2383,29 @@ impl X11Platform {
         width: u16,
         height: u16,
     ) -> Result<(), Box<dyn Error>> {
-        let radius = POPUP_STYLE.card_radius.min(width / 2).min(height / 2);
+        self.fill_rounded_popup_card_with_radius(
+            window,
+            gc,
+            x,
+            y,
+            width,
+            height,
+            POPUP_STYLE.card_radius,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill_rounded_popup_card_with_radius(
+        &self,
+        window: u32,
+        gc: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        requested_radius: u16,
+    ) -> Result<(), Box<dyn Error>> {
+        let radius = requested_radius.min(width / 2).min(height / 2);
         if radius == 0 {
             self.conn.poly_fill_rectangle(
                 window,
@@ -2341,6 +2444,43 @@ impl X11Platform {
             height: height.saturating_sub(radius.saturating_mul(2)),
         });
         self.conn.poly_fill_rectangle(window, gc, &strips)?;
+        Ok(())
+    }
+
+    fn draw_notification_rounded_panel(
+        &self,
+        window: u32,
+        gc: u32,
+        rect: layout::MenuRect,
+        border_pixel: u32,
+        fill_pixel: u32,
+        radius: u16,
+    ) -> Result<(), Box<dyn Error>> {
+        self.conn
+            .change_gc(gc, &xproto::ChangeGCAux::new().foreground(border_pixel))?
+            .check()?;
+        self.fill_rounded_popup_card_with_radius(
+            window,
+            gc,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height,
+            radius,
+        )?;
+        self.conn
+            .change_gc(gc, &xproto::ChangeGCAux::new().foreground(fill_pixel))?
+            .check()?;
+        let inner = notification_rounded_inner_rect(rect);
+        self.fill_rounded_popup_card_with_radius(
+            window,
+            gc,
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height,
+            radius.saturating_sub(1),
+        )?;
         Ok(())
     }
 
@@ -2579,7 +2719,6 @@ impl X11Platform {
         let mut platform = Self {
             conn,
             root,
-            default_surface,
             glass_surface,
             atoms,
             text,
@@ -3984,7 +4123,7 @@ impl X11Platform {
             }
             return Ok(());
         }
-        let width = 360_u16.min(output.width.max(1));
+        let width = TOAST_WIDTH.min(output.width.max(1));
         let x =
             (output.x as i32 + output.width as i32 - width as i32 - 10).max(output.x as i32) as i16;
         let y = output.y + BAR_HEIGHT as i16 + 8;
@@ -4035,7 +4174,7 @@ impl X11Platform {
                 continue;
             };
             let body = single_line(&notification.body);
-            let gap = if cards.is_empty() { 0 } else { 8 };
+            let gap = if cards.is_empty() { 0 } else { TOAST_CARD_GAP };
             let grouped = item.group_key().is_some();
             let item_height = toast_item_height(&item, &body);
             let card_height = item_height.saturating_sub(if grouped { 8 } else { 0 });
@@ -4044,25 +4183,14 @@ impl X11Platform {
                 break;
             }
             let item_y = stack_height.saturating_add(gap);
-            let rect = layout::MenuRect {
-                x: 0,
-                y: (item_y + if grouped { 4 } else { 0 }) as i16,
-                width,
-                height: card_height,
-            };
-            let rear_rects = if grouped {
-                (0..item.members().len().min(3).saturating_sub(1))
-                    .map(|layer| layout::MenuRect {
-                        x: 4 * (layer as i16 + 1),
-                        y: item_y as i16 + 2 * layer as i16,
-                        width: width.saturating_sub(8 * (layer as u16 + 1)),
-                        height: card_height,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            let (rect, rear_rects) =
+                toast_card_geometry(width, item_y, card_height, grouped, item.members().len());
             stack_height = required;
+            let secondary = if item.group_key().is_none() {
+                single_line(&notification.summary)
+            } else {
+                String::new()
+            };
             let title = item
                 .group_key()
                 .map(|key| match key {
@@ -4070,10 +4198,11 @@ impl X11Platform {
                         format!("{name} · {}", item.members().len())
                     }
                 })
-                .unwrap_or_else(|| single_line(&notification.summary));
+                .unwrap_or_else(|| single_line(&notification.app_name));
             cards.push(ToastRenderItem {
                 history_id,
                 title,
+                secondary,
                 body,
                 rect,
                 rear_rects,
@@ -4091,8 +4220,8 @@ impl X11Platform {
         } else {
             let window = self.conn.generate_id()?;
             trace_x11_resource("WINDOW_CREATE", "notification", window);
-            self.create_surface_window(
-                self.default_surface,
+            self.create_surface_window_with_effect(
+                self.glass_surface,
                 SurfaceRole::Notification,
                 window,
                 SurfaceWindowGeometry {
@@ -4102,10 +4231,11 @@ impl X11Platform {
                     height,
                     border_width: 1,
                 },
-                BAR_STYLE.material.background,
+                toast_canvas_background(self.glass_surface),
                 xproto::CreateWindowAux::new()
                     .override_redirect(1)
                     .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
+                false,
             )?;
             self.conn
                 .change_property32(
@@ -4140,12 +4270,12 @@ impl X11Platform {
             self.notification.as_ref().and_then(|n| n.backing),
             width,
             height,
-            self.default_surface.depth,
+            self.glass_surface.depth,
         );
         let backing = if backing_replaced {
             let pixmap = self.conn.generate_id()?;
             self.conn
-                .create_pixmap(self.default_surface.depth, pixmap, self.root, width, height)?
+                .create_pixmap(self.glass_surface.depth, pixmap, self.root, width, height)?
                 .check()?;
             let gc = self.conn.generate_id()?;
             self.conn
@@ -4153,8 +4283,8 @@ impl X11Platform {
                     gc,
                     pixmap,
                     &xproto::CreateGCAux::new().foreground(
-                        self.default_surface
-                            .background_pixel(BAR_STYLE.material.background),
+                        self.glass_surface
+                            .background_pixel(toast_canvas_background(self.glass_surface)),
                     ),
                 )?
                 .check()?;
@@ -4168,7 +4298,7 @@ impl X11Platform {
                 gc,
                 width,
                 height,
-                depth: self.default_surface.depth,
+                depth: self.glass_surface.depth,
             }
         } else {
             self.notification
@@ -4176,68 +4306,78 @@ impl X11Platform {
                 .and_then(|n| n.backing)
                 .expect("notification backing")
         };
+        self.conn
+            .change_gc(
+                backing.gc,
+                &xproto::ChangeGCAux::new().foreground(
+                    self.glass_surface
+                        .background_pixel(toast_canvas_background(self.glass_surface)),
+                ),
+            )?
+            .check()?;
+        self.conn
+            .poly_fill_rectangle(
+                backing.pixmap,
+                backing.gc,
+                &[xproto::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }],
+            )?
+            .check()?;
+        let card_border = self.glass_surface.opaque_pixel(TOAST_STYLE.card_border);
+        let rear_material = self
+            .glass_surface
+            .opaque_pixel(POPUP_STYLE.material.background.rgb());
+        let card_material = notification_card_background(self.glass_surface);
         for card in &cards {
-            for rect in &card.rear_rects {
-                self.conn.poly_fill_rectangle(
+            for rect in card.rear_rects.iter().rev() {
+                self.draw_notification_rounded_panel(
                     backing.pixmap,
                     backing.gc,
-                    &[xproto::Rectangle {
-                        x: rect.x,
-                        y: rect.y,
-                        width: rect.width,
-                        height: rect.height,
-                    }],
-                )?;
-                self.conn.poly_rectangle(
-                    backing.pixmap,
-                    backing.gc,
-                    &[xproto::Rectangle {
-                        x: rect.x,
-                        y: rect.y,
-                        width: rect.width,
-                        height: rect.height,
-                    }],
+                    *rect,
+                    card_border,
+                    rear_material,
+                    TOAST_CARD_RADIUS,
                 )?;
             }
-            let rect = card.rect;
-            self.conn.poly_fill_rectangle(
+            self.draw_notification_rounded_panel(
                 backing.pixmap,
                 backing.gc,
-                &[xproto::Rectangle {
-                    x: rect.x,
-                    y: rect.y,
-                    width: rect.width,
-                    height: rect.height,
-                }],
-            )?;
-            self.conn.poly_rectangle(
-                backing.pixmap,
-                backing.gc,
-                &[xproto::Rectangle {
-                    x: rect.x,
-                    y: rect.y,
-                    width: rect.width,
-                    height: rect.height,
-                }],
+                card.rect,
+                card_border,
+                card_material,
+                TOAST_CARD_RADIUS,
             )?;
         }
         self.conn.flush()?;
         self.conn.get_input_focus()?.reply()?;
         self.text
-            .prepare_drawable("notification", backing.pixmap, self.default_surface)?;
+            .prepare_drawable("notification", backing.pixmap, self.glass_surface)?;
         for card in &cards {
+            let text_x = i32::from(card.rect.x) + i32::from(TOAST_CARD_PADDING);
             self.text.draw_popup_utf8(
                 &card.title,
-                12,
-                i32::from(card.rect.y) + 25,
-                BAR_STYLE.material.foreground,
+                text_x,
+                i32::from(card.rect.y) + 22,
+                TOAST_STYLE.title_foreground,
             )?;
+            if !card.secondary.is_empty() {
+                self.text.draw_popup_utf8(
+                    &card.secondary,
+                    text_x,
+                    i32::from(card.rect.y) + 42,
+                    BAR_STYLE.material.foreground,
+                )?;
+            }
             if !card.body.is_empty() {
                 self.text.draw_popup_utf8(
                     &card.body,
-                    12,
-                    i32::from(card.rect.y) + 52,
-                    BAR_STYLE.material.foreground,
+                    text_x,
+                    i32::from(card.rect.y) + if card.secondary.is_empty() { 45 } else { 62 },
+                    TOAST_STYLE.body_foreground,
                 )?;
             }
         }
@@ -4289,7 +4429,7 @@ impl X11Platform {
         let Some(output) = state.outputs.iter().find(|output| output.id == output_id) else {
             return Ok(());
         };
-        let width = 360_u16.min(output.width.max(1));
+        let width = notification_center_width(output.width);
         let available = output.height.saturating_sub(BAR_HEIGHT + 12);
         let has_header = !state.notification_history.is_empty();
         let header_height = if has_header {
@@ -4432,6 +4572,7 @@ impl X11Platform {
                     .override_redirect(1)
                     .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
             )?;
+            self.set_xomposite_frame_policy(window, notification_center_frame_policy())?;
             self.configure_auxiliary_effect_surface(
                 SurfaceRole::Notification,
                 window,
@@ -4492,8 +4633,10 @@ impl X11Platform {
                 .create_gc(
                     gc,
                     pixmap,
-                    &xproto::CreateGCAux::new()
-                        .foreground(notification_center_outer_background(self.glass_surface)),
+                    &xproto::CreateGCAux::new().foreground(
+                        self.glass_surface
+                            .background_pixel(POPUP_STYLE.material.background),
+                    ),
                 )?
                 .check()?;
             if let Some(old) = self
@@ -4518,87 +4661,27 @@ impl X11Platform {
                 .and_then(|center| center.backing)
                 .expect("center backing")
         };
-        self.conn
-            .change_gc(
-                backing.gc,
-                &xproto::ChangeGCAux::new()
-                    .foreground(notification_center_outer_background(self.glass_surface)),
-            )?
-            .check()?;
-        self.conn.poly_fill_rectangle(
-            backing.pixmap,
-            backing.gc,
-            &[xproto::Rectangle {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            }],
-        )?;
+        self.fill_glass_background(backing.pixmap, backing.gc, width, height)?;
         self.draw_popup_frame(backing.pixmap, backing.gc, width, height)?;
         let clear_all_text_width = self.text.measure_popup_width("Clear All");
         let clear_all_rect =
             notification_header_for_history(width, clear_all_text_width, has_header);
         if let Some(rect) = clear_all_rect {
-            self.conn
-                .change_gc(
-                    backing.gc,
-                    &xproto::ChangeGCAux::new().foreground(
-                        self.glass_surface
-                            .background_pixel(POPUP_STYLE.card_background),
-                    ),
-                )?
-                .check()?;
-            self.conn.poly_fill_rectangle(
-                backing.pixmap,
-                backing.gc,
-                &[xproto::Rectangle {
-                    x: NOTIFICATION_OUTER_PADDING as i16,
-                    y: 4,
-                    width: width.saturating_sub(NOTIFICATION_OUTER_PADDING * 2),
-                    height: NOTIFICATION_HEADER_HEIGHT.saturating_sub(8),
-                }],
-            )?;
             let clear_all_hovered = self
                 .notification_center
                 .as_ref()
                 .is_some_and(|center| center.hover == Some(NotificationCenterHover::ClearAll));
-            self.conn
-                .change_gc(
-                    backing.gc,
-                    &xproto::ChangeGCAux::new().foreground(self.glass_surface.opaque_pixel(
-                        if clear_all_hovered {
-                            NOTIFICATION_HEADER_CONTROL_HOVER_BACKGROUND
-                        } else {
-                            NOTIFICATION_HEADER_CONTROL_BACKGROUND
-                        },
-                    )),
-                )?
-                .check()?;
-            self.fill_rounded_popup_card(
+            self.draw_notification_rounded_panel(
                 backing.pixmap,
                 backing.gc,
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
-            )?;
-            self.conn
-                .change_gc(
-                    backing.gc,
-                    &xproto::ChangeGCAux::new()
-                        .foreground(self.glass_surface.opaque_pixel(POPUP_STYLE.card_border)),
-                )?
-                .check()?;
-            self.conn.poly_rectangle(
-                backing.pixmap,
-                backing.gc,
-                &[xproto::Rectangle {
-                    x: rect.x,
-                    y: rect.y,
-                    width: rect.width,
-                    height: rect.height,
-                }],
+                rect,
+                self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                self.glass_surface.opaque_pixel(if clear_all_hovered {
+                    NOTIFICATION_HEADER_CONTROL_HOVER_BACKGROUND
+                } else {
+                    NOTIFICATION_HEADER_CONTROL_BACKGROUND
+                }),
+                NOTIFICATION_CLEAR_ALL_RADIUS,
             )?;
             self.conn.flush()?;
             self.conn.get_input_focus()?.reply()?;
@@ -4677,69 +4760,14 @@ impl X11Platform {
                     rear_rects,
                     ..
                 } => {
-                    let container = notification_group_container_rect(*bounds);
-                    self.conn
-                        .change_gc(
-                            backing.gc,
-                            &xproto::ChangeGCAux::new().foreground(
-                                self.glass_surface
-                                    .background_pixel(POPUP_STYLE.material.background),
-                            ),
-                        )?
-                        .check()?;
-                    self.fill_rounded_popup_card(
-                        backing.pixmap,
-                        backing.gc,
-                        container.x,
-                        container.y,
-                        container.width,
-                        container.height,
-                    )?;
-                    self.conn
-                        .change_gc(
-                            backing.gc,
-                            &xproto::ChangeGCAux::new().foreground(
-                                self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
-                            ),
-                        )?
-                        .check()?;
-                    self.conn.poly_rectangle(
-                        backing.pixmap,
-                        backing.gc,
-                        &[xproto::Rectangle {
-                            x: container.x,
-                            y: container.y,
-                            width: container.width,
-                            height: container.height,
-                        }],
-                    )?;
-                    for rect in rear_rects {
-                        self.conn
-                            .change_gc(
-                                backing.gc,
-                                &xproto::ChangeGCAux::new()
-                                    .foreground(self.glass_surface.opaque_pixel(0x252c36)),
-                            )?
-                            .check()?;
-                        self.conn.poly_fill_rectangle(
+                    for rect in rear_rects.iter().rev() {
+                        self.draw_notification_rounded_panel(
                             backing.pixmap,
                             backing.gc,
-                            &[xproto::Rectangle {
-                                x: rect.x,
-                                y: rect.y,
-                                width: rect.width,
-                                height: rect.height,
-                            }],
-                        )?;
-                        self.conn.poly_rectangle(
-                            backing.pixmap,
-                            backing.gc,
-                            &[xproto::Rectangle {
-                                x: rect.x,
-                                y: rect.y,
-                                width: rect.width,
-                                height: rect.height,
-                            }],
+                            *rect,
+                            self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                            self.glass_surface.opaque_pixel(0x252c36),
+                            NOTIFICATION_CARD_RADIUS,
                         )?;
                     }
                     group_hits.push(NotificationGroupHit {
@@ -4753,61 +4781,17 @@ impl X11Platform {
                     key,
                     members,
                     header_rect,
-                    bounds,
+                    bounds: _,
                     ..
                 } => {
-                    let container = notification_group_container_rect(*bounds);
-                    self.conn
-                        .change_gc(
-                            backing.gc,
-                            &xproto::ChangeGCAux::new().foreground(
-                                self.glass_surface
-                                    .background_pixel(POPUP_STYLE.material.background),
-                            ),
-                        )?
-                        .check()?;
-                    self.fill_rounded_popup_card(
+                    self.draw_notification_rounded_panel(
                         backing.pixmap,
                         backing.gc,
-                        container.x,
-                        container.y,
-                        container.width,
-                        container.height,
-                    )?;
-                    self.conn
-                        .change_gc(
-                            backing.gc,
-                            &xproto::ChangeGCAux::new().foreground(
-                                self.glass_surface
-                                    .background_pixel(POPUP_STYLE.card_background),
-                            ),
-                        )?
-                        .check()?;
-                    self.fill_rounded_popup_card(
-                        backing.pixmap,
-                        backing.gc,
-                        header_rect.x,
-                        header_rect.y,
-                        header_rect.width,
-                        header_rect.height,
-                    )?;
-                    self.conn
-                        .change_gc(
-                            backing.gc,
-                            &xproto::ChangeGCAux::new().foreground(
-                                self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
-                            ),
-                        )?
-                        .check()?;
-                    self.conn.poly_rectangle(
-                        backing.pixmap,
-                        backing.gc,
-                        &[xproto::Rectangle {
-                            x: header_rect.x,
-                            y: header_rect.y,
-                            width: header_rect.width,
-                            height: header_rect.height,
-                        }],
+                        *header_rect,
+                        self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                        self.glass_surface
+                            .background_pixel(POPUP_STYLE.card_background),
+                        NOTIFICATION_GROUP_HEADER_RADIUS,
                     )?;
                     self.conn.flush()?;
                     self.conn.get_input_focus()?.reply()?;
@@ -4817,7 +4801,12 @@ impl X11Platform {
                         self.glass_surface,
                     )?;
                     let crate::core::GroupKey::ApplicationName(label) = key;
-                    let baseline = i32::from(header_rect.y) + 17;
+                    let baseline = i32::from(header_rect.y)
+                        + i32::from(
+                            self.text
+                                .popup_metrics()
+                                .centered_baseline(header_rect.height),
+                        );
                     if notification_content_text_visible(
                         content_viewport,
                         baseline,
@@ -4828,6 +4817,19 @@ impl X11Platform {
                             i32::from(header_rect.x) + NOTIFICATION_CARD_CONTENT_PADDING as i32,
                             baseline,
                             BAR_STYLE.material.foreground,
+                        )?;
+                    }
+                    if notification_content_text_visible(
+                        content_viewport,
+                        baseline,
+                        self.text.popup_metrics(),
+                    ) {
+                        self.text.draw_popup_utf8(
+                            "⌄",
+                            i32::from(header_rect.x)
+                                + i32::from(header_rect.width.saturating_sub(20)),
+                            baseline,
+                            POPUP_STYLE.muted_foreground,
                         )?;
                     }
                     self.text.release_drawable(backing.pixmap);
@@ -4956,85 +4958,45 @@ impl X11Platform {
                     matches!(hover, NotificationCenterHover::Card(id) | NotificationCenterHover::Dismiss(id) if id == entry.id)
                 });
             let highlighted = self.notification_center_highlight == Some(entry.id);
-            self.conn
-                .change_gc(
-                    backing.gc,
-                    &xproto::ChangeGCAux::new().foreground(if hovered {
-                        self.glass_surface
-                            .background_pixel(POPUP_STYLE.hover_background)
-                    } else if highlighted {
-                        self.glass_surface.opaque_pixel(0x3b4658)
-                    } else {
-                        notification_card_background(self.glass_surface)
-                    }),
-                )?
-                .check()?;
-            self.fill_rounded_popup_card(
+            self.draw_notification_rounded_panel(
                 backing.pixmap,
                 backing.gc,
-                card_rect.x,
-                card_rect.y,
-                card_rect.width,
-                card_rect.height,
-            )?;
-            self.conn
-                .change_gc(
-                    backing.gc,
-                    &xproto::ChangeGCAux::new()
-                        .foreground(self.glass_surface.opaque_pixel(POPUP_STYLE.card_border)),
-                )?
-                .check()?;
-            self.conn.poly_rectangle(
-                backing.pixmap,
-                backing.gc,
-                &[xproto::Rectangle {
-                    x: card_rect.x,
-                    y: card_rect.y,
-                    width: card_rect.width,
-                    height: card_rect.height,
-                }],
+                card_rect,
+                self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                if hovered {
+                    self.glass_surface
+                        .background_pixel(POPUP_STYLE.hover_background)
+                } else if highlighted {
+                    self.glass_surface.opaque_pixel(0x3b4658)
+                } else {
+                    notification_card_background(self.glass_surface)
+                },
+                NOTIFICATION_CARD_RADIUS,
             )?;
             if let Some(dismiss_rect) = dismiss_rect {
                 let dismiss_hovered = self.notification_center.as_ref().is_some_and(|center| {
                     matches!(center.hover, Some(NotificationCenterHover::Dismiss(id)) if id == entry.id)
                 });
-                self.conn
-                    .change_gc(
+                if dismiss_hovered {
+                    self.conn
+                        .change_gc(
+                            backing.gc,
+                            &xproto::ChangeGCAux::new().foreground(
+                                self.glass_surface
+                                    .opaque_pixel(POPUP_STYLE.hover_background.rgb()),
+                            ),
+                        )?
+                        .check()?;
+                    self.fill_rounded_popup_card_with_radius(
+                        backing.pixmap,
                         backing.gc,
-                        &xproto::ChangeGCAux::new().foreground(self.glass_surface.opaque_pixel(
-                            if dismiss_hovered {
-                                POPUP_STYLE.hover_background.rgb()
-                            } else {
-                                POPUP_STYLE.card_background.rgb()
-                            },
-                        )),
-                    )?
-                    .check()?;
-                self.fill_rounded_popup_card(
-                    backing.pixmap,
-                    backing.gc,
-                    dismiss_rect.x,
-                    dismiss_rect.y,
-                    dismiss_rect.width,
-                    dismiss_rect.height,
-                )?;
-                self.conn
-                    .change_gc(
-                        backing.gc,
-                        &xproto::ChangeGCAux::new()
-                            .foreground(self.glass_surface.opaque_pixel(POPUP_STYLE.card_border)),
-                    )?
-                    .check()?;
-                self.conn.poly_rectangle(
-                    backing.pixmap,
-                    backing.gc,
-                    &[xproto::Rectangle {
-                        x: dismiss_rect.x,
-                        y: dismiss_rect.y,
-                        width: dismiss_rect.width,
-                        height: dismiss_rect.height,
-                    }],
-                )?;
+                        dismiss_rect.x,
+                        dismiss_rect.y,
+                        dismiss_rect.width,
+                        dismiss_rect.height,
+                        NOTIFICATION_DISMISS_HOVER_RADIUS,
+                    )?;
+                }
             }
             for action in &action_rects {
                 let action_hovered = self.notification_center.as_ref().is_some_and(|center| {
@@ -5042,27 +5004,17 @@ impl X11Platform {
                         matches!(hover, NotificationCenterHover::Action(id, key) if *id == entry.id && key == &action.key)
                     })
                 });
-                self.conn
-                    .change_gc(
-                        backing.gc,
-                        &xproto::ChangeGCAux::new().foreground(
-                            self.glass_surface.opaque_pixel(if action_hovered {
-                                0x3f4d61
-                            } else {
-                                0x354052
-                            }),
-                        ),
-                    )?
-                    .check()?;
-                self.conn.poly_fill_rectangle(
+                self.draw_notification_rounded_panel(
                     backing.pixmap,
                     backing.gc,
-                    &[xproto::Rectangle {
-                        x: action.rect.x,
-                        y: action.rect.y,
-                        width: action.rect.width,
-                        height: action.rect.height,
-                    }],
+                    action.rect,
+                    self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                    self.glass_surface.opaque_pixel(if action_hovered {
+                        0x3f4d61
+                    } else {
+                        0x354052
+                    }),
+                    NOTIFICATION_ACTION_RADIUS,
                 )?;
             }
             for (rect, glyph) in [(pager_prev_rect, "<"), (pager_next_rect, ">")].into_iter() {
@@ -5075,27 +5027,14 @@ impl X11Platform {
                                     && matches!(hover, NotificationCenterHover::ActionPageNext(id) if *id == entry.id))
                         })
                     });
-                    self.conn
-                        .change_gc(
-                            backing.gc,
-                            &xproto::ChangeGCAux::new().foreground(
-                                self.glass_surface.opaque_pixel(if hovered {
-                                    0x3f4d61
-                                } else {
-                                    0x2b3340
-                                }),
-                            ),
-                        )?
-                        .check()?;
-                    self.conn.poly_fill_rectangle(
+                    self.draw_notification_rounded_panel(
                         backing.pixmap,
                         backing.gc,
-                        &[xproto::Rectangle {
-                            x: rect.x,
-                            y: rect.y,
-                            width: rect.width,
-                            height: rect.height,
-                        }],
+                        rect,
+                        self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                        self.glass_surface
+                            .opaque_pixel(if hovered { 0x3f4d61 } else { 0x2b3340 }),
+                        NOTIFICATION_ACTION_RADIUS,
                     )?;
                 }
             }
@@ -5122,20 +5061,20 @@ impl X11Platform {
             if card_rect.y + 20 <= content_bottom
                 && notification_content_text_visible(
                     content_viewport,
-                    i32::from(card_rect.y) + 20,
+                    i32::from(card_rect.y) + 24,
                     self.text.popup_metrics(),
                 )
             {
                 self.text.draw_popup_utf8(
                     &text.title,
                     text_x,
-                    i32::from(card_rect.y) + 20,
+                    i32::from(card_rect.y) + 24,
                     BAR_STYLE.material.foreground,
                 )?;
             }
             if let Some(secondary) = &text.secondary {
                 let baseline =
-                    i32::from(card_rect.y) + if text.tertiary.is_some() { 38 } else { 42 };
+                    i32::from(card_rect.y) + if text.tertiary.is_some() { 45 } else { 46 };
                 if notification_content_text_visible(
                     content_viewport,
                     baseline,
@@ -5150,7 +5089,7 @@ impl X11Platform {
                 }
             }
             if let Some(tertiary) = &text.tertiary {
-                let baseline = i32::from(card_rect.y) + 54;
+                let baseline = i32::from(card_rect.y) + 66;
                 if notification_content_text_visible(
                     content_viewport,
                     baseline,
@@ -5218,39 +5157,14 @@ impl X11Platform {
         }
         if state.notification_history.is_empty() {
             let empty_rect = notification_empty_state_rect(width, height);
-            self.conn
-                .change_gc(
-                    backing.gc,
-                    &xproto::ChangeGCAux::new().foreground(
-                        self.glass_surface
-                            .background_pixel(POPUP_STYLE.card_background),
-                    ),
-                )?
-                .check()?;
-            self.fill_rounded_popup_card(
+            self.draw_notification_rounded_panel(
                 backing.pixmap,
                 backing.gc,
-                empty_rect.x,
-                empty_rect.y,
-                empty_rect.width,
-                empty_rect.height,
-            )?;
-            self.conn
-                .change_gc(
-                    backing.gc,
-                    &xproto::ChangeGCAux::new()
-                        .foreground(self.glass_surface.opaque_pixel(POPUP_STYLE.card_border)),
-                )?
-                .check()?;
-            self.conn.poly_rectangle(
-                backing.pixmap,
-                backing.gc,
-                &[xproto::Rectangle {
-                    x: empty_rect.x,
-                    y: empty_rect.y,
-                    width: empty_rect.width,
-                    height: empty_rect.height,
-                }],
+                empty_rect,
+                self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                self.glass_surface
+                    .background_pixel(POPUP_STYLE.card_background),
+                NOTIFICATION_CARD_RADIUS,
             )?;
             self.conn.flush()?;
             self.conn.get_input_focus()?.reply()?;
@@ -8466,6 +8380,28 @@ mod tests {
     }
 
     #[test]
+    fn notification_center_frame_request_is_concrete_window_only() {
+        assert_eq!(
+            super::notification_center_frame_policy(),
+            FramePolicy::Request
+        );
+        assert_eq!(
+            super::frame_policy_property_value(super::notification_center_frame_policy()),
+            [1]
+        );
+        assert_eq!(
+            SurfaceRole::Notification.frame_policy(),
+            FramePolicy::Default
+        );
+        assert_eq!(SurfaceRole::AudioPopup.frame_policy(), FramePolicy::Request);
+        assert_eq!(
+            SurfaceRole::NetworkPopup.frame_policy(),
+            FramePolicy::Request
+        );
+        assert_eq!(SurfaceRole::Dock.frame_policy(), FramePolicy::Suppress);
+    }
+
+    #[test]
     fn attention_net_wm_state_bad_window_is_window_gone() {
         assert!(matches!(
             classify_attention_property_reply::<()>(
@@ -9352,7 +9288,7 @@ mod tests {
             super::notification_header_for_history(360, 48, true)
                 .expect("non-empty history has header control")
                 .width,
-            68
+            76
         );
         assert!(super::notification_header_for_history(360, 48, false).is_none());
     }
@@ -9368,10 +9304,10 @@ mod tests {
 
         assert!(baseline - metrics.ascent >= rect.y);
         assert!(baseline + metrics.descent <= rect.y + rect.height as i16);
-        assert_eq!(baseline, 18);
+        assert_eq!(baseline, 25);
         assert_eq!(
             super::notification_header_text_origin(rect, baseline),
-            (280, 18)
+            (276, 25)
         );
         assert_ne!(
             super::NOTIFICATION_HEADER_CONTROL_BACKGROUND,
@@ -10100,6 +10036,93 @@ mod tests {
         }
     }
 
+    #[test]
+    fn toast_singleton_geometry_is_one_inset_rounded_card() {
+        let (rect, rear_rects) = super::toast_card_geometry(400, 0, 88, false, 1);
+
+        assert_eq!(rect.x, super::TOAST_CARD_INSET);
+        assert_eq!(rect.width, 380);
+        assert!(rear_rects.is_empty());
+        assert!(rect.width > 2);
+        assert!(rect.height > 2);
+    }
+
+    #[test]
+    fn grouped_toast_geometry_caps_decorative_layers_and_preserves_front_rect() {
+        let (rect, rear_rects) = super::toast_card_geometry(400, 8, 88, true, 12);
+
+        assert_eq!(rear_rects.len(), 2);
+        assert!(rear_rects
+            .iter()
+            .all(|rear| { rear.x + rear.width as i16 == rect.x + rect.width as i16 }));
+        assert!(rear_rects[1].x < rear_rects[0].x);
+        assert!(rear_rects[1].width > rear_rects[0].width);
+        assert!(rear_rects.iter().all(|rear| rear.y == rect.y));
+        assert!(rear_rects.iter().all(|rear| rear.height == rect.height));
+        assert_eq!(rect.x, super::TOAST_CARD_INSET);
+        assert_eq!(rect.y, 12);
+    }
+
+    #[test]
+    fn toast_visual_tokens_match_notification_card_language() {
+        assert_eq!(super::TOAST_CARD_RADIUS, super::NOTIFICATION_CARD_RADIUS);
+        assert_eq!(super::TOAST_CARD_GAP, 8);
+        assert_eq!(super::TOAST_CARD_PADDING, 12);
+    }
+
+    #[test]
+    fn toast_canvas_clear_is_transparent_on_argb_surface() {
+        let surface = super::SurfaceVisual::argb(
+            1,
+            2,
+            super::DirectPixelFormat {
+                red_shift: 16,
+                red_mask: 0xff,
+                green_shift: 8,
+                green_mask: 0xff,
+                blue_shift: 0,
+                blue_mask: 0xff,
+                alpha_shift: 24,
+                alpha_mask: 0xff,
+            },
+        );
+        let clear = surface.background_pixel(super::TOAST_CANVAS_CLEAR);
+        let border = surface.opaque_pixel(super::POPUP_STYLE.card_border);
+        let card = super::notification_card_background(surface);
+        assert_eq!(clear, 0);
+        assert_eq!(clear >> 24, 0);
+        assert_eq!(border >> 24, 0xff);
+        assert_eq!(card >> 24, 0xff);
+
+        let fallback = super::SurfaceVisual::default(3, 24, 4);
+        assert_eq!(
+            super::toast_canvas_background(fallback),
+            super::BAR_STYLE.material.background
+        );
+        assert_ne!(
+            super::toast_canvas_background(fallback),
+            super::TOAST_CANVAS_CLEAR
+        );
+        assert_eq!(
+            fallback.background_pixel(super::toast_canvas_background(fallback)),
+            super::BAR_STYLE.material.background.rgb()
+        );
+    }
+
+    #[test]
+    fn toast_canvas_keeps_default_frame_policy_contract() {
+        assert_eq!(
+            super::SurfaceRole::Notification.frame_policy(),
+            super::FramePolicy::Default
+        );
+    }
+
+    #[test]
+    fn toast_width_remains_output_clamped() {
+        assert_eq!(super::TOAST_WIDTH.min(1440), 400);
+        assert_eq!(super::TOAST_WIDTH.min(320), 320);
+    }
+
     fn test_history(ids: &[u32]) -> Vec<crate::core::NotificationHistoryEntry> {
         ids.iter()
             .enumerate()
@@ -10219,8 +10242,8 @@ mod tests {
     #[test]
     fn variable_action_layout_keeps_legacy_cards_and_wraps_rows() {
         let no_actions = super::notification_entry_layout(HistoryEntryId(1), &[], &[], 352, 500, 0);
-        assert_eq!(no_actions.card_height, 54);
-        assert_eq!(no_actions.slot_extent, 62);
+        assert_eq!(no_actions.card_height, 78);
+        assert_eq!(no_actions.slot_extent, 86);
 
         let actions = vec![
             NotificationActionView {
@@ -10234,7 +10257,7 @@ mod tests {
         ];
         let layout =
             super::notification_entry_layout(HistoryEntryId(2), &actions, &[100, 100], 120, 500, 0);
-        assert_eq!(layout.card_height, 114);
+        assert_eq!(layout.card_height, 158);
         assert_eq!(
             layout
                 .actions
@@ -10245,8 +10268,8 @@ mod tests {
         );
         let one_row =
             super::notification_entry_layout(HistoryEntryId(3), &actions, &[20, 20], 352, 500, 0);
-        assert_eq!(one_row.card_height, 86);
-        assert_eq!(one_row.slot_extent, 94);
+        assert_eq!(one_row.card_height, 124);
+        assert_eq!(one_row.slot_extent, 132);
     }
 
     #[test]
@@ -10324,7 +10347,7 @@ mod tests {
             );
             assert!(layout.card_height <= viewport);
             assert!(layout.compact || viewport >= 110);
-            if (24..110).contains(&viewport) {
+            if (30..110).contains(&viewport) {
                 assert_eq!(layout.actions.len(), 1);
                 assert_eq!(layout.page_count, 2);
             }
@@ -10388,7 +10411,7 @@ mod tests {
         assert!(layout.page_count > 1);
         assert_eq!(
             layout.actions.last().map(|action| action.key.as_str()),
-            Some("a28")
+            Some("a22")
         );
 
         let card = super::layout::MenuRect {
@@ -10463,7 +10486,7 @@ mod tests {
             186,
             |_| 40,
         );
-        assert_eq!(super::notification_variable_max_scroll(&layouts, 186), 2);
+        assert_eq!(super::notification_variable_max_scroll(&layouts, 186), 3);
 
         let mixed = vec![
             super::notification_entry_layout(HistoryEntryId(1), &[], &[], 352, 186, 0),
@@ -10493,7 +10516,7 @@ mod tests {
         ];
         assert_eq!(
             super::notification_variable_max_scroll(&mixed, 186),
-            2,
+            3,
             "backward suffix must use actual variable slot extents"
         );
     }
@@ -10503,8 +10526,8 @@ mod tests {
         let layouts = (1..=4)
             .map(|id| super::notification_entry_layout(HistoryEntryId(id), &[], &[], 352, 120, 0))
             .collect::<Vec<_>>();
-        assert_eq!(super::notification_scroll_to_target(&layouts, 120, 0, 1), 0);
-        assert_eq!(super::notification_scroll_to_target(&layouts, 120, 0, 2), 1);
+        assert_eq!(super::notification_scroll_to_target(&layouts, 120, 0, 1), 1);
+        assert_eq!(super::notification_scroll_to_target(&layouts, 120, 0, 2), 2);
         assert_eq!(super::notification_scroll_to_target(&layouts, 120, 2, 0), 0);
     }
 
@@ -10525,7 +10548,7 @@ mod tests {
             ),
             super::notification_entry_layout(HistoryEntryId(3), &[], &[], 352, 150, 0),
         ];
-        assert_eq!(super::notification_scroll_to_target(&layouts, 150, 0, 2), 1);
+        assert_eq!(super::notification_scroll_to_target(&layouts, 150, 0, 2), 2);
     }
 
     fn grouped_entry(id: u64, app_name: &str) -> NotificationHistoryEntry {
@@ -10688,7 +10711,7 @@ mod tests {
         );
         assert_eq!(
             super::notification_grouped_scroll_to_target(&collapsed, 80, 0, HistoryEntryId(3)),
-            0
+            16
         );
         assert_eq!(
             super::notification_grouped_scroll_to_target(&collapsed, 80, 0, HistoryEntryId(99)),
@@ -10844,7 +10867,7 @@ mod tests {
         assert!(maximum > 0);
         assert_eq!(
             super::notification_grouped_scroll_to_target(&items, 100, 0, HistoryEntryId(1)),
-            286
+            412
         );
         assert_eq!(
             super::notification_grouped_scroll_to_target(
@@ -11225,6 +11248,48 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_center_rear_layers_stack_left_with_fixed_right_edge() {
+        let items = grouped_test_layout(
+            &[
+                grouped_entry(3, "Discord"),
+                grouped_entry(2, "Discord"),
+                grouped_entry(1, "Discord"),
+            ],
+            &HashSet::new(),
+        );
+        let super::NotificationCenterLayoutItem::CollapsedGroup {
+            rear_rects, front, ..
+        } = &items[0]
+        else {
+            panic!("expected collapsed group")
+        };
+        assert_eq!(rear_rects.len(), 2);
+        assert!(rear_rects
+            .iter()
+            .all(|rear| { rear.x + rear.width as i16 == front.rect.x + front.rect.width as i16 }));
+        assert!(rear_rects[1].x < rear_rects[0].x);
+        assert!(rear_rects[1].width > rear_rects[0].width);
+        assert!(rear_rects.iter().all(|rear| rear.y == front.rect.y));
+        assert!(rear_rects
+            .iter()
+            .all(|rear| rear.height == front.rect.height));
+    }
+
+    #[test]
+    fn collapsed_center_front_rect_keeps_canonical_geometry() {
+        let items = grouped_test_layout(
+            &[grouped_entry(2, "Discord"), grouped_entry(1, "Discord")],
+            &HashSet::new(),
+        );
+        let super::NotificationCenterLayoutItem::CollapsedGroup { front, .. } = &items[0] else {
+            panic!("expected collapsed group")
+        };
+        assert_eq!(front.rect.x, 22);
+        assert_eq!(front.rect.y, 8);
+        assert_eq!(front.rect.width, 316);
+    }
+
+    #[test]
     fn c5c_r2_center_layout_uses_positive_audio_style_outer_inset() {
         let items = grouped_test_layout(&[grouped_entry(1, "Terminal")], &HashSet::new());
         let super::NotificationCenterLayoutItem::Single { card } = &items[0] else {
@@ -11313,5 +11378,127 @@ mod tests {
         assert!(shell.x + shell.width as i16 <= 360);
         assert!(shell.y + shell.height as i16 <= 78);
         assert!(shell.width > 0 && shell.height > 0);
+    }
+
+    #[test]
+    fn c7a_center_geometry_uses_reference_width_and_spacious_header() {
+        assert_eq!(super::NOTIFICATION_HEADER_HEIGHT, 42);
+        assert_eq!(super::NOTIFICATION_OUTER_PADDING, 12);
+        assert_eq!(super::notification_center_width(1920), 420);
+        let clear_all = super::notification_header_rect(420, 64);
+        assert_eq!(clear_all.y, 8);
+        assert_eq!(clear_all.height, 26);
+        assert!(clear_all.x + clear_all.width as i16 <= 420);
+    }
+
+    #[test]
+    fn c7a_single_action_uses_the_full_padded_card_width() {
+        let action = NotificationActionView {
+            key: "reply".into(),
+            label: "Execute action".into(),
+        };
+        let layout =
+            super::notification_entry_layout(HistoryEntryId(1), &[action], &[100], 396, 500, 0);
+        assert_eq!(layout.actions.len(), 1);
+        assert_eq!(layout.actions[0].width, 372);
+        assert_eq!(layout.card_height, 124);
+    }
+
+    #[test]
+    fn c7a_expanded_members_keep_summary_body_hierarchy_without_app_repeat() {
+        let mut entry = grouped_entry(1, "Example App");
+        entry.body = "body".into();
+        let expanded = super::notification_card_text(&entry, true);
+        assert_eq!(expanded.title, "summary 1");
+        assert_eq!(expanded.secondary.as_deref(), Some("body"));
+        assert!(expanded.tertiary.is_none());
+        let single = super::notification_card_text(&entry, false);
+        assert_eq!(single.title, "Example App");
+        assert_eq!(single.secondary.as_deref(), Some("summary 1"));
+    }
+
+    #[test]
+    fn c7a_group_header_reserves_a_non_overlapping_chevron_slot() {
+        let history = vec![
+            grouped_entry(2, "Example App"),
+            grouped_entry(1, "Example App"),
+        ];
+        let key = crate::core::GroupKey::ApplicationName("Example App".into());
+        let items = grouped_test_layout(&history, &HashSet::from([key]));
+        let super::NotificationCenterLayoutItem::ExpandedGroup { header_rect, .. } = &items[0]
+        else {
+            panic!("expected expanded group")
+        };
+        assert!(header_rect.width > 20);
+        assert!(header_rect.x + header_rect.width as i16 <= 420 - 24);
+    }
+
+    #[test]
+    fn c7a_r1r1_notification_radii_match_internal_reference_hierarchy() {
+        assert_eq!(super::NOTIFICATION_CARD_RADIUS, 11);
+        assert_eq!(super::NOTIFICATION_GROUP_HEADER_RADIUS, 10);
+        assert_eq!(super::NOTIFICATION_ACTION_RADIUS, 8);
+        assert_eq!(super::NOTIFICATION_CLEAR_ALL_RADIUS, 8);
+    }
+
+    #[test]
+    fn c7a_r1r1_rounded_border_inner_rect_stays_inside_outer_rect() {
+        let outer = MenuRect {
+            x: 12,
+            y: 24,
+            width: 396,
+            height: 78,
+        };
+        let inner = super::notification_rounded_inner_rect(outer);
+        assert_eq!(inner.x, outer.x + 1);
+        assert_eq!(inner.y, outer.y + 1);
+        assert_eq!(inner.width, outer.width - 2);
+        assert_eq!(inner.height, outer.height - 2);
+        assert!(inner.x + inner.width as i16 <= outer.x + outer.width as i16);
+        assert!(inner.y + inner.height as i16 <= outer.y + outer.height as i16);
+    }
+
+    #[test]
+    fn c7a_r1r1_shared_popup_shell_geometry_remains_canonical() {
+        assert_eq!(
+            super::NOTIFICATION_OUTER_PADDING,
+            super::POPUP_STYLE.outer_padding
+        );
+        assert_eq!(
+            super::POPUP_STYLE.border_width,
+            crate::ui::layout::AUDIO_POPUP_BORDER
+        );
+        assert_eq!(super::NOTIFICATION_CENTER_WIDTH, 420);
+    }
+
+    #[test]
+    fn c7a_r1r1_internal_controls_remain_inside_card_geometry() {
+        let card = MenuRect {
+            x: 12,
+            y: 60,
+            width: 396,
+            height: 124,
+        };
+        let dismiss = super::notification_dismiss_rect(card);
+        assert_eq!(dismiss.width, 24);
+        assert_eq!(dismiss.height, 24);
+        assert!(dismiss.x + dismiss.width as i16 <= card.x + card.width as i16);
+        assert!(dismiss.y + dismiss.height as i16 <= card.y + card.height as i16);
+        assert_eq!(
+            card.width - (super::NOTIFICATION_CARD_CONTENT_PADDING as u16 * 2),
+            372
+        );
+    }
+
+    #[test]
+    fn c7a_r1r1_internal_redesign_preserves_group_scroll_extent() {
+        let history = (1..=6)
+            .map(|id| grouped_entry(id, "Example App"))
+            .collect::<Vec<_>>();
+        let key = crate::core::GroupKey::ApplicationName("Example App".into());
+        let items = grouped_test_layout(&history, &HashSet::from([key]));
+        let content = super::notification_grouped_content_height(&items);
+        assert!(content > 100);
+        assert!(super::notification_grouped_max_scroll(&items, 100) > 0);
     }
 }

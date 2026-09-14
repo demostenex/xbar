@@ -214,6 +214,21 @@ pub const POPUP_STYLE: PopupStyle = PopupStyle {
     card_radius: 7,
 };
 
+/// Toast-only foreground and edge tokens. Keep notification toasts visually
+/// legible without changing the shared Notification Center/popup language.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToastStyle {
+    pub title_foreground: u32,
+    pub body_foreground: u32,
+    pub card_border: u32,
+}
+
+pub const TOAST_STYLE: ToastStyle = ToastStyle {
+    title_foreground: GLASS_MATERIAL.foreground,
+    body_foreground: 0xdce3ea,
+    card_border: 0x465365,
+};
+
 pub const STATUS_ITEM_GAP: i16 = 6;
 
 impl TextMeasurer for BarStyle {
