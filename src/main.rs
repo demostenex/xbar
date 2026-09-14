@@ -384,19 +384,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 _ => None,
             };
-            let notification_scrolled = match (&event, mouse_target.as_ref()) {
-                (
-                    Event::X11(platform::x11::X11Event::ButtonPress { button, .. }),
-                    Some(
-                        platform::x11::HitTarget::NotificationCenterCard(_)
-                        | platform::x11::HitTarget::NotificationCenterDismiss(_)
-                        | platform::x11::HitTarget::NotificationCenterAction(_, _)
-                        | platform::x11::HitTarget::NotificationCenterActionPagePrev(_)
-                        | platform::x11::HitTarget::NotificationCenterActionPageNext(_)
-                        | platform::x11::HitTarget::NotificationCenterClearAll
-                        | platform::x11::HitTarget::NotificationCenterEmpty,
-                    ),
-                ) if *button == 4 || *button == 5 => {
+            let notification_scrolled = match &event {
+                Event::X11(platform::x11::X11Event::ButtonPress { window, button, .. })
+                    if (*button == 4 || *button == 5)
+                        && x11.is_notification_center_window(*window) =>
+                {
                     x11.scroll_notification_center(*button, &state)
                 }
                 _ => false,
@@ -414,6 +406,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                         | platform::x11::HitTarget::NotificationCenterActionPagePrev(_)
                         | platform::x11::HitTarget::NotificationCenterActionPageNext(_)
                         | platform::x11::HitTarget::NotificationCenterClearAll
+                        | platform::x11::HitTarget::NotificationCenterGroupBody(_)
+                        | platform::x11::HitTarget::NotificationCenterGroupHeader(_)
                 ) {
                     x11.clear_notification_center_highlight();
                 }
@@ -455,6 +449,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                         }
                         Some(platform::x11::NotificationCenterButtonAction::ActionPageNext(id)) => {
                             x11.next_notification_action_page(id)
+                        }
+                        Some(platform::x11::NotificationCenterButtonAction::ExpandGroup(_))
+                        | Some(platform::x11::NotificationCenterButtonAction::CollapseGroup(_)) => {
+                            false
                         }
                         None => false,
                     };
@@ -573,6 +571,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::NotificationCenter(output)),
                 ) => Event::ToggleNotificationCenter(*output),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::NotificationCenterGroupBody(key)),
+                ) => Event::ExpandNotificationGroup(key.clone()),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::NotificationCenterGroupHeader(key)),
+                ) => Event::CollapseNotificationGroup(key.clone()),
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::Audio),
@@ -1768,6 +1774,9 @@ fn render_target_for(
             Some(RenderTarget::Dock.merge(RenderTarget::Notification))
         }
         Event::ToggleNotificationCenter(_) => Some(RenderTarget::Notification),
+        Event::ExpandNotificationGroup(_) | Event::CollapseNotificationGroup(_) => {
+            Some(RenderTarget::Notification)
+        }
         Event::EnsureNotificationCenterOpen { .. } | Event::NotificationToastConsumed => {
             Some(RenderTarget::Notification)
         }
@@ -1826,6 +1835,8 @@ fn hover_render_target_for(
         | Some(HitTarget::NotificationCenterActionPageNext(_))
         | Some(HitTarget::NotificationBody(_, _))
         | Some(HitTarget::NotificationCenterClearAll)
+        | Some(HitTarget::NotificationCenterGroupBody(_))
+        | Some(HitTarget::NotificationCenterGroupHeader(_))
         | Some(HitTarget::NotificationCenterEmpty) => None,
     }
 }

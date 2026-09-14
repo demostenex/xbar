@@ -128,17 +128,25 @@ impl SurfaceRole {
         }
     }
 
-    /// Blur is an opt-in compositor request for current ARGB glass surfaces.
-    /// Notifications retain their independently scoped default surface.
+    /// Blur is an explicit compositor request for selected ARGB popup roles.
+    /// Surface capability alone never opts a role into blur.
     pub(crate) const fn effect(self, surface: SurfaceVisual) -> Option<SurfaceEffect> {
         match (self, surface.kind) {
-            (Self::Notification, _) | (_, SurfaceKind::Default) => None,
-            _ => Some(SurfaceEffect::BlurBehind),
+            (_, SurfaceKind::Default) => None,
+            (
+                Self::GlobalMenuPopup
+                | Self::TrayPopup
+                | Self::NetworkPopup
+                | Self::BluetoothPopup
+                | Self::AudioPopup
+                | Self::Notification,
+                SurfaceKind::Argb,
+            ) => Some(SurfaceEffect::BlurBehind),
+            (Self::Dock, SurfaceKind::Argb) => None,
         }
     }
 
-    /// Current interactive glass popups use the auxiliary compositor owner.
-    /// Notifications remain outside this contract.
+    /// Glass popups that request compositor effects use the auxiliary owner.
     pub(crate) const fn uses_effect_owner(self) -> bool {
         matches!(
             self,
@@ -147,6 +155,7 @@ impl SurfaceRole {
                 | Self::NetworkPopup
                 | Self::BluetoothPopup
                 | Self::AudioPopup
+                | Self::Notification
         )
     }
 
@@ -291,12 +300,25 @@ mod tests {
             SurfaceRole::NetworkPopup,
             SurfaceRole::BluetoothPopup,
             SurfaceRole::AudioPopup,
+            SurfaceRole::Notification,
         ] {
             assert!(role.uses_effect_owner());
         }
         assert!(SurfaceRole::NetworkPopup.uses_override_redirect());
-        assert!(!SurfaceRole::Notification.uses_effect_owner());
         assert!(!SurfaceRole::Dock.uses_effect_owner());
+    }
+
+    #[test]
+    fn notification_glass_uses_the_existing_effect_owner_policy() {
+        assert!(SurfaceRole::Notification.uses_effect_owner());
+        assert_eq!(
+            SurfaceRole::Notification.frame_policy(),
+            FramePolicy::Default
+        );
+        assert_eq!(
+            SurfaceRole::Notification.effect(SurfaceVisual::default(0x21, 24, 0x31)),
+            None
+        );
     }
 
     #[test]
@@ -334,16 +356,35 @@ mod tests {
     fn all_interactive_argb_glass_roles_request_blur_behind() {
         let surface = SurfaceVisual::argb(0x22, 0x33, ARGB_8888);
         for role in [
-            SurfaceRole::Dock,
             SurfaceRole::GlobalMenuPopup,
             SurfaceRole::TrayPopup,
             SurfaceRole::NetworkPopup,
             SurfaceRole::BluetoothPopup,
             SurfaceRole::AudioPopup,
+            SurfaceRole::Notification,
         ] {
             assert_eq!(role.effect(surface), Some(SurfaceEffect::BlurBehind));
         }
-        assert_eq!(SurfaceRole::Notification.effect(surface), None);
+    }
+
+    #[test]
+    fn notification_blur_is_explicit_and_frame_policy_remains_default() {
+        let surface = SurfaceVisual::argb(0x22, 0x33, ARGB_8888);
+        assert_eq!(
+            SurfaceRole::Notification.effect(surface),
+            Some(SurfaceEffect::BlurBehind)
+        );
+        assert_eq!(
+            SurfaceRole::Notification.frame_policy(),
+            FramePolicy::Default
+        );
+    }
+
+    #[test]
+    fn non_blur_dock_does_not_inherit_argb_blur() {
+        let surface = SurfaceVisual::argb(0x22, 0x33, ARGB_8888);
+        assert_eq!(SurfaceRole::Dock.effect(surface), None);
+        assert_eq!(SurfaceRole::Dock.frame_policy(), FramePolicy::Suppress);
     }
 
     #[test]
