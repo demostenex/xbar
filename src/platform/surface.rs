@@ -19,6 +19,14 @@ pub(crate) enum SurfaceRole {
     Notification,
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FramePolicy {
+    Default = 0,
+    Request = 1,
+    Suppress = 2,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SurfaceEffect {
     BlurBehind,
@@ -108,6 +116,18 @@ impl SurfaceVisual {
 }
 
 impl SurfaceRole {
+    pub(crate) const fn frame_policy(self) -> FramePolicy {
+        match self {
+            Self::GlobalMenuPopup
+            | Self::TrayPopup
+            | Self::NetworkPopup
+            | Self::BluetoothPopup
+            | Self::AudioPopup => FramePolicy::Request,
+            Self::Notification => FramePolicy::Default,
+            Self::Dock => FramePolicy::Suppress,
+        }
+    }
+
     /// Blur is an opt-in compositor request for current ARGB glass surfaces.
     /// Notifications retain their independently scoped default surface.
     pub(crate) const fn effect(self, surface: SurfaceVisual) -> Option<SurfaceEffect> {
@@ -340,5 +360,30 @@ mod tests {
         ] {
             assert_eq!(role.effect(surface), None);
         }
+    }
+
+    #[test]
+    fn frame_policy_values_are_stable() {
+        assert_eq!(FramePolicy::Default as u32, 0);
+        assert_eq!(FramePolicy::Request as u32, 1);
+        assert_eq!(FramePolicy::Suppress as u32, 2);
+    }
+
+    #[test]
+    fn frame_policy_maps_surface_roles_without_changing_effect_contract() {
+        for role in [
+            SurfaceRole::GlobalMenuPopup,
+            SurfaceRole::TrayPopup,
+            SurfaceRole::NetworkPopup,
+            SurfaceRole::BluetoothPopup,
+            SurfaceRole::AudioPopup,
+        ] {
+            assert_eq!(role.frame_policy(), FramePolicy::Request);
+        }
+        assert_eq!(
+            SurfaceRole::Notification.frame_policy(),
+            FramePolicy::Default
+        );
+        assert_eq!(SurfaceRole::Dock.frame_policy(), FramePolicy::Suppress);
     }
 }

@@ -20,7 +20,7 @@ use x11rb::wrapper::ConnectionExt as WrapperExt;
 use x11rb::xcb_ffi::XCBConnection;
 
 use super::surface::{
-    select_argb_visual, DirectPixelFormat, SurfaceEffect, SurfaceRole, SurfaceVisual,
+    select_argb_visual, DirectPixelFormat, FramePolicy, SurfaceEffect, SurfaceRole, SurfaceVisual,
     VisualCandidate,
 };
 use super::x11_text::X11Text;
@@ -335,6 +335,7 @@ struct Atoms {
     net_wm_window_opacity: Atom,
     blur_behind_region: Atom,
     xomposite_effect_owner: Atom,
+    xomposite_frame_policy: Atom,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1524,6 +1525,12 @@ const fn effect_owner_property_value(dock: u32) -> [u32; 1] {
     [dock]
 }
 
+const XOMPOSITE_FRAME_POLICY_ATOM_NAME: &[u8] = b"_XOMPOSITE_FRAME_POLICY";
+
+const fn frame_policy_property_value(policy: FramePolicy) -> [u32; 1] {
+    [policy as u32]
+}
+
 fn with_default_border_pixel(attributes: xproto::CreateWindowAux) -> xproto::CreateWindowAux {
     if attributes.border_pixel.is_none() && attributes.border_pixmap.is_none() {
         attributes.border_pixel(0)
@@ -1598,6 +1605,24 @@ impl X11Platform {
             )?
             .check()?;
         self.apply_surface_effect(surface, role, window, geometry)?;
+        self.set_xomposite_frame_policy(window, role.frame_policy())?;
+        Ok(())
+    }
+
+    fn set_xomposite_frame_policy(
+        &self,
+        window: u32,
+        policy: FramePolicy,
+    ) -> Result<(), Box<dyn Error>> {
+        self.conn
+            .change_property32(
+                xproto::PropMode::REPLACE,
+                window,
+                self.atoms.xomposite_frame_policy,
+                AtomEnum::CARDINAL,
+                &frame_policy_property_value(policy),
+            )?
+            .check()?;
         Ok(())
     }
 
@@ -1933,6 +1958,7 @@ impl X11Platform {
             net_wm_window_opacity: intern(b"_NET_WM_WINDOW_OPACITY")?,
             blur_behind_region: intern(b"_KDE_NET_WM_BLUR_BEHIND_REGION")?,
             xomposite_effect_owner: intern(b"_XOMPOSITE_EFFECT_OWNER")?,
+            xomposite_frame_policy: intern(XOMPOSITE_FRAME_POLICY_ATOM_NAME)?,
         };
         let render_formats = conn
             .render_query_pict_formats()
@@ -6146,6 +6172,8 @@ impl X11Platform {
                     layout: popup_layout.clone(),
                     backing: None,
                 });
+            } else {
+                self.set_xomposite_frame_policy(window, popup_role.frame_policy())?;
             }
             let resize = self.popups[level].layout.rect != popup_layout.rect;
             let backing_replaced = !backing_matches(
