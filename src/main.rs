@@ -1453,6 +1453,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     endpoint,
                                     action.name,
                                     action.target,
+                                    timestamp,
                                 );
                             }
                         }

@@ -37,6 +37,61 @@ pub struct MenuAction {
     pub target: Option<MenuActionTarget>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GtkActionGroupRole {
+    Application,
+    Window,
+    Unity,
+    Other,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GtkActionGroupPath {
+    pub role: GtkActionGroupRole,
+    pub object_path: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GtkActionGroupEndpoint {
+    pub role: GtkActionGroupRole,
+    pub object_path: String,
+}
+
+impl GtkActionGroupEndpoint {
+    pub fn from_capability(path: GtkActionGroupPath, has_actions: bool) -> Result<Self, String> {
+        has_actions
+            .then_some(Self {
+                role: path.role,
+                object_path: path.object_path,
+            })
+            .ok_or_else(|| "GMenu path does not implement org.gtk.Actions".into())
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct QualifiedActionReference {
+    pub original: String,
+    pub namespace: Option<String>,
+    pub local_name: String,
+}
+
+impl QualifiedActionReference {
+    pub fn parse(original: &str) -> Result<Self, String> {
+        let (namespace, local_name) = original
+            .split_once('.')
+            .map(|(namespace, local_name)| (Some(namespace.to_owned()), local_name))
+            .unwrap_or((None, original));
+        if local_name.is_empty() || namespace.as_deref() == Some("") {
+            return Err(format!("invalid GMenu action reference: {original}"));
+        }
+        Ok(Self {
+            original: original.to_owned(),
+            namespace,
+            local_name: local_name.to_owned(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MenuItem {
     pub id: MenuItemId,
@@ -84,7 +139,28 @@ pub struct MenuEndpoint {
 pub struct GtkMenuEndpoint {
     pub bus_name: String,
     pub menu_object_path: String,
-    pub actions_object_paths: Vec<String>,
+    pub action_group_paths: Vec<GtkActionGroupPath>,
+    pub default_action_group: Option<GtkActionGroupPath>,
+}
+
+impl GtkMenuEndpoint {
+    pub fn action_group_for(&self, namespace: Option<&str>) -> Result<&GtkActionGroupPath, String> {
+        let role = match namespace {
+            None => {
+                return self.default_action_group.as_ref().ok_or_else(|| {
+                    "GMenu action has no namespace and endpoint has no default action group".into()
+                })
+            }
+            Some("app") => GtkActionGroupRole::Application,
+            Some("win") => GtkActionGroupRole::Window,
+            Some("unity") => GtkActionGroupRole::Unity,
+            Some(namespace) => return Err(format!("unknown GMenu action namespace: {namespace}")),
+        };
+        self.action_group_paths
+            .iter()
+            .find(|group| group.role == role)
+            .ok_or_else(|| format!("GMenu action namespace has no endpoint: {namespace:?}"))
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1163,7 +1239,14 @@ mod tests {
         let gtk = GtkMenuEndpoint {
             bus_name: ":1.gtk".into(),
             menu_object_path: "/gtk/menu".into(),
-            actions_object_paths: vec!["/gtk/actions".into()],
+            action_group_paths: vec![GtkActionGroupPath {
+                role: GtkActionGroupRole::Other,
+                object_path: "/gtk/actions".into(),
+            }],
+            default_action_group: Some(GtkActionGroupPath {
+                role: GtkActionGroupRole::Other,
+                object_path: "/gtk/actions".into(),
+            }),
         };
         registry.register_gtk(WindowId(10), gtk.clone());
         assert_eq!(
@@ -1188,16 +1271,109 @@ mod tests {
         let old = GtkMenuEndpoint {
             bus_name: ":1.old".into(),
             menu_object_path: "/gtk/old".into(),
-            actions_object_paths: vec![],
+            action_group_paths: vec![],
+            default_action_group: None,
         };
         let current = GtkMenuEndpoint {
             bus_name: ":1.current".into(),
             menu_object_path: "/gtk/current".into(),
-            actions_object_paths: vec![],
+            action_group_paths: vec![],
+            default_action_group: None,
         };
         registry.register_gtk(WindowId(10), old);
         registry.register_gtk(WindowId(10), current.clone());
         assert!(registry.remove_sender(":1.old").is_empty());
         assert_eq!(registry.gtk(WindowId(10)), Some(&current));
+    }
+
+    fn routed_endpoint() -> GtkMenuEndpoint {
+        let groups = vec![
+            GtkActionGroupPath {
+                role: GtkActionGroupRole::Application,
+                object_path: "/app/actions".into(),
+            },
+            GtkActionGroupPath {
+                role: GtkActionGroupRole::Window,
+                object_path: "/win/actions".into(),
+            },
+            GtkActionGroupPath {
+                role: GtkActionGroupRole::Unity,
+                object_path: "/unity/actions".into(),
+            },
+        ];
+        GtkMenuEndpoint {
+            bus_name: ":1.test".into(),
+            menu_object_path: "/menu".into(),
+            action_group_paths: groups,
+            default_action_group: Some(GtkActionGroupPath {
+                role: GtkActionGroupRole::Window,
+                object_path: "/win/actions".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn qualified_action_routes_namespace_and_preserves_local_name() {
+        let endpoint = routed_endpoint();
+        let reference = QualifiedActionReference::parse("unity.Prefer---ncias").unwrap();
+        assert_eq!(reference.original, "unity.Prefer---ncias");
+        assert_eq!(reference.namespace.as_deref(), Some("unity"));
+        assert_eq!(reference.local_name, "Prefer---ncias");
+        assert_eq!(
+            endpoint
+                .action_group_for(reference.namespace.as_deref())
+                .unwrap()
+                .object_path,
+            "/unity/actions"
+        );
+    }
+
+    #[test]
+    fn app_and_window_namespaces_use_distinct_endpoints() {
+        let endpoint = routed_endpoint();
+        assert_eq!(
+            endpoint.action_group_for(Some("app")).unwrap().object_path,
+            "/app/actions"
+        );
+        assert_eq!(
+            endpoint.action_group_for(Some("win")).unwrap().object_path,
+            "/win/actions"
+        );
+    }
+
+    #[test]
+    fn namespace_errors_are_explicit_and_unqualified_is_defaulted() {
+        let endpoint = routed_endpoint();
+        assert!(endpoint.action_group_for(Some("other")).is_err());
+        assert_eq!(
+            endpoint.action_group_for(None).unwrap().object_path,
+            "/win/actions"
+        );
+        let missing = GtkMenuEndpoint {
+            action_group_paths: vec![],
+            default_action_group: None,
+            ..endpoint
+        };
+        assert!(missing.action_group_for(Some("app")).is_err());
+        assert!(missing.action_group_for(None).is_err());
+    }
+
+    #[test]
+    fn qualified_action_parser_preserves_unicode_and_hyphens() {
+        let reference = QualifiedActionReference::parse("unity.Préfer---ncias").unwrap();
+        assert_eq!(reference.local_name, "Préfer---ncias");
+        let dotted = QualifiedActionReference::parse("app.file.open").unwrap();
+        assert_eq!(dotted.namespace.as_deref(), Some("app"));
+        assert_eq!(dotted.local_name, "file.open");
+    }
+
+    #[test]
+    fn paths_without_actions_capability_are_not_endpoints() {
+        let path = GtkActionGroupPath {
+            role: GtkActionGroupRole::Unity,
+            object_path: "/not-actions".into(),
+        };
+        assert!(GtkActionGroupEndpoint::from_capability(path.clone(), false).is_err());
+        assert!(GtkActionGroupEndpoint::from_capability(path, true).is_ok());
     }
 }

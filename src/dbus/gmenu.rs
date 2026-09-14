@@ -292,6 +292,42 @@ mod tests {
     }
 
     #[test]
+    fn target_types_and_labels_are_not_part_of_action_resolution() {
+        let menu = vec![
+            item(&[
+                ("label", value("Different label")),
+                ("action", value("app.boolean")),
+                ("target", value(true)),
+            ]),
+            item(&[
+                ("label", value("Another label")),
+                ("action", value("app.integer")),
+                ("target", value(42_i32)),
+            ]),
+        ];
+        let model = convert_start(
+            1,
+            vec![(0, 0, menu)],
+            &HashMap::from([("app.boolean".into(), true), ("app.integer".into(), true)]),
+        )
+        .unwrap();
+        assert_eq!(
+            model.root.children[0].action,
+            Some(MenuAction {
+                name: "app.boolean".into(),
+                target: Some(MenuActionTarget::Boolean(true)),
+            })
+        );
+        assert_eq!(
+            model.root.children[1].action,
+            Some(MenuAction {
+                name: "app.integer".into(),
+                target: Some(MenuActionTarget::Int32(42)),
+            })
+        );
+    }
+
+    #[test]
     fn missing_linked_menu_is_a_submenu_but_has_no_children() {
         let model = convert_start(
             1,

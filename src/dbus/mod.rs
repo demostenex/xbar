@@ -1,3 +1,4 @@
+use crate::core::menu::{GtkActionGroupEndpoint, QualifiedActionReference};
 #[cfg(test)]
 use crate::core::NetworkAccessPoint;
 use crate::core::{
@@ -42,6 +43,40 @@ fn sibling_sni_watcher_path(executable: &Path) -> Option<PathBuf> {
     executable
         .parent()
         .map(|parent| parent.join("xbar-sni-watcher"))
+}
+
+#[cfg(test)]
+mod gmenu_activation_context_tests {
+    use super::platform_data;
+    use zbus::zvariant::Value;
+
+    #[test]
+    fn input_timestamp_becomes_startup_id_without_stale_state() {
+        let data = platform_data(Some(136746));
+        assert_eq!(
+            data.get("desktop-startup-id")
+                .and_then(|value| match value {
+                    Value::Str(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+            Some("_TIME136746")
+        );
+        let next = platform_data(Some(7));
+        assert_eq!(
+            next.get("desktop-startup-id")
+                .and_then(|value| match value {
+                    Value::Str(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+            Some("_TIME7")
+        );
+    }
+
+    #[test]
+    fn absent_or_zero_timestamp_does_not_create_time_zero() {
+        assert!(platform_data(None).is_empty());
+        assert!(platform_data(Some(0)).is_empty());
+    }
 }
 
 fn sibling_sni_watcher(executable: &Path) -> Option<PathBuf> {
@@ -168,6 +203,7 @@ struct GtkActivateRequest {
     endpoint: GtkMenuEndpoint,
     action: String,
     target: Option<MenuActionTarget>,
+    timestamp: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -580,6 +616,7 @@ impl DbusBridge {
         endpoint: GtkMenuEndpoint,
         action: String,
         target: Option<MenuActionTarget>,
+        timestamp: u32,
     ) {
         let _ = self
             .requests
@@ -588,6 +625,7 @@ impl DbusBridge {
                 endpoint,
                 action,
                 target,
+                timestamp: (timestamp != 0).then_some(timestamp),
             }));
     }
 
@@ -2519,16 +2557,16 @@ async fn activate_gmenu(
     connection: &zbus::Connection,
     request: &GtkActivateRequest,
 ) -> Result<(), String> {
-    let path = request
+    let reference = QualifiedActionReference::parse(&request.action)?;
+    let action_group_path = request
         .endpoint
-        .actions_object_paths
-        .first()
-        .cloned()
-        .unwrap_or_else(|| request.endpoint.menu_object_path.clone());
+        .action_group_for(reference.namespace.as_deref())?
+        .clone();
+    let path = action_group_path.object_path.clone();
     let proxy = zbus::Proxy::new_owned(
         connection.clone(),
         request.endpoint.bus_name.clone(),
-        path,
+        path.clone(),
         "org.gtk.Actions",
     )
     .await
@@ -2540,16 +2578,30 @@ async fn activate_gmenu(
         .transpose()?
         .into_iter()
         .collect::<Vec<_>>();
-    let platform_data: HashMap<String, zbus::zvariant::Value<'static>> = HashMap::new();
+    let descriptions: HashMap<String, (bool, Signature, Vec<zbus::zvariant::OwnedValue>)> = proxy
+        .call("DescribeAll", &())
+        .await
+        .map_err(|error| error.to_string())?;
+    let _endpoint = GtkActionGroupEndpoint::from_capability(action_group_path, true)?;
+    if !descriptions.contains_key(&reference.local_name) {
+        return Err(format!(
+            "GMenu action does not exist in resolved endpoint: {}",
+            reference.local_name
+        ));
+    }
+    let platform_data = platform_data(request.timestamp);
     let _: () = proxy
         .call(
             "Activate",
-            &(request.action.as_str(), parameter, platform_data),
+            &(reference.local_name.as_str(), parameter, platform_data),
         )
         .await
         .map_err(|error| error.to_string())?;
     if std::env::var_os("XBAR_TRACE").is_some() {
-        eprintln!("xbar trace: GMenu Activate action={}", request.action);
+        eprintln!(
+            "xbar trace: GMenu Activate action={} local={} path={}",
+            reference.original, reference.local_name, path
+        );
     }
     Ok(())
 }
@@ -2561,6 +2613,18 @@ fn menu_action_target(target: &MenuActionTarget) -> Result<zbus::zvariant::Value
         MenuActionTarget::Int32(value) => zbus::zvariant::Value::from(*value),
         MenuActionTarget::Uint32(value) => zbus::zvariant::Value::from(*value),
     })
+}
+
+fn platform_data(timestamp: Option<u32>) -> HashMap<String, zbus::zvariant::Value<'static>> {
+    timestamp
+        .filter(|timestamp| *timestamp != 0)
+        .map(|timestamp| {
+            HashMap::from([(
+                "desktop-startup-id".to_owned(),
+                zbus::zvariant::Value::from(format!("_TIME{timestamp}")),
+            )])
+        })
+        .unwrap_or_default()
 }
 
 enum Either<O, R> {
@@ -2650,11 +2714,12 @@ async fn load_gmenu(
         content.extend(loaded);
         groups = gmenu::referenced_groups(&content);
     }
-    let action_path = endpoint
-        .actions_object_paths
-        .first()
+    let action_group_path = endpoint
+        .default_action_group
+        .as_ref()
         .cloned()
-        .unwrap_or_else(|| endpoint.menu_object_path.clone());
+        .ok_or_else(|| "GMenu endpoint has no action group".to_owned())?;
+    let action_path = action_group_path.object_path.clone();
     let action_proxy = zbus::Proxy::new_owned(
         connection.clone(),
         endpoint.bus_name.clone(),
@@ -2668,6 +2733,7 @@ async fn load_gmenu(
             .call("DescribeAll", &())
             .await
             .map_err(|error| error.to_string())?;
+    let _endpoint = GtkActionGroupEndpoint::from_capability(action_group_path, true)?;
     let actions = descriptions
         .into_iter()
         .map(|(name, (enabled, _, _))| (name, enabled))

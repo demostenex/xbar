@@ -1,3 +1,4 @@
+use crate::core::menu::{GtkActionGroupPath, GtkActionGroupRole};
 use crate::core::{
     GtkMenuEndpoint, MenuItemId, NetworkWifiTarget, NotificationActionProjection,
     NotificationActionView, OutputId, OutputState, State, StatusNotifierEndpoint, WindowId,
@@ -3731,24 +3732,59 @@ impl X11Platform {
         let Some(menu_object_path) = menu_object_path else {
             return Ok(None);
         };
-        let mut actions_object_paths = Vec::new();
-        for atom in [
-            self.atoms.gtk_window_object_path,
-            self.atoms.gtk_application_object_path,
-        ] {
-            if let Some(path) = self.property_string(window, atom)? {
-                if !actions_object_paths.contains(&path) {
-                    actions_object_paths.push(path);
-                }
-            }
+        let window_action_path = self.property_string(window, self.atoms.gtk_window_object_path)?;
+        let application_action_path =
+            self.property_string(window, self.atoms.gtk_application_object_path)?;
+        let unity_action_path = self.property_string(window, self.atoms.unity_object_path)?;
+        let mut action_group_paths = Vec::new();
+        if let Some(path) = application_action_path {
+            action_group_paths.push(GtkActionGroupPath {
+                role: GtkActionGroupRole::Application,
+                object_path: path,
+            });
         }
-        if !actions_object_paths.contains(&menu_object_path) {
-            actions_object_paths.push(menu_object_path.clone());
+        if let Some(path) = window_action_path {
+            action_group_paths.push(GtkActionGroupPath {
+                role: GtkActionGroupRole::Window,
+                object_path: path,
+            });
         }
+        if let Some(path) = unity_action_path {
+            action_group_paths.push(GtkActionGroupPath {
+                role: GtkActionGroupRole::Unity,
+                object_path: path,
+            });
+        }
+        if action_group_paths.is_empty() {
+            action_group_paths.push(GtkActionGroupPath {
+                role: GtkActionGroupRole::Other,
+                object_path: menu_object_path.clone(),
+            });
+        }
+        let default_action_group = action_group_paths
+            .iter()
+            .find(|group| group.role == GtkActionGroupRole::Window)
+            .or_else(|| {
+                action_group_paths
+                    .iter()
+                    .find(|group| group.role == GtkActionGroupRole::Application)
+            })
+            .or_else(|| {
+                action_group_paths
+                    .iter()
+                    .find(|group| group.role == GtkActionGroupRole::Unity)
+            })
+            .or_else(|| {
+                action_group_paths
+                    .iter()
+                    .find(|group| group.role == GtkActionGroupRole::Other)
+            })
+            .cloned();
         Ok(Some(GtkMenuEndpoint {
             bus_name,
             menu_object_path,
-            actions_object_paths,
+            action_group_paths,
+            default_action_group,
         }))
     }
 
