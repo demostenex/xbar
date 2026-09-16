@@ -1298,6 +1298,19 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 false
             }
         }
+        Event::PassivePopupDismissRequested {
+            ai_usage,
+            notification_center,
+        } => {
+            let mut changed = false;
+            if ai_usage && state.ai_usage_popup.take().is_some() {
+                changed = true;
+            }
+            if notification_center && state.notification_center_open.take().is_some() {
+                changed = true;
+            }
+            changed
+        }
         Event::TrayMenuOpenRequested { .. } => {
             let changed = state.audio_popup_open
                 || state.audio_dragging
@@ -1638,7 +1651,39 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 .ne(plugins.iter().map(plugin_visual_key));
             state.ai_usage = usage;
             state.plugin_zone.plugins = plugins;
+            if let Some((selected, _)) = &state.ai_usage_popup {
+                if !state
+                    .plugin_zone
+                    .plugins
+                    .iter()
+                    .any(|plugin| plugin.id == *selected)
+                {
+                    state.ai_usage_popup = None;
+                }
+            }
             visual_changed
+        }
+        Event::AiUsagePopupToggled { plugin, output } => {
+            if state.ai_usage_popup.as_ref() == Some(&(plugin.clone(), output)) {
+                state.ai_usage_popup = None;
+            } else if state
+                .plugin_zone
+                .plugins
+                .iter()
+                .any(|candidate| candidate.id == plugin)
+            {
+                state.ai_usage_popup = Some((plugin, output));
+                state.audio_popup_open = false;
+                state.audio_dragging = false;
+                state.audio_drag_input = false;
+                state.bluetooth_popup_open = false;
+                state.network_popup_open = false;
+                state.network_popup_open_pending = false;
+                dismiss_menu_presentation(state);
+            } else {
+                return false;
+            }
+            true
         }
         Event::BluetoothSnapshotReceived(bluetooth) => {
             let before = bluetooth_visual_state(&state.bluetooth);
@@ -1847,6 +1892,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         | Event::X11(crate::platform::x11::X11Event::MotionNotify { .. })
         | Event::X11(crate::platform::x11::X11Event::KeyPress { .. })
         | Event::X11(crate::platform::x11::X11Event::KeyRelease { .. }) => false,
+        Event::X11(crate::platform::x11::X11Event::RawButtonPress { .. }) => false,
         Event::X11(crate::platform::x11::X11Event::GtkWindowChanged(_))
         | Event::X11(crate::platform::x11::X11Event::GtkWindowsChanged)
         | Event::X11(crate::platform::x11::X11Event::GtkWindowDestroyed(_))
@@ -1899,6 +1945,25 @@ mod tests {
             service: ":1.9".into(),
             object_path: "/menu".into(),
         }
+    }
+
+    #[test]
+    fn raw_button_press_is_a_reducer_noop() {
+        let mut state = State::default();
+        let before = state.clone();
+        let changed = reduce(
+            &mut state,
+            Event::X11(crate::platform::x11::X11Event::RawButtonPress {
+                time: 17,
+                detail: 4,
+                deviceid: 2,
+                sourceid: 3,
+                flags: Default::default(),
+            }),
+            &mut MenuRegistry::default(),
+        );
+        assert!(!changed);
+        assert_eq!(state, before);
     }
     fn model() -> super::super::MenuModel {
         super::super::MenuModel {
@@ -5566,6 +5631,130 @@ mod tests {
             fetched_at: None,
             cache_age_secs: None,
         }
+    }
+
+    #[test]
+    fn ai_usage_popup_toggle_selects_switches_and_closes() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let first = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Default,
+            Some(97),
+            super::super::UsageStatus::Fresh,
+        );
+        let second = ai_usage(
+            "anthropic",
+            "claude",
+            super::super::AccountIdentity::Default,
+            Some(83),
+            super::super::UsageStatus::Fresh,
+        );
+        reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![first.clone(), second.clone()]),
+            &mut registry,
+        );
+        let first_id = first.plugin_summary().id;
+        let second_id = second.plugin_summary().id;
+        let output = super::super::OutputId(4);
+        assert!(reduce(
+            &mut state,
+            Event::AiUsagePopupToggled {
+                plugin: first_id.clone(),
+                output,
+            },
+            &mut registry,
+        ));
+        assert_eq!(state.ai_usage_popup, Some((first_id.clone(), output)));
+        assert!(reduce(
+            &mut state,
+            Event::AiUsagePopupToggled {
+                plugin: second_id.clone(),
+                output,
+            },
+            &mut registry,
+        ));
+        assert_eq!(state.ai_usage_popup, Some((second_id.clone(), output)));
+        assert!(reduce(
+            &mut state,
+            Event::AiUsagePopupToggled {
+                plugin: second_id,
+                output,
+            },
+            &mut registry,
+        ));
+        assert_eq!(state.ai_usage_popup, None);
+    }
+
+    #[test]
+    fn passive_popup_dismiss_closes_only_requested_surfaces() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        state.ai_usage_popup = Some((super::super::PluginId("ai".into()), OutputId(1)));
+        state.notification_center_open = Some(OutputId(2));
+        assert!(reduce(
+            &mut state,
+            Event::PassivePopupDismissRequested {
+                ai_usage: true,
+                notification_center: false,
+            },
+            &mut registry,
+        ));
+        assert_eq!(state.ai_usage_popup, None);
+        assert_eq!(state.notification_center_open, Some(OutputId(2)));
+        assert!(reduce(
+            &mut state,
+            Event::PassivePopupDismissRequested {
+                ai_usage: false,
+                notification_center: true,
+            },
+            &mut registry,
+        ));
+        assert_eq!(state.notification_center_open, None);
+        assert!(!reduce(
+            &mut state,
+            Event::PassivePopupDismissRequested {
+                ai_usage: true,
+                notification_center: true,
+            },
+            &mut registry,
+        ));
+    }
+
+    #[test]
+    fn ai_usage_popup_selection_is_cleared_when_selected_agent_disappears() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let agent = ai_usage(
+            "openai",
+            "codex",
+            super::super::AccountIdentity::Default,
+            Some(97),
+            super::super::UsageStatus::Fresh,
+        );
+        let plugin = agent.plugin_summary().id;
+        reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(vec![agent]),
+            &mut registry,
+        );
+        reduce(
+            &mut state,
+            Event::AiUsagePopupToggled {
+                plugin,
+                output: super::super::OutputId(1),
+            },
+            &mut registry,
+        );
+        assert!(state.ai_usage_popup.is_some());
+        reduce(
+            &mut state,
+            Event::ActiveAiUsageChanged(Vec::new()),
+            &mut registry,
+        );
+        assert_eq!(state.ai_usage_popup, None);
     }
 
     #[test]

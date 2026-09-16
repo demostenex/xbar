@@ -15,6 +15,7 @@ use clock::ClockSource;
 use core::{Event, MenuLayoutReloadTracker, MenuSource, State, StatusNotifierAction};
 use i3::I3Client;
 use platform::x11::{HitTarget, RenderTarget, X11Platform};
+use std::collections::HashMap;
 use std::error::Error;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -103,7 +104,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut next_menu_request_id = 1_u64;
     let mut menu_layout_reloads = MenuLayoutReloadTracker::default();
     let mut last_audio_command = None;
-
     i3.subscribe()?;
     i3.request_workspaces()?;
     i3.request_focused_window()?;
@@ -269,6 +269,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+
+        prepare_passive_batch(&mut events, &state, &x11);
 
         if events
             .iter()
@@ -560,6 +562,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                     Event::X11(platform::x11::X11Event::ButtonPress { .. }),
                     Some(platform::x11::HitTarget::TopLevel(id)),
                 ) => Event::MenuRootClicked(*id),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::AiUsage(plugin, output)),
+                ) => Event::AiUsagePopupToggled {
+                    plugin: plugin.clone(),
+                    output: *output,
+                },
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { .. }),
+                    Some(platform::x11::HitTarget::AiUsageInside),
+                ) => event.clone(),
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::NotificationBody(output, history_id)),
@@ -962,6 +975,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Event::TrayMenuOpenRequested { endpoint } => Some(endpoint.clone()),
                 _ => None,
             };
+            let tray_menu_reclick = tray_menu_open.as_ref().is_some_and(|endpoint| {
+                matches!(
+                    &state.menu,
+                    core::MenuState::TrayLoaded {
+                        endpoint: current,
+                        ..
+                    } if current == endpoint
+                ) && state.menu_interaction.open_root.is_some()
+            });
             let sni_action = match &translated {
                 Event::StatusNotifierActionRequested {
                     endpoint,
@@ -994,10 +1016,20 @@ fn run() -> Result<(), Box<dyn Error>> {
             let pending_lazy_root_before = state.menu_interaction.pending_lazy_root.clone();
             let notification_center_before = state.notification_center_open;
             let notification_history_before = state.notification_history.clone();
+            let ai_usage_popup_before = state.ai_usage_popup.is_some();
             let reduced = core::reduce(
                 &mut state,
                 translated.clone(),
                 &mut registry.lock().expect("registry poisoned"),
+            );
+            render_target = merge_render_target(
+                render_target,
+                ai_usage_update_render_target(
+                    &translated,
+                    reduced,
+                    ai_usage_popup_before,
+                    state.ai_usage_popup.is_some(),
+                ),
             );
             if notification_center_toggle_opened(
                 &translated,
@@ -1386,7 +1418,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 dbus.request_status_notifier_action(endpoint, action, root_x, root_y);
             }
-            if let Some(endpoint) = tray_menu_open {
+            if let Some(endpoint) = tray_menu_open.filter(|_| !tray_menu_reclick) {
                 let request_id = next_menu_request_id;
                 next_menu_request_id += 1;
                 let source = MenuSource::Tray(endpoint.clone());
@@ -1659,6 +1691,161 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassiveCoreTarget {
+    AiOpener,
+    AiPopupInside,
+    NotificationCenter,
+    OtherXbar,
+    External,
+}
+
+fn passive_core_target(target: &HitTarget) -> PassiveCoreTarget {
+    match target {
+        HitTarget::AiUsage(_, _) => PassiveCoreTarget::AiOpener,
+        HitTarget::AiUsageInside => PassiveCoreTarget::AiPopupInside,
+        HitTarget::NotificationCenter(_)
+        | HitTarget::NotificationCenterCard(_)
+        | HitTarget::NotificationCenterDismiss(_)
+        | HitTarget::NotificationCenterGroupBody(_)
+        | HitTarget::NotificationCenterGroupHeader(_)
+        | HitTarget::NotificationCenterAction(_, _)
+        | HitTarget::NotificationCenterActionPagePrev(_)
+        | HitTarget::NotificationCenterActionPageNext(_)
+        | HitTarget::NotificationCenterClearAll
+        | HitTarget::NotificationCenterEmpty => PassiveCoreTarget::NotificationCenter,
+        HitTarget::Outside => PassiveCoreTarget::External,
+        _ => PassiveCoreTarget::OtherXbar,
+    }
+}
+
+fn eligible_passive_raw_button(detail: u32) -> bool {
+    matches!(detail, 1..=3)
+}
+
+fn passive_dismiss_for_targets(
+    ai_open: bool,
+    notification_open: bool,
+    core_targets: &[PassiveCoreTarget],
+) -> (bool, bool) {
+    let ai_protected = core_targets.iter().any(|target| {
+        matches!(
+            target,
+            PassiveCoreTarget::AiOpener | PassiveCoreTarget::AiPopupInside
+        )
+    });
+    let notification_protected = core_targets.contains(&PassiveCoreTarget::NotificationCenter);
+    (
+        ai_open && !ai_protected,
+        notification_open && !notification_protected,
+    )
+}
+
+#[derive(Clone, Debug)]
+struct PassiveCoreCandidate {
+    index: usize,
+    timestamp: u32,
+    target: PassiveCoreTarget,
+}
+
+fn passive_core_targets_for_timestamp(
+    cores: &[PassiveCoreCandidate],
+    timestamp: u32,
+) -> Vec<PassiveCoreTarget> {
+    cores
+        .iter()
+        .filter(|core| core.timestamp == timestamp)
+        .map(|core| core.target)
+        .collect()
+}
+
+fn passive_dismiss_event(ai_usage: bool, notification_center: bool) -> Option<Event> {
+    (ai_usage || notification_center).then_some(Event::PassivePopupDismissRequested {
+        ai_usage,
+        notification_center,
+    })
+}
+
+fn prepare_passive_batch(events: &mut Vec<Event>, state: &State, x11: &X11Platform) {
+    let cores = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            let Event::X11(platform::x11::X11Event::ButtonPress {
+                timestamp, button, ..
+            }) = event
+            else {
+                return None;
+            };
+            if !eligible_passive_raw_button(u32::from(*button)) {
+                return None;
+            }
+            let target = x11.hit_test(match event {
+                Event::X11(event) => event,
+                _ => unreachable!(),
+            });
+            Some(PassiveCoreCandidate {
+                index,
+                timestamp: *timestamp,
+                target: passive_core_target(&target),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let raw_presses = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            let Event::X11(platform::x11::X11Event::RawButtonPress { time, detail, .. }) = event
+            else {
+                return None;
+            };
+            eligible_passive_raw_button(*detail).then_some((index, *time))
+        })
+        .collect::<Vec<_>>();
+
+    let ai_open = state.ai_usage_popup.is_some();
+    let notification_open = state.notification_center_open.is_some();
+    let mut insertions = HashMap::<usize, (bool, bool)>::new();
+    for (raw_index, timestamp) in &raw_presses {
+        let targets = passive_core_targets_for_timestamp(&cores, *timestamp);
+        if targets.is_empty() {
+            let (dismiss_ai, dismiss_notification) =
+                passive_dismiss_for_targets(ai_open, notification_open, &[]);
+            if dismiss_ai || dismiss_notification {
+                insertions.insert(*raw_index, (dismiss_ai, dismiss_notification));
+            }
+            continue;
+        }
+        let (dismiss_ai, dismiss_notification) =
+            passive_dismiss_for_targets(ai_open, notification_open, &targets);
+        if let Some(index) = cores
+            .iter()
+            .filter(|core| core.timestamp == *timestamp)
+            .map(|core| core.index)
+            .min()
+        {
+            if dismiss_ai || dismiss_notification {
+                insertions
+                    .entry(index)
+                    .and_modify(|flags| {
+                        flags.0 |= dismiss_ai;
+                        flags.1 |= dismiss_notification;
+                    })
+                    .or_insert((dismiss_ai, dismiss_notification));
+            }
+        }
+    }
+
+    let mut insertions = insertions.into_iter().collect::<Vec<_>>();
+    insertions.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+    for (index, (dismiss_ai, dismiss_notification)) in insertions {
+        if let Some(dismiss) = passive_dismiss_event(dismiss_ai, dismiss_notification) {
+            events.insert(index, dismiss);
+        }
+    }
+}
+
 fn render_target_for(
     event: &Event,
     mouse_target: &Option<HitTarget>,
@@ -1723,6 +1910,19 @@ fn render_target_for(
             hover_render_target_for(mouse_target.as_ref(), Some(RenderTarget::DockContext))
         }
         Event::MenuClickedOutside => Some(RenderTarget::Popup),
+        Event::PassivePopupDismissRequested {
+            ai_usage,
+            notification_center,
+        } => {
+            let mut target = None;
+            if *ai_usage {
+                target = Some(RenderTarget::Popup);
+            }
+            if *notification_center {
+                target = merge_render_target(target, Some(RenderTarget::Notification));
+            }
+            target
+        }
         Event::MenuAboutToShowRequested { .. } => Some(RenderTarget::Popup),
         Event::MenuAboutToShowCompleted { need_update, .. } => Some(if *need_update {
             RenderTarget::DockContext
@@ -1738,6 +1938,7 @@ fn render_target_for(
             Some(RenderTarget::Bluetooth)
         }
         Event::ActiveAiUsageChanged(_) => Some(RenderTarget::PluginZone),
+        Event::AiUsagePopupToggled { .. } => Some(RenderTarget::Popup),
         Event::StatusNotifierRegistered(_)
         | Event::StatusNotifierUnregistered(_)
         | Event::StatusNotifierOwnerVanished(_)
@@ -1810,6 +2011,8 @@ fn hover_render_target_for(
     match mouse_target {
         Some(HitTarget::Item(_)) => Some(RenderTarget::Popup),
         Some(HitTarget::TopLevel(_)) => Some(RenderTarget::DockContext),
+        Some(HitTarget::AiUsage(_, _)) => None,
+        Some(HitTarget::AiUsageInside) => None,
         Some(HitTarget::Outside) | None => outside_target,
         Some(HitTarget::Tray(_)) => None,
         Some(HitTarget::AudioTrack) | Some(HitTarget::AudioInputTrack) => Some(RenderTarget::Popup),
@@ -1873,6 +2076,18 @@ fn render_target_for_changes(
     let semantic_target = reduced.then_some(semantic_target).flatten();
     let popup_hover_target = popup_hover_changed.then_some(RenderTarget::Popup);
     merge_render_target(semantic_target, popup_hover_target)
+}
+
+fn ai_usage_update_render_target(
+    event: &Event,
+    reduced: bool,
+    popup_was_open: bool,
+    popup_is_open: bool,
+) -> Option<RenderTarget> {
+    (reduced
+        && matches!(event, Event::ActiveAiUsageChanged(_))
+        && (popup_was_open || popup_is_open))
+        .then_some(RenderTarget::Popup)
 }
 
 fn notification_action_page_render_target(changed: bool) -> Option<RenderTarget> {
@@ -1987,13 +2202,95 @@ fn keyboard_event(
 #[cfg(test)]
 mod scheduler_tests {
     use super::{
-        hover_render_target_for, merge_render_target, notification_action_page_render_target,
-        notification_center_toggle_opened, notification_history_ids_added,
+        ai_usage_update_render_target, eligible_passive_raw_button, hover_render_target_for,
+        merge_render_target, notification_action_page_render_target,
+        notification_center_toggle_opened, notification_history_ids_added, passive_core_target,
+        passive_core_targets_for_timestamp, passive_dismiss_for_targets,
         pending_lazy_root_to_schedule, promote_menu_popup_target, render_target_for_changes,
-        should_schedule_invalidation, toast_navigation_event,
+        should_schedule_invalidation, toast_navigation_event, PassiveCoreCandidate,
+        PassiveCoreTarget,
     };
     use crate::core::{LazyRootOpenPending, MenuEndpoint, MenuItemId, MenuSource, WindowId};
     use crate::platform::x11::{HitTarget, RenderTarget};
+
+    #[test]
+    fn passive_dismiss_classification_respects_protected_targets() {
+        assert_eq!(
+            passive_dismiss_for_targets(true, false, &[PassiveCoreTarget::External]),
+            (true, false)
+        );
+        assert_eq!(
+            passive_dismiss_for_targets(false, true, &[PassiveCoreTarget::External]),
+            (false, true)
+        );
+        assert_eq!(
+            passive_dismiss_for_targets(true, true, &[PassiveCoreTarget::External]),
+            (true, true)
+        );
+        assert_eq!(
+            passive_dismiss_for_targets(true, false, &[PassiveCoreTarget::AiOpener]),
+            (false, false)
+        );
+        assert_eq!(
+            passive_dismiss_for_targets(false, true, &[PassiveCoreTarget::NotificationCenter]),
+            (false, false)
+        );
+        assert_eq!(
+            passive_dismiss_for_targets(true, true, &[PassiveCoreTarget::AiPopupInside]),
+            (false, true)
+        );
+        assert_eq!(
+            passive_dismiss_for_targets(true, true, &[PassiveCoreTarget::NotificationCenter]),
+            (true, false)
+        );
+        assert_eq!(passive_dismiss_for_targets(true, false, &[]), (true, false));
+    }
+
+    #[test]
+    fn batch_core_matching_is_independent_of_raw_event_position() {
+        let raw_then_core = vec![PassiveCoreCandidate {
+            index: 1,
+            timestamp: 77,
+            target: PassiveCoreTarget::OtherXbar,
+        }];
+        let core_then_raw = raw_then_core.clone();
+        assert_eq!(
+            passive_core_targets_for_timestamp(&raw_then_core, 77),
+            passive_core_targets_for_timestamp(&core_then_raw, 77)
+        );
+        assert_eq!(
+            passive_dismiss_for_targets(
+                true,
+                false,
+                &passive_core_targets_for_timestamp(&raw_then_core, 77)
+            ),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn passive_targets_and_buttons_keep_opener_inside_and_wheel_distinct() {
+        assert_eq!(
+            passive_core_target(&HitTarget::AiUsageInside),
+            PassiveCoreTarget::AiPopupInside
+        );
+        assert_eq!(
+            passive_core_target(&HitTarget::AiUsage(
+                crate::core::PluginId("ai".into()),
+                crate::core::OutputId(1),
+            )),
+            PassiveCoreTarget::AiOpener
+        );
+        assert_eq!(
+            passive_core_target(&HitTarget::NotificationCenter(crate::core::OutputId(1))),
+            PassiveCoreTarget::NotificationCenter
+        );
+        assert!(eligible_passive_raw_button(1));
+        assert!(eligible_passive_raw_button(2));
+        assert!(eligible_passive_raw_button(3));
+        assert!(!eligible_passive_raw_button(4));
+        assert!(!eligible_passive_raw_button(5));
+    }
 
     fn pending(
         window_id: u32,
@@ -2044,6 +2341,27 @@ mod scheduler_tests {
                 target: Some(crate::core::HistoryEntryId(8)),
             }
         ));
+    }
+
+    #[test]
+    fn ai_usage_updates_redraw_only_an_open_or_closing_popup() {
+        let event = crate::core::Event::ActiveAiUsageChanged(Vec::new());
+        assert_eq!(
+            ai_usage_update_render_target(&event, true, false, false),
+            None
+        );
+        assert_eq!(
+            ai_usage_update_render_target(&event, true, true, true),
+            Some(RenderTarget::Popup)
+        );
+        assert_eq!(
+            ai_usage_update_render_target(&event, true, true, false),
+            Some(RenderTarget::Popup)
+        );
+        assert_eq!(
+            ai_usage_update_render_target(&event, false, true, true),
+            None
+        );
     }
 
     #[test]

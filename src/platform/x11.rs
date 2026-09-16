@@ -9,9 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::randr::{self, ConnectionExt as RandrExt};
 use x11rb::protocol::render::{self, ConnectionExt as RenderExt};
+use x11rb::protocol::xinput::{self, ConnectionExt as XinputExt};
 use x11rb::protocol::xproto::{
     self, Atom, AtomEnum, ButtonIndex, ConnectionExt as XprotoExt, EventMask, GrabMode, ModMask,
     WindowClass,
@@ -35,12 +36,61 @@ fn trace_x11_resource(event: &str, role: &str, xid: u32) {
     }
 }
 
+#[allow(dead_code)]
+fn format_cache_age(seconds: Option<u64>) -> String {
+    let seconds = seconds.unwrap_or(0);
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
+    }
+}
+
+#[allow(dead_code)]
+fn format_reset_at(timestamp: Option<u64>) -> Option<String> {
+    let timestamp = timestamp? as libc::time_t;
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut reset = unsafe { std::mem::zeroed::<libc::tm>() };
+    let mut today = unsafe { std::mem::zeroed::<libc::tm>() };
+    if unsafe { libc::localtime_r(&timestamp, &mut reset) }.is_null()
+        || unsafe { libc::localtime_r(&now, &mut today) }.is_null()
+    {
+        return None;
+    }
+    if reset.tm_year == today.tm_year && reset.tm_yday == today.tm_yday {
+        Some(format!("resets {:02}:{:02}", reset.tm_hour, reset.tm_min))
+    } else {
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let month = MONTHS.get(reset.tm_mon as usize).copied().unwrap_or("?");
+        Some(format!(
+            "resets {} {} {:02}:{:02}",
+            reset.tm_mday, month, reset.tm_hour, reset.tm_min
+        ))
+    }
+}
+
 fn notification_scroll_trace_enabled() -> bool {
     std::env::var_os("XBAR_TRACE_NOTIFICATION_SCROLL").is_some()
 }
 
 fn notification_ui_trace_enabled() -> bool {
     std::env::var_os("XBAR_TRACE_NOTIFICATION_UI").is_some()
+}
+
+fn raw_button_press_event(raw: &xinput::RawButtonPressEvent) -> X11Event {
+    X11Event::RawButtonPress {
+        time: raw.time,
+        detail: raw.detail,
+        deviceid: raw.deviceid,
+        sourceid: raw.sourceid,
+        flags: raw.flags,
+    }
 }
 
 /// Render an eligible template pixel while retaining its source alpha as
@@ -240,6 +290,13 @@ pub enum X11Event {
         button: u8,
         timestamp: u32,
     },
+    RawButtonPress {
+        time: u32,
+        detail: u32,
+        deviceid: u16,
+        sourceid: u16,
+        flags: xinput::PointerEventFlags,
+    },
     ButtonRelease {
         window: u32,
         x: i16,
@@ -277,6 +334,8 @@ pub struct X11Platform {
     text: X11Text,
     conn: XCBConnection,
     root: u32,
+    #[allow(dead_code)]
+    xinput_observer_enabled: bool,
     // One platform-owned colormap is intentionally shared by every xbar-owned
     // glass window using this visual. It is released only after all such
     // windows and their Xft drawables are gone.
@@ -291,6 +350,8 @@ pub struct X11Platform {
     bluetooth_backing: Option<PopupBacking>,
     network_popup: Option<NetworkPopupWindow>,
     network_backing: Option<PopupBacking>,
+    ai_usage_popup: Option<AiUsagePopupWindow>,
+    ai_usage_backing: Option<PopupBacking>,
     popup_hover: Option<PopupHover>,
     popup_hover_changed: bool,
     menu_popup_dirty: MenuPopupDirty,
@@ -563,6 +624,11 @@ struct NetworkPopupWindow {
     rect: layout::MenuRect,
     wireless: layout::MenuRect,
     access_points: Vec<(NetworkWifiTarget, layout::MenuRect)>,
+}
+
+struct AiUsagePopupWindow {
+    window: u32,
+    rect: layout::MenuRect,
 }
 #[derive(Clone, Debug, PartialEq)]
 enum PopupHover {
@@ -1863,6 +1929,7 @@ type BarHitMap = (
     i16,
     i16,
     Vec<view::MenuVisualItem>,
+    Vec<view::PluginVisualItem>,
     Vec<view::TrayVisualItem>,
     Option<view::NetworkVisual>,
     Option<view::AudioVisual>,
@@ -1884,6 +1951,8 @@ pub enum HitTarget {
     NotificationCenterEmpty,
     NotificationBody(OutputId, crate::core::HistoryEntryId),
     TopLevel(crate::core::MenuItemId),
+    AiUsage(crate::core::PluginId, OutputId),
+    AiUsageInside,
     Item(Vec<crate::core::MenuItemId>),
     Tray(StatusNotifierEndpoint),
     Audio,
@@ -2120,6 +2189,17 @@ fn popup_effect_owner(windows: &[BarWindow], output: OutputId) -> Option<u32> {
         .map(|bar| bar.window)
 }
 
+const AI_USAGE_POPUP_MIN_HEIGHT: u16 = 280;
+
+fn ai_usage_popup_height(quota_count: usize, status_count: usize, output_height: u16) -> u16 {
+    72_u16
+        .saturating_add((status_count as u16).saturating_mul(20))
+        .saturating_add((quota_count as u16).saturating_mul(68))
+        .saturating_add(3 * POPUP_STYLE.outer_padding)
+        .max(AI_USAGE_POPUP_MIN_HEIGHT)
+        .min(output_height.saturating_sub(BAR_HEIGHT).max(1))
+}
+
 const fn effect_owner_property_value(dock: u32) -> [u32; 1] {
     [dock]
 }
@@ -2143,6 +2223,85 @@ fn with_default_border_pixel(attributes: xproto::CreateWindowAux) -> xproto::Cre
 }
 
 impl X11Platform {
+    fn root_raw_event_masks() -> [xinput::EventMask; 1] {
+        [xinput::EventMask {
+            deviceid: xinput::Device::ALL_MASTER.into(),
+            mask: vec![xinput::XIEventMask::RAW_BUTTON_PRESS],
+        }]
+    }
+
+    fn initialize_xinput_observer(conn: &XCBConnection, root: u32) -> bool {
+        match conn.extension_information(xinput::X11_EXTENSION_NAME) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!("[XBAR-ROOT-RAW] observer=disabled stage=extension");
+                }
+                return false;
+            }
+            Err(error) => {
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!("[XBAR-ROOT-RAW] observer=disabled stage=extension error={error}");
+                }
+                return false;
+            }
+        }
+        let cookie = match conn.xinput_xi_query_version(2, 0) {
+            Ok(cookie) => cookie,
+            Err(error) => {
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!(
+                        "[XBAR-ROOT-RAW] observer=disabled stage=query-version error={error}"
+                    );
+                }
+                return false;
+            }
+        };
+        let version = match cookie.reply() {
+            Ok(version) => version,
+            Err(error) => {
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!(
+                        "[XBAR-ROOT-RAW] observer=disabled stage=query-version error={error}"
+                    );
+                }
+                return false;
+            }
+        };
+        if (version.major_version, version.minor_version) < (2, 0) {
+            if std::env::var_os("XBAR_TRACE").is_some() {
+                eprintln!(
+                    "[XBAR-ROOT-RAW] observer=disabled stage=query-version error=unsupported version {}.{}",
+                    version.major_version, version.minor_version
+                );
+            }
+            return false;
+        }
+        let masks = Self::root_raw_event_masks();
+        let cookie = match conn.xinput_xi_select_events(root, &masks) {
+            Ok(cookie) => cookie,
+            Err(error) => {
+                if std::env::var_os("XBAR_TRACE").is_some() {
+                    eprintln!("[XBAR-ROOT-RAW] observer=disabled stage=select error={error}");
+                }
+                return false;
+            }
+        };
+        if let Err(error) = cookie.check() {
+            if std::env::var_os("XBAR_TRACE").is_some() {
+                eprintln!("[XBAR-ROOT-RAW] observer=disabled stage=select error={error}");
+            }
+            return false;
+        }
+        if std::env::var_os("XBAR_TRACE").is_some() {
+            eprintln!(
+                "[XBAR-ROOT-RAW] observer=enabled root={root} deviceid={} xi_version={}.{}",
+                masks[0].deviceid, version.major_version, version.minor_version
+            );
+        }
+        true
+    }
+
     fn bar_popup_anchor(
         &self,
         output_id: OutputId,
@@ -2151,7 +2310,7 @@ impl X11Platform {
         self.bar_hits
             .iter()
             .find(|(_, id, ..)| *id == output_id)
-            .and_then(|(_, _, _, _, _, _, network, audio, bluetooth)| {
+            .and_then(|(_, _, _, _, _, _, _, network, audio, bluetooth)| {
                 let rect = match source {
                     BarPopupSource::Audio => audio.as_ref().map(|visual| visual.rect),
                     BarPopupSource::Bluetooth => bluetooth.as_ref().map(|visual| visual.rect),
@@ -2168,6 +2327,19 @@ impl X11Platform {
         self.bar_hits
             .iter()
             .find_map(|(_, output_id, ..)| self.bar_popup_anchor(*output_id, source))
+    }
+
+    fn ai_usage_popup_anchor(
+        &self,
+        output_id: OutputId,
+        plugin_id: &crate::core::PluginId,
+    ) -> Option<layout::PopupAnchor> {
+        self.bar_hits
+            .iter()
+            .find(|(_, id, ..)| *id == output_id)
+            .and_then(|(_, _, _, _, _, plugins, ..)| {
+                ai_usage_popup_anchor_for_plugins(output_id, plugin_id, plugins)
+            })
     }
 
     fn notification_popup_anchor(&self, output_id: OutputId) -> Option<layout::PopupAnchor> {
@@ -2190,13 +2362,7 @@ impl X11Platform {
         attributes: xproto::CreateWindowAux,
     ) -> Result<(), Box<dyn Error>> {
         self.create_surface_window_with_effect(
-            surface,
-            role,
-            window,
-            geometry,
-            background,
-            attributes,
-            true,
+            surface, role, window, geometry, background, attributes, true,
         )
     }
 
@@ -2692,6 +2858,7 @@ impl X11Platform {
                 ))
             })
             .unwrap_or(default_surface);
+        let xinput_observer_enabled = Self::initialize_xinput_observer(&conn, root);
         if std::env::var_os("XBAR_TRACE").is_some() {
             eprintln!(
                 "xbar trace: glass surface kind={:?} visual=0x{:x} depth={} colormap=0x{:x} alpha_mask=0x{:x} pixel_format={:?} background_pixel=0x{:x}",
@@ -2720,6 +2887,7 @@ impl X11Platform {
         let mut platform = Self {
             conn,
             root,
+            xinput_observer_enabled,
             glass_surface,
             atoms,
             text,
@@ -2732,6 +2900,8 @@ impl X11Platform {
             bluetooth_backing: None,
             network_popup: None,
             network_backing: None,
+            ai_usage_popup: None,
+            ai_usage_backing: None,
             popup_hover: None,
             popup_hover_changed: false,
             menu_popup_dirty: MenuPopupDirty::None,
@@ -3078,7 +3248,11 @@ impl X11Platform {
         Some((relative as u32 * 100 / popup.input_track.width.max(1) as u32).min(100))
     }
     pub fn popup_count(&self) -> usize {
-        self.popups.len() + usize::from(self.audio_popup.is_some())
+        self.popups.len()
+            + usize::from(self.audio_popup.is_some())
+            + usize::from(self.bluetooth_popup.is_some())
+            + usize::from(self.network_popup.is_some())
+            + usize::from(self.ai_usage_popup.is_some())
     }
 
     pub fn text_raw_fd(&self) -> RawFd {
@@ -3116,6 +3290,10 @@ impl X11Platform {
                 .is_some_and(|popup| popup.window == window)
             || self
                 .network_popup
+                .as_ref()
+                .is_some_and(|popup| popup.window == window)
+            || self
+                .ai_usage_popup
                 .as_ref()
                 .is_some_and(|popup| popup.window == window)
             || self
@@ -3397,9 +3575,26 @@ impl X11Platform {
         Ok(acquired)
     }
     pub fn next_event(&mut self) -> Result<Option<X11Event>, Box<dyn Error>> {
-        Ok(match self.conn.poll_for_event()? {
+        loop {
+            match self.conn.poll_for_event()? {
+                Some(event) => {
+                    if let Some(event) = self.translate_event(Some(event))? {
+                        return Ok(Some(event));
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
+    fn translate_event(
+        &mut self,
+        event: Option<Event>,
+    ) -> Result<Option<X11Event>, Box<dyn Error>> {
+        Ok(match event {
             Some(Event::RandrNotify(_)) => Some(X11Event::RandrChanged),
             Some(Event::Expose(e)) => Some(X11Event::Expose(e.window)),
+            Some(Event::XinputRawButtonPress(raw)) => Some(raw_button_press_event(&raw)),
             Some(Event::ButtonPress(e)) => {
                 if std::env::var_os("XBAR_TRACE").is_some() {
                     eprintln!(
@@ -4061,6 +4256,7 @@ impl X11Platform {
             } else {
                 self.render_audio_popup(state)?;
             }
+            self.render_ai_usage_popup(state)?;
             self.hover_repaint_active = false;
         }
         if target.contains(RenderTarget::NOTIFICATION) {
@@ -4084,6 +4280,8 @@ impl X11Platform {
             "Network"
         } else if state.menu_interaction.open_root.is_some() {
             "Menu"
+        } else if state.ai_usage_popup.is_some() {
+            "AiUsage"
         } else {
             "None"
         };
@@ -4109,6 +4307,13 @@ impl X11Platform {
                     || self.network_popup.is_some()
             }
             "None" => {
+                self.audio_popup.is_some()
+                    || self.bluetooth_popup.is_some()
+                    || self.network_popup.is_some()
+                    || !self.popups.is_empty()
+                    || self.ai_usage_popup.is_some()
+            }
+            "AiUsage" => {
                 self.audio_popup.is_some()
                     || self.bluetooth_popup.is_some()
                     || self.network_popup.is_some()
@@ -5437,6 +5642,7 @@ impl X11Platform {
                 output.x,
                 output.y,
                 context.menu.clone(),
+                context.plugins.clone(),
                 context.tray.clone(),
                 context.network.clone(),
                 context.audio.clone(),
@@ -5907,6 +6113,16 @@ impl X11Platform {
                 eprintln!("xbar trace: UNMAP popup=Network xid={}", popup.window);
             }
         }
+        if let Some(popup) = self.ai_usage_popup.take() {
+            self.text.release_drawable(popup.window);
+            trace_x11_resource("WINDOW_DESTROY", "ai-usage-popup", popup.window);
+            self.conn.destroy_window(popup.window)?.check()?;
+            if let Some(backing) = self.ai_usage_backing.take() {
+                self.text.release_drawable(backing.pixmap);
+                self.conn.free_gc(backing.gc)?.check()?;
+                self.conn.free_pixmap(backing.pixmap)?.check()?;
+            }
+        }
         if self.pointer_grabbed {
             if std::env::var_os("XBAR_TRACE").is_some() {
                 if let Some(state) = state {
@@ -5931,6 +6147,266 @@ impl X11Platform {
                 eprintln!("xbar trace: pointer grab released pointer_grabbed=false");
             }
         }
+        Ok(())
+    }
+
+    fn render_ai_usage_popup(&mut self, state: &State) -> Result<(), Box<dyn Error>> {
+        let Some((plugin_id, output_id)) = state.ai_usage_popup.as_ref() else {
+            if self.ai_usage_popup.is_some() {
+                self.close_popups(Some(state))?;
+            }
+            return Ok(());
+        };
+        let Some(popup_view) = view::ai_usage_popup_view(state, &(plugin_id.clone(), *output_id))
+        else {
+            self.close_popups(Some(state))?;
+            return Ok(());
+        };
+        let Some(anchor) = self.ai_usage_popup_anchor(*output_id, plugin_id) else {
+            return Ok(());
+        };
+        let Some(output) = state.outputs.iter().find(|output| output.id == *output_id) else {
+            return Ok(());
+        };
+        let header = popup_view.display_name;
+        let mut status_lines = Vec::new();
+        let mut quota_rows = Vec::new();
+        match popup_view.status {
+            view::AiUsageStatusView::Stale => {
+                if let Some(detail) = popup_view.cache_detail {
+                    status_lines.push(detail);
+                }
+            }
+            view::AiUsageStatusView::Unavailable => status_lines.push("Usage unavailable".into()),
+            view::AiUsageStatusView::Unknown => status_lines.push("Usage unknown".into()),
+            view::AiUsageStatusView::Fresh => {}
+        }
+        for meter in popup_view.meters {
+            let Some(percent) = meter.remaining_pct else {
+                continue;
+            };
+            quota_rows.push((
+                meter.label,
+                format!("{percent}% left"),
+                meter.reset_text,
+                percent,
+            ));
+        }
+        let mut width_candidates = vec![header.clone()];
+        width_candidates.extend(status_lines.iter().cloned());
+        width_candidates.extend(quota_rows.iter().flat_map(|(label, value, reset, _)| {
+            [
+                label.clone(),
+                value.clone(),
+                reset.clone().unwrap_or_default(),
+            ]
+        }));
+        let width = width_candidates
+            .iter()
+            .map(|line| self.text.measure_popup_width(line))
+            .max()
+            .unwrap_or(120)
+            .saturating_add(2 * POPUP_STYLE.outer_padding + 64)
+            .clamp(300, 520)
+            .min(output.width.max(1));
+        let quota_height = 68_u16;
+        let height = ai_usage_popup_height(quota_rows.len(), status_lines.len(), output.height);
+        let rect = layout::place_bar_popup(anchor, width, height, output).popup_rect;
+        let window = if let Some(popup) = &self.ai_usage_popup {
+            popup.window
+        } else {
+            let window = self.conn.generate_id()?;
+            let effect_owner = popup_effect_owner(&self.windows, output.id)
+                .ok_or("no dock window for AI usage popup effect owner")?;
+            self.create_glass_popup_window(
+                SurfaceRole::AiUsagePopup,
+                window,
+                rect,
+                POPUP_STYLE.border_width,
+                EventMask::EXPOSURE | EventMask::BUTTON_PRESS,
+            )?;
+            self.configure_auxiliary_effect_surface(
+                SurfaceRole::AiUsagePopup,
+                window,
+                effect_owner,
+            )?;
+            self.conn.map_window(window)?.check()?;
+            window
+        };
+        let resize = self
+            .ai_usage_popup
+            .as_ref()
+            .is_some_and(|popup| popup.rect != rect);
+        self.ai_usage_popup = Some(AiUsagePopupWindow { window, rect });
+        let backing_replaced = !backing_matches(
+            self.ai_usage_backing,
+            rect.width,
+            rect.height,
+            self.glass_surface.depth,
+        );
+        if backing_replaced {
+            let pixmap = self.conn.generate_id()?;
+            self.conn
+                .create_pixmap(
+                    self.glass_surface.depth,
+                    pixmap,
+                    self.root,
+                    rect.width,
+                    rect.height,
+                )?
+                .check()?;
+            let gc = self.conn.generate_id()?;
+            self.conn
+                .create_gc(
+                    gc,
+                    pixmap,
+                    &xproto::CreateGCAux::new().foreground(
+                        self.glass_surface
+                            .background_pixel(POPUP_STYLE.material.background),
+                    ),
+                )?
+                .check()?;
+            if let Some(old) = self.ai_usage_backing.replace(PopupBacking {
+                pixmap,
+                gc,
+                width: rect.width,
+                height: rect.height,
+                depth: self.glass_surface.depth,
+            }) {
+                self.conn.free_gc(old.gc)?.check()?;
+                self.conn.free_pixmap(old.pixmap)?.check()?;
+            }
+        }
+        let backing = self.ai_usage_backing.expect("AI usage backing created");
+        if resize || backing_replaced {
+            self.conn
+                .configure_window(
+                    window,
+                    &xproto::ConfigureWindowAux::new()
+                        .x(rect.x as i32)
+                        .y(rect.y as i32)
+                        .width(rect.width as u32)
+                        .height(rect.height as u32),
+                )?
+                .check()?;
+        }
+        self.text
+            .prepare_drawable("ai-usage-popup", backing.pixmap, self.glass_surface)?;
+        let gc = backing.gc;
+        self.fill_glass_background(backing.pixmap, gc, rect.width, rect.height)?;
+        self.draw_popup_frame(backing.pixmap, gc, rect.width, rect.height)?;
+        let card = layout::MenuRect {
+            x: rect.x + POPUP_STYLE.outer_padding as i16,
+            y: rect.y + POPUP_STYLE.outer_padding as i16,
+            width: rect.width.saturating_sub(2 * POPUP_STYLE.outer_padding),
+            height: rect.height.saturating_sub(2 * POPUP_STYLE.outer_padding),
+        };
+        self.draw_popup_card(backing.pixmap, gc, rect, card)?;
+        let content_x = POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding;
+        let content_width = card.width.saturating_sub(2 * POPUP_STYLE.card_padding);
+        self.text.draw_popup_utf8(
+            &layout::truncate_text_to_width(&header, content_width, &PopupMeasurer(&self.text))
+                .unwrap_or_default(),
+            content_x as i32,
+            (POPUP_STYLE.outer_padding + 24) as i32,
+            BAR_STYLE.material.foreground,
+        )?;
+        let mut cursor = POPUP_STYLE.outer_padding + 42;
+        for status in status_lines {
+            self.text.draw_popup_utf8(
+                &layout::truncate_text_to_width(&status, content_width, &PopupMeasurer(&self.text))
+                    .unwrap_or_default(),
+                content_x as i32,
+                cursor as i32,
+                0xb9c3d2,
+            )?;
+            cursor = cursor.saturating_add(20);
+        }
+        for (label, value, reset, percent) in quota_rows {
+            let quota_card = layout::MenuRect {
+                x: card.x + POPUP_STYLE.card_padding as i16,
+                y: rect.y + cursor as i16,
+                width: card.width.saturating_sub(2 * POPUP_STYLE.card_padding),
+                height: 60,
+            };
+            self.draw_popup_card(backing.pixmap, gc, rect, quota_card)?;
+            let local_x = quota_card.x - rect.x + POPUP_STYLE.card_padding as i16;
+            let label_width = quota_card
+                .width
+                .saturating_sub(2 * POPUP_STYLE.card_padding);
+            let quota_label_result = self.text.draw_popup_utf8(
+                &layout::truncate_text_to_width(&label, label_width, &PopupMeasurer(&self.text))
+                    .unwrap_or_default(),
+                local_x as i32,
+                (quota_card.y - rect.y + 19) as i32,
+                BAR_STYLE.material.foreground,
+            );
+            quota_label_result?;
+            let value_width = self.text.measure_popup_width(&value);
+            self.text.draw_popup_utf8(
+                &value,
+                (quota_card.x - rect.x + quota_card.width as i16
+                    - POPUP_STYLE.card_padding as i16
+                    - value_width as i16) as i32,
+                (quota_card.y - rect.y + 19) as i32,
+                0xd7e3f4,
+            )?;
+            let track = layout::MenuRect {
+                x: quota_card.x + POPUP_STYLE.card_padding as i16,
+                y: quota_card.y + 29,
+                width: quota_card
+                    .width
+                    .saturating_sub(2 * POPUP_STYLE.card_padding),
+                height: 6,
+            };
+            for (color, width) in [
+                (0x47515f, track.width),
+                (0x8fb3ff, track.width.saturating_mul(percent) / 100),
+            ] {
+                self.conn
+                    .change_gc(
+                        gc,
+                        &xproto::ChangeGCAux::new()
+                            .foreground(self.glass_surface.opaque_pixel(color)),
+                    )?
+                    .check()?;
+                self.conn
+                    .poly_fill_rectangle(
+                        backing.pixmap,
+                        gc,
+                        &[xproto::Rectangle {
+                            x: track.x - rect.x,
+                            y: track.y - rect.y,
+                            width,
+                            height: track.height,
+                        }],
+                    )?
+                    .check()?;
+            }
+            if let Some(reset) = reset {
+                self.text.draw_popup_utf8(
+                    &reset,
+                    local_x as i32,
+                    (quota_card.y - rect.y + 51) as i32,
+                    0x9daabd,
+                )?;
+            }
+            cursor = cursor.saturating_add(quota_height);
+        }
+        self.text.release_drawable(backing.pixmap);
+        self.conn
+            .copy_area(
+                backing.pixmap,
+                window,
+                gc,
+                0,
+                0,
+                0,
+                0,
+                rect.width,
+                rect.height,
+            )?
+            .check()?;
         Ok(())
     }
 
@@ -7064,21 +7540,21 @@ impl X11Platform {
         } else {
             SurfaceRole::GlobalMenuPopup
         };
-        let anchor = self
-            .bar_hits
-            .iter()
-            .find_map(|(_, output_id, _, _, items, tray, _, _, _)| {
-                if let Some(endpoint) = tray_endpoint {
-                    tray.iter()
-                        .find(|item| item.endpoint.service == endpoint.service)
-                        .map(|item| (*output_id, item.rect))
-                } else {
-                    items
-                        .iter()
-                        .find(|item| item.id == root_id)
-                        .map(|item| (*output_id, item.rect))
-                }
-            });
+        let anchor =
+            self.bar_hits
+                .iter()
+                .find_map(|(_, output_id, _, _, items, _, tray, _, _, _)| {
+                    if let Some(endpoint) = tray_endpoint {
+                        tray.iter()
+                            .find(|item| item.endpoint.service == endpoint.service)
+                            .map(|item| (*output_id, item.rect))
+                    } else {
+                        items
+                            .iter()
+                            .find(|item| item.id == root_id)
+                            .map(|item| (*output_id, item.rect))
+                    }
+                });
         let Some((output_id, top_rect)) = anchor else {
             return Ok(());
         };
@@ -7580,8 +8056,21 @@ impl X11Platform {
                 return target;
             }
         }
-        if let Some((_bar, _, ox, oy, items, tray, network, audio, bluetooth)) =
-            self.bar_hits.iter().find(|(bar, _, _, _, _, _, _, _, _)| {
+        if let Some(popup) = &self.ai_usage_popup {
+            let inside = popup.window == window
+                || (self.root == window
+                    && root_x >= popup.rect.x
+                    && root_x < popup.rect.x + popup.rect.width as i16
+                    && root_y >= popup.rect.y
+                    && root_y < popup.rect.y + popup.rect.height as i16);
+            if inside {
+                return HitTarget::AiUsageInside;
+            }
+        }
+        if let Some((_bar, output, ox, oy, items, plugins, tray, network, audio, bluetooth)) = self
+            .bar_hits
+            .iter()
+            .find(|(bar, _, _, _, _, _, _, _, _, _)| {
                 *bar == window || (self.root == window && root_y < BAR_HEIGHT as i16)
             })
         {
@@ -7604,6 +8093,12 @@ impl X11Platform {
                 .map(|i| HitTarget::TopLevel(i.id))
             {
                 return item;
+            }
+            if let Some(target) = plugins
+                .iter()
+                .find_map(|plugin| ai_usage_hit_target(plugin, *output, bar_x, bar_y))
+            {
+                return target;
             }
             let root_x = bar_x;
             let root_y = bar_y;
@@ -7802,6 +8297,34 @@ impl X11Platform {
     }
 }
 
+fn ai_usage_popup_anchor_for_plugins(
+    output_id: OutputId,
+    plugin_id: &crate::core::PluginId,
+    plugins: &[view::PluginVisualItem],
+) -> Option<layout::PopupAnchor> {
+    plugins
+        .iter()
+        .find(|plugin| &plugin.id == plugin_id)
+        .map(|plugin| layout::PopupAnchor {
+            output_id,
+            source_rect: plugin.rect,
+        })
+}
+
+fn ai_usage_hit_target(
+    plugin: &view::PluginVisualItem,
+    output_id: OutputId,
+    x: i16,
+    y: i16,
+) -> Option<HitTarget> {
+    plugin
+        .id
+        .is_ai_usage()
+        .then(|| plugin.rect.contains(x, y))
+        .filter(|contains| *contains)
+        .map(|_| HitTarget::AiUsage(plugin.id.clone(), output_id))
+}
+
 fn popup_hover_for(target: Option<&HitTarget>) -> Option<PopupHover> {
     match target {
         Some(HitTarget::Item(path)) => path.last().copied().map(PopupHover::MenuItem),
@@ -7848,6 +8371,7 @@ impl Drop for X11Platform {
             self.audio_backing.take(),
             self.bluetooth_backing.take(),
             self.network_backing.take(),
+            self.ai_usage_backing.take(),
         ]
         .into_iter()
         .flatten()
@@ -7885,6 +8409,7 @@ impl Drop for X11Platform {
             self.audio_popup.take().map(|popup| popup.window),
             self.bluetooth_popup.take().map(|popup| popup.window),
             self.network_popup.take().map(|popup| popup.window),
+            self.ai_usage_popup.take().map(|popup| popup.window),
             self.instance_window.take(),
         ]
         .into_iter()
@@ -7986,21 +8511,23 @@ fn is_xbar_owned_window(
 mod tests {
     use super::super::surface::{FramePolicy, SurfaceRole};
     use super::{
+        ai_usage_hit_target, ai_usage_popup_anchor_for_plugins, ai_usage_popup_height,
         backing_matches, bar_backing_matches, blur_behind_rect, classify_attention_property_reply,
-        classify_property_string_reply, effect_owner_property_value, frame_policy_property_value,
-        install_passive_grabs, is_xbar_owned_window, menu_popup_dirty_for_interaction_change,
-        menu_popup_slot_for_window, menu_popup_slots_for_item, network_primary_row_label,
-        notification_body_hit, notification_history_id_for, notification_hover_transition,
-        notification_indicator_hit, notification_indicator_rect, notification_previous_scroll,
-        notification_scroll_target, notification_wheel_direction, popup_effect_owner,
-        popup_hover_for, popup_hover_transition, popup_slot_is_selected, preserve_color_pixel,
+        classify_property_string_reply, effect_owner_property_value, format_cache_age,
+        format_reset_at, frame_policy_property_value, install_passive_grabs, is_xbar_owned_window,
+        menu_popup_dirty_for_interaction_change, menu_popup_slot_for_window,
+        menu_popup_slots_for_item, network_primary_row_label, notification_body_hit,
+        notification_history_id_for, notification_hover_transition, notification_indicator_hit,
+        notification_indicator_rect, notification_previous_scroll, notification_scroll_target,
+        notification_wheel_direction, popup_effect_owner, popup_hover_for, popup_hover_transition,
+        popup_slot_is_selected, preserve_color_pixel, raw_button_press_event,
         reconcile_notification_scroll, reconcile_toast_stack, reconcile_toast_stack_candidates,
         reconcile_toast_stack_grouped, template_icon_pixel, toast_members_that_fit,
         toast_presentation_items, tray_draw_size, tray_hit, union_menu_rects,
         AttentionPropertyRead, BarBacking, BarWindow, GlobalPinShortcut, HitTarget, MenuPopupDirty,
         PopupBacking, PopupHover, PopupSlot, PopupWindow, RenderTarget, SurfaceWindowGeometry,
-        ToastFitItem, X11Event, BAR_HEIGHT, NOTIFICATION_CARD_SLOT_GAP,
-        NOTIFICATION_GROUP_INTERNAL_GAP, NOTIFICATION_OUTER_PADDING,
+        ToastFitItem, X11Event, X11Platform, AI_USAGE_POPUP_MIN_HEIGHT, BAR_HEIGHT,
+        NOTIFICATION_CARD_SLOT_GAP, NOTIFICATION_GROUP_INTERNAL_GAP, NOTIFICATION_OUTER_PADDING,
         XOMPOSITE_FRAME_POLICY_ATOM_NAME,
     };
     use crate::core::{
@@ -8016,9 +8543,74 @@ mod tests {
     };
     use std::collections::HashSet;
     use x11rb::errors::ReplyError;
+    use x11rb::protocol::xinput;
     use x11rb::protocol::xproto::{EventMask, ModMask};
     use x11rb::protocol::{xproto, ErrorKind};
     use x11rb::x11_utils::X11Error;
+
+    #[test]
+    fn xinput_raw_button_press_is_an_observational_x11_event() {
+        let raw = xinput::RawButtonPressEvent {
+            time: 17,
+            detail: 4,
+            deviceid: 2,
+            sourceid: 3,
+            flags: Default::default(),
+            ..Default::default()
+        };
+        assert_eq!(
+            raw_button_press_event(&raw),
+            X11Event::RawButtonPress {
+                time: 17,
+                detail: 4,
+                deviceid: 2,
+                sourceid: 3,
+                flags: Default::default(),
+            }
+        );
+        assert!(!matches!(
+            raw_button_press_event(&raw),
+            X11Event::ButtonPress { .. }
+        ));
+    }
+
+    #[test]
+    fn raw_buttons_four_and_five_are_not_ui_actions() {
+        for detail in [4, 5] {
+            let event = raw_button_press_event(&xinput::RawButtonPressEvent {
+                detail,
+                ..Default::default()
+            });
+            assert!(matches!(event, X11Event::RawButtonPress { detail: d, .. } if d == detail));
+        }
+    }
+
+    fn first_recognized<T>(events: impl IntoIterator<Item = Option<T>>) -> Option<T> {
+        for event in events {
+            if event.is_some() {
+                return event;
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn ignored_protocol_events_are_skipped_until_recognized_or_empty() {
+        assert_eq!(first_recognized([None, Some(1_u8)]), Some(1));
+        assert_eq!(first_recognized([None, None, Some(2_u8)]), Some(2));
+        assert_eq!(first_recognized([None::<u8>, None]), None);
+        assert_eq!(first_recognized([Some(3_u8), Some(4_u8)]), Some(3));
+    }
+
+    #[test]
+    fn root_raw_selection_uses_xi_all_master_devices() {
+        let masks = X11Platform::root_raw_event_masks();
+        assert_eq!(masks.len(), 1);
+        assert_eq!(masks[0].deviceid, u16::from(xinput::Device::ALL_MASTER));
+        assert_eq!(masks[0].deviceid, 1);
+        assert_ne!(masks[0].deviceid, 0xffff);
+        assert_eq!(masks[0].mask, vec![xinput::XIEventMask::RAW_BUTTON_PRESS,]);
+    }
 
     fn x11_error(kind: ErrorKind, bad_value: u32) -> ReplyError {
         ReplyError::X11Error(X11Error {
@@ -8390,6 +8982,87 @@ mod tests {
         assert_eq!(XOMPOSITE_FRAME_POLICY_ATOM_NAME, b"_XOMPOSITE_FRAME_POLICY");
         assert_eq!(frame_policy_property_value(FramePolicy::Request), [1]);
         assert_eq!(frame_policy_property_value(FramePolicy::Request).len(), 1);
+    }
+
+    #[test]
+    fn ai_usage_formatters_preserve_missing_values_and_bound_age_units() {
+        assert_eq!(format_cache_age(Some(45)), "45s ago");
+        assert_eq!(format_cache_age(Some(180)), "3m ago");
+        assert_eq!(format_cache_age(Some(7200)), "2h ago");
+        assert_eq!(format_cache_age(Some(345_600)), "4d ago");
+        assert!(format_reset_at(None).is_none());
+    }
+
+    #[test]
+    fn ai_usage_hit_target_uses_canonical_id_not_display_text() {
+        let ai = crate::ui::view::PluginVisualItem {
+            id: crate::core::PluginId("ai-usage:openai:codex:default".into()),
+            text: "completely unrelated label".into(),
+            rect: MenuRect {
+                x: 10,
+                y: 0,
+                width: 80,
+                height: 26,
+            },
+        };
+        assert_eq!(
+            ai_usage_hit_target(&ai, OutputId(3), 20, 10),
+            Some(HitTarget::AiUsage(
+                crate::core::PluginId("ai-usage:openai:codex:default".into()),
+                OutputId(3),
+            ))
+        );
+        let generic = crate::ui::view::PluginVisualItem {
+            id: crate::core::PluginId("plugin:generic".into()),
+            text: "ai-usage:openai:codex:default 97%".into(),
+            rect: ai.rect,
+        };
+        assert_eq!(ai_usage_hit_target(&generic, OutputId(3), 20, 10), None);
+        assert_eq!(ai_usage_hit_target(&ai, OutputId(3), 200, 10), None);
+    }
+
+    #[test]
+    fn ai_usage_anchor_uses_selected_output_without_global_fallback() {
+        let plugins_a = vec![crate::ui::view::PluginVisualItem {
+            id: crate::core::PluginId("ai-usage:openai:codex:a".into()),
+            text: "A".into(),
+            rect: MenuRect {
+                x: 10,
+                y: 0,
+                width: 20,
+                height: 26,
+            },
+        }];
+        let plugins_b = vec![crate::ui::view::PluginVisualItem {
+            id: crate::core::PluginId("ai-usage:openai:codex:b".into()),
+            text: "B".into(),
+            rect: MenuRect {
+                x: 40,
+                y: 0,
+                width: 20,
+                height: 26,
+            },
+        }];
+        let a_id = crate::core::PluginId("ai-usage:openai:codex:a".into());
+        let b_id = crate::core::PluginId("ai-usage:openai:codex:b".into());
+        let a = ai_usage_popup_anchor_for_plugins(OutputId(1), &a_id, &plugins_a).unwrap();
+        let b = ai_usage_popup_anchor_for_plugins(OutputId(2), &b_id, &plugins_b).unwrap();
+        assert_eq!((a.output_id, a.source_rect.x), (OutputId(1), 10));
+        assert_eq!((b.output_id, b.source_rect.x), (OutputId(2), 40));
+        assert!(ai_usage_popup_anchor_for_plugins(OutputId(3), &a_id, &plugins_b).is_none());
+    }
+
+    #[test]
+    fn ai_usage_height_is_minimum_content_driven_and_output_bounded() {
+        let two_quotas = ai_usage_popup_height(2, 0, 1080);
+        assert_eq!(two_quotas, AI_USAGE_POPUP_MIN_HEIGHT);
+        assert!(two_quotas >= 280);
+
+        assert_eq!(
+            ai_usage_popup_height(2, 0, 300),
+            300_u16.saturating_sub(BAR_HEIGHT).max(1)
+        );
+        assert_eq!(ai_usage_popup_height(0, 0, BAR_HEIGHT), 1);
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub(crate) enum SurfaceRole {
     NetworkPopup,
     BluetoothPopup,
     AudioPopup,
+    AiUsagePopup,
     Notification,
 }
 
@@ -123,6 +124,7 @@ impl SurfaceRole {
             | Self::NetworkPopup
             | Self::BluetoothPopup
             | Self::AudioPopup => FramePolicy::Request,
+            Self::AiUsagePopup => FramePolicy::Request,
             Self::Notification => FramePolicy::Default,
             Self::Dock => FramePolicy::Suppress,
         }
@@ -139,6 +141,7 @@ impl SurfaceRole {
                 | Self::NetworkPopup
                 | Self::BluetoothPopup
                 | Self::AudioPopup
+                | Self::AiUsagePopup
                 | Self::Notification,
                 SurfaceKind::Argb,
             ) => Some(SurfaceEffect::BlurBehind),
@@ -155,6 +158,7 @@ impl SurfaceRole {
                 | Self::NetworkPopup
                 | Self::BluetoothPopup
                 | Self::AudioPopup
+                | Self::AiUsagePopup
                 | Self::Notification
         )
     }
@@ -167,6 +171,7 @@ impl SurfaceRole {
                 | Self::NetworkPopup
                 | Self::BluetoothPopup
                 | Self::AudioPopup
+                | Self::AiUsagePopup
         )
     }
 }
@@ -426,5 +431,16 @@ mod tests {
             FramePolicy::Default
         );
         assert_eq!(SurfaceRole::Dock.frame_policy(), FramePolicy::Suppress);
+    }
+
+    #[test]
+    fn ai_usage_popup_uses_the_existing_blurred_popup_contract() {
+        let surface = SurfaceVisual::argb(0x22, 0x33, ARGB_8888);
+        assert_eq!(
+            SurfaceRole::AiUsagePopup.effect(surface),
+            Some(SurfaceEffect::BlurBehind)
+        );
+        assert!(SurfaceRole::AiUsagePopup.uses_effect_owner());
+        assert!(SurfaceRole::AiUsagePopup.uses_override_redirect());
     }
 }

@@ -137,6 +137,14 @@ pub struct NetworkStatus {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PluginId(pub String);
 
+impl PluginId {
+    /// AI usage projection IDs use this canonical, non-display discriminator.
+    /// The rendered label is deliberately not part of hit-test identity.
+    pub fn is_ai_usage(&self) -> bool {
+        self.0.starts_with("ai-usage:")
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PluginStatus {
     Ready,
@@ -686,6 +694,7 @@ pub struct State {
     pub network_popup_open_pending: bool,
     pub ai_usage: Vec<ActiveAgentUsage>,
     pub plugin_zone: PluginZoneState,
+    pub ai_usage_popup: Option<(PluginId, OutputId)>,
     pub audio_popup_open: bool,
     pub notifications: Vec<Notification>,
     pub notification_history: Vec<NotificationHistoryEntry>,

@@ -82,6 +82,10 @@ pub enum Event {
         path: Vec<MenuItemId>,
     },
     MenuClickedOutside,
+    PassivePopupDismissRequested {
+        ai_usage: bool,
+        notification_center: bool,
+    },
     PinCurrentMenuPresentation,
     UnpinMenuPresentation,
     #[allow(dead_code)] // Reserved for the future native global shortcut.
@@ -168,6 +172,10 @@ pub enum Event {
     NetworkActionFinished(NetworkPendingAction),
     #[allow(dead_code)]
     ActiveAiUsageChanged(Vec<super::ActiveAgentUsage>),
+    AiUsagePopupToggled {
+        plugin: super::PluginId,
+        output: super::OutputId,
+    },
     BluetoothSnapshotReceived(super::BluetoothState),
     BluetoothUnavailable,
     BluetoothPopupToggled,

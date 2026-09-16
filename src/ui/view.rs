@@ -1,6 +1,7 @@
 use crate::core::{
-    ClockState, MenuItemId, MenuModel, NetworkConnectivity, NetworkLinkKind, StatusNotifierIcon,
-    StatusNotifierItem, StatusNotifierStatus,
+    ActiveAgentUsage, ClockState, MenuItemId, MenuModel, NetworkConnectivity, NetworkLinkKind,
+    PluginId, State, StatusNotifierIcon, StatusNotifierItem, StatusNotifierStatus, UsageStatus,
+    UsageValue,
 };
 use crate::ui::layout::{allocate_tray, MenuRect, WorkspaceRect};
 use crate::ui::style::{TextMeasurer, BAR_STYLE, STATUS_ITEM_GAP};
@@ -33,6 +34,135 @@ pub struct PluginVisualItem {
     pub id: crate::core::PluginId,
     pub text: String,
     pub rect: MenuRect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AiUsageMeterKind {
+    Percentage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AiUsageMeterView {
+    pub id: String,
+    pub label: String,
+    pub kind: AiUsageMeterKind,
+    pub remaining_pct: Option<u16>,
+    pub reset_text: Option<String>,
+    pub is_primary: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AiUsageStatusView {
+    Fresh,
+    Stale,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AiUsagePopupView {
+    pub plugin_id: PluginId,
+    pub output_id: crate::core::OutputId,
+    pub display_name: String,
+    pub provider_id: String,
+    pub status: AiUsageStatusView,
+    pub cache_detail: Option<String>,
+    pub meters: Vec<AiUsageMeterView>,
+}
+
+fn ai_usage_cache_detail(age: Option<u64>) -> Option<String> {
+    let age = age?;
+    let detail = if age < 60 {
+        format!("{age}s ago")
+    } else if age < 3_600 {
+        format!("{}m ago", age / 60)
+    } else if age < 86_400 {
+        format!("{}h ago", age / 3_600)
+    } else {
+        format!("{}d ago", age / 86_400)
+    };
+    Some(format!("Cached {detail}"))
+}
+
+fn ai_usage_reset_text(timestamp: Option<u64>) -> Option<String> {
+    let timestamp = timestamp? as libc::time_t;
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut reset = unsafe { std::mem::zeroed::<libc::tm>() };
+    let mut today = unsafe { std::mem::zeroed::<libc::tm>() };
+    if unsafe { libc::localtime_r(&timestamp, &mut reset) }.is_null()
+        || unsafe { libc::localtime_r(&now, &mut today) }.is_null()
+    {
+        return None;
+    }
+    if reset.tm_year == today.tm_year && reset.tm_yday == today.tm_yday {
+        Some(format!("resets {:02}:{:02}", reset.tm_hour, reset.tm_min))
+    } else {
+        Some(format!(
+            "resets {:02}/{:02} {:02}:{:02}",
+            reset.tm_mday,
+            reset.tm_mon + 1,
+            reset.tm_hour,
+            reset.tm_min
+        ))
+    }
+}
+
+/// Projects the selected collector record into renderer-facing semantics.
+/// Account identity is intentionally not copied into this view.
+pub fn ai_usage_popup_view(
+    state: &State,
+    selection: &(PluginId, crate::core::OutputId),
+) -> Option<AiUsagePopupView> {
+    let (plugin_id, output_id) = selection;
+    let agent: &ActiveAgentUsage = state
+        .ai_usage
+        .iter()
+        .find(|agent| agent.plugin_summary().id == *plugin_id)?;
+    let primary_id = agent.summary.label.as_str();
+    let mut meters = agent
+        .meters
+        .iter()
+        .filter(|meter| {
+            matches!(
+                meter.value,
+                Some(UsageValue::Percentage {
+                    remaining_pct: Some(_),
+                    ..
+                })
+            )
+        })
+        .collect::<Vec<_>>();
+    meters.sort_by_key(|meter| {
+        let category = if meter.id == primary_id { 0 } else { 1 };
+        (category, meter.id.as_str())
+    });
+    let meters = meters
+        .into_iter()
+        .map(|meter| AiUsageMeterView {
+            id: meter.id.clone(),
+            label: meter.label.clone(),
+            kind: AiUsageMeterKind::Percentage,
+            remaining_pct: meter.remaining_pct.map(|value| value.min(100)),
+            reset_text: ai_usage_reset_text(meter.reset_at),
+            is_primary: meter.id == primary_id,
+        })
+        .collect();
+    Some(AiUsagePopupView {
+        plugin_id: plugin_id.clone(),
+        output_id: *output_id,
+        display_name: agent.display_name.clone(),
+        provider_id: agent.provider_id.clone(),
+        status: match agent.status {
+            UsageStatus::Fresh => AiUsageStatusView::Fresh,
+            UsageStatus::Stale => AiUsageStatusView::Stale,
+            UsageStatus::Unavailable => AiUsageStatusView::Unavailable,
+            UsageStatus::Unknown => AiUsageStatusView::Unknown,
+        },
+        cache_detail: matches!(agent.status, UsageStatus::Stale)
+            .then(|| ai_usage_cache_detail(agent.cache_age_secs))
+            .flatten(),
+        meters,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1389,5 +1519,180 @@ mod tests {
         );
         assert_eq!(view.plugins.len(), 2);
         assert!(view.plugins.iter().all(|plugin| plugin.rect.width > 0));
+    }
+
+    #[test]
+    fn ai_usage_popup_projection_orders_percentages_and_omits_supplementary_values() {
+        let agent = crate::core::ActiveAgentUsage {
+            agent_id: "codex".into(),
+            provider_id: "openai".into(),
+            account_id: crate::core::AccountIdentity::Default,
+            display_name: "Codex".into(),
+            active_instances: 1,
+            meters: vec![
+                crate::core::UsageMeter {
+                    id: "credits".into(),
+                    label: "Credits".into(),
+                    remaining_pct: None,
+                    used_pct: None,
+                    value: Some(crate::core::UsageValue::Amount {
+                        value: "12.40".into(),
+                        unit: Some("USD".into()),
+                    }),
+                    reset_at: None,
+                },
+                crate::core::UsageMeter {
+                    id: "weekly".into(),
+                    label: "Weekly".into(),
+                    remaining_pct: Some(60),
+                    used_pct: Some(40),
+                    value: Some(crate::core::UsageValue::Percentage {
+                        remaining_pct: Some(60),
+                        used_pct: Some(40),
+                    }),
+                    reset_at: None,
+                },
+                crate::core::UsageMeter {
+                    id: "session".into(),
+                    label: "Codex 5h".into(),
+                    remaining_pct: Some(97),
+                    used_pct: Some(3),
+                    value: Some(crate::core::UsageValue::Percentage {
+                        remaining_pct: Some(97),
+                        used_pct: Some(3),
+                    }),
+                    reset_at: Some(1),
+                },
+            ],
+            summary: crate::core::UsageSummary {
+                label: "session".into(),
+                remaining_pct: Some(97),
+            },
+            status: crate::core::UsageStatus::Fresh,
+            fetched_at: Some(1),
+            cache_age_secs: None,
+        };
+        let plugin_id = agent.plugin_summary().id;
+        let state = crate::core::State {
+            ai_usage: vec![agent],
+            ..Default::default()
+        };
+        let view = ai_usage_popup_view(&state, &(plugin_id.clone(), crate::core::OutputId(7)))
+            .expect("selected AI usage must project");
+        assert_eq!(view.plugin_id, plugin_id);
+        assert_eq!(view.output_id, crate::core::OutputId(7));
+        assert_eq!(view.meters[0].id, "session");
+        assert!(view.meters[0].is_primary);
+        assert_eq!(view.meters[0].remaining_pct, Some(97));
+        assert_eq!(view.meters[0].kind, AiUsageMeterKind::Percentage);
+        assert_eq!(view.meters[1].id, "weekly");
+        assert_eq!(view.meters.len(), 2);
+        assert!(view.meters[0].reset_text.is_some());
+    }
+
+    #[test]
+    fn ai_usage_popup_projection_omits_amount_and_text_meters() {
+        let agent = crate::core::ActiveAgentUsage {
+            agent_id: "codex".into(),
+            provider_id: "openai".into(),
+            account_id: crate::core::AccountIdentity::Default,
+            display_name: "Codex".into(),
+            active_instances: 1,
+            meters: vec![
+                crate::core::UsageMeter {
+                    id: "credits".into(),
+                    label: "Credits".into(),
+                    remaining_pct: None,
+                    used_pct: None,
+                    value: Some(crate::core::UsageValue::Amount {
+                        value: "12.40".into(),
+                        unit: Some("USD".into()),
+                    }),
+                    reset_at: None,
+                },
+                crate::core::UsageMeter {
+                    id: "message".into(),
+                    label: "Messages".into(),
+                    remaining_pct: None,
+                    used_pct: None,
+                    value: Some(crate::core::UsageValue::Text {
+                        value: "unlimited".into(),
+                        unit: None,
+                    }),
+                    reset_at: None,
+                },
+            ],
+            summary: Default::default(),
+            status: crate::core::UsageStatus::Fresh,
+            fetched_at: Some(1),
+            cache_age_secs: None,
+        };
+        let plugin_id = agent.plugin_summary().id;
+        let state = crate::core::State {
+            ai_usage: vec![agent],
+            ..Default::default()
+        };
+        let view = ai_usage_popup_view(&state, &(plugin_id, crate::core::OutputId(7))).unwrap();
+        assert!(view.meters.is_empty());
+    }
+
+    #[test]
+    fn ai_usage_popup_projection_keeps_status_and_omits_account_identity() {
+        let agent = crate::core::ActiveAgentUsage {
+            agent_id: "grok".into(),
+            provider_id: "xai".into(),
+            account_id: crate::core::AccountIdentity::Named("/secret/account".into()),
+            display_name: "Grok".into(),
+            active_instances: 1,
+            meters: Vec::new(),
+            summary: Default::default(),
+            status: crate::core::UsageStatus::Unavailable,
+            fetched_at: None,
+            cache_age_secs: None,
+        };
+        let plugin_id = agent.plugin_summary().id;
+        let state = crate::core::State {
+            ai_usage: vec![agent],
+            ..Default::default()
+        };
+        let view = ai_usage_popup_view(&state, &(plugin_id, crate::core::OutputId(1))).unwrap();
+        assert_eq!(view.status, AiUsageStatusView::Unavailable);
+        assert!(view.meters.is_empty());
+        let rendered_fields = format!("{} {}", view.display_name, view.provider_id);
+        assert!(!rendered_fields.contains("/secret/account"));
+    }
+
+    #[test]
+    fn ai_usage_popup_projection_shows_cache_detail_only_when_stale() {
+        let mut agent = crate::core::ActiveAgentUsage {
+            agent_id: "codex".into(),
+            provider_id: "openai".into(),
+            account_id: crate::core::AccountIdentity::Default,
+            display_name: "Codex".into(),
+            active_instances: 1,
+            meters: Vec::new(),
+            summary: Default::default(),
+            status: crate::core::UsageStatus::Fresh,
+            fetched_at: None,
+            cache_age_secs: Some(180),
+        };
+        let mut state = crate::core::State::default();
+        let id = agent.plugin_summary().id;
+        state.ai_usage = vec![agent.clone()];
+        assert!(
+            ai_usage_popup_view(&state, &(id.clone(), crate::core::OutputId(1)))
+                .unwrap()
+                .cache_detail
+                .is_none()
+        );
+        agent.status = crate::core::UsageStatus::Stale;
+        state.ai_usage = vec![agent];
+        assert_eq!(
+            ai_usage_popup_view(&state, &(id, crate::core::OutputId(1)))
+                .unwrap()
+                .cache_detail
+                .as_deref(),
+            Some("Cached 3m ago")
+        );
     }
 }
