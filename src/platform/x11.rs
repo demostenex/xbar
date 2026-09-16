@@ -473,6 +473,7 @@ struct BarText {
 }
 struct PopupWindow {
     window: u32,
+    output: OutputId,
     layout: layout::PopupLayout,
     backing: Option<PopupBacking>,
 }
@@ -1950,12 +1951,12 @@ pub enum HitTarget {
     NotificationCenterClearAll,
     NotificationCenterEmpty,
     NotificationBody(OutputId, crate::core::HistoryEntryId),
-    TopLevel(crate::core::MenuItemId),
+    TopLevel(crate::core::MenuItemId, OutputId),
     AiUsage(crate::core::PluginId, OutputId),
     AiUsageInside,
     Item(Vec<crate::core::MenuItemId>),
-    Tray(StatusNotifierEndpoint),
-    Audio,
+    Tray(StatusNotifierEndpoint, OutputId),
+    Audio(OutputId),
     AudioMute,
     AudioTrack,
     AudioInputMute,
@@ -1963,11 +1964,11 @@ pub enum HitTarget {
     AudioOutputDevice(String),
     AudioInputDevice(String),
     AudioInside,
-    Bluetooth,
+    Bluetooth(OutputId),
     BluetoothPower,
     BluetoothDevice(String),
     BluetoothInside,
-    Network,
+    Network(OutputId),
     NetworkWifi(NetworkWifiTarget),
     NetworkWireless,
     NetworkInside,
@@ -2189,6 +2190,16 @@ fn popup_effect_owner(windows: &[BarWindow], output: OutputId) -> Option<u32> {
         .map(|bar| bar.window)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectOwnerUpdate {
+    Set(u32),
+    Delete,
+}
+
+fn effect_owner_update(windows: &[BarWindow], output: OutputId) -> EffectOwnerUpdate {
+    popup_effect_owner(windows, output).map_or(EffectOwnerUpdate::Delete, EffectOwnerUpdate::Set)
+}
+
 const AI_USAGE_POPUP_MIN_HEIGHT: u16 = 280;
 
 fn ai_usage_popup_height(quota_count: usize, status_count: usize, output_height: u16) -> u16 {
@@ -2323,12 +2334,6 @@ impl X11Platform {
             })
     }
 
-    fn first_bar_popup_anchor(&self, source: BarPopupSource) -> Option<layout::PopupAnchor> {
-        self.bar_hits
-            .iter()
-            .find_map(|(_, output_id, ..)| self.bar_popup_anchor(*output_id, source))
-    }
-
     fn ai_usage_popup_anchor(
         &self,
         output_id: OutputId,
@@ -2447,18 +2452,32 @@ impl X11Platform {
         &self,
         role: SurfaceRole,
         popup: u32,
-        dock: u32,
+        output: OutputId,
     ) -> Result<(), Box<dyn Error>> {
-        debug_assert!(role.uses_effect_owner());
-        self.conn
-            .change_property32(
-                xproto::PropMode::REPLACE,
-                popup,
-                self.atoms.xomposite_effect_owner,
-                AtomEnum::WINDOW,
-                &effect_owner_property_value(dock),
-            )?
-            .check()?;
+        if !role.uses_effect_owner() {
+            self.conn
+                .delete_property(popup, self.atoms.xomposite_effect_owner)?
+                .check()?;
+            return Ok(());
+        }
+        match effect_owner_update(&self.windows, output) {
+            EffectOwnerUpdate::Set(dock) => {
+                self.conn
+                    .change_property32(
+                        xproto::PropMode::REPLACE,
+                        popup,
+                        self.atoms.xomposite_effect_owner,
+                        AtomEnum::WINDOW,
+                        &effect_owner_property_value(dock),
+                    )?
+                    .check()?;
+            }
+            EffectOwnerUpdate::Delete => {
+                self.conn
+                    .delete_property(popup, self.atoms.xomposite_effect_owner)?
+                    .check()?;
+            }
+        }
         Ok(())
     }
 
@@ -4779,8 +4798,6 @@ impl X11Platform {
         let anchor = self
             .notification_popup_anchor(output_id)
             .ok_or("no notification bar anchor")?;
-        let effect_owner = popup_effect_owner(&self.windows, output_id)
-            .ok_or("no dock window for notification center effect owner")?;
         let placement = layout::place_bar_popup(anchor, width, height, output);
         let x = placement.popup_rect.x;
         let y = placement.popup_rect.y;
@@ -4814,11 +4831,7 @@ impl X11Platform {
                     .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
             )?;
             self.set_xomposite_frame_policy(window, notification_center_frame_policy())?;
-            self.configure_auxiliary_effect_surface(
-                SurfaceRole::Notification,
-                window,
-                effect_owner,
-            )?;
+            self.configure_auxiliary_effect_surface(SurfaceRole::Notification, window, output_id)?;
             self.conn.map_window(window)?.check()?;
             let (grab_button1, grab_button4, grab_button5) =
                 self.install_notification_center_button_grabs(window);
@@ -4830,6 +4843,7 @@ impl X11Platform {
             }
             window
         };
+        self.configure_auxiliary_effect_surface(SurfaceRole::Notification, window, output_id)?;
         if self.notification_center.as_ref().is_some_and(|center| {
             center.width != width || center.height != height || center.output != output_id
         }) {
@@ -6216,8 +6230,6 @@ impl X11Platform {
             popup.window
         } else {
             let window = self.conn.generate_id()?;
-            let effect_owner = popup_effect_owner(&self.windows, output.id)
-                .ok_or("no dock window for AI usage popup effect owner")?;
             self.create_glass_popup_window(
                 SurfaceRole::AiUsagePopup,
                 window,
@@ -6225,14 +6237,11 @@ impl X11Platform {
                 POPUP_STYLE.border_width,
                 EventMask::EXPOSURE | EventMask::BUTTON_PRESS,
             )?;
-            self.configure_auxiliary_effect_surface(
-                SurfaceRole::AiUsagePopup,
-                window,
-                effect_owner,
-            )?;
+            self.configure_auxiliary_effect_surface(SurfaceRole::AiUsagePopup, window, *output_id)?;
             self.conn.map_window(window)?.check()?;
             window
         };
+        self.configure_auxiliary_effect_surface(SurfaceRole::AiUsagePopup, window, *output_id)?;
         let resize = self
             .ai_usage_popup
             .as_ref()
@@ -6417,13 +6426,14 @@ impl X11Platform {
             }
             return Ok(());
         }
+        let output_id = state.audio_popup_output.ok_or("no audio popup origin")?;
         let anchor = self
-            .first_bar_popup_anchor(BarPopupSource::Audio)
+            .bar_popup_anchor(output_id, BarPopupSource::Audio)
             .ok_or("no audio bar anchor")?;
         let output = state
             .outputs
             .iter()
-            .find(|output| output.id == anchor.output_id)
+            .find(|output| output.id == output_id)
             .ok_or("no output for audio popup")?;
         let output_count = state.audio.outputs.len().min(8);
         let input_count = state.audio.inputs.len().min(8);
@@ -6502,8 +6512,6 @@ impl X11Platform {
             (input_label_y + 22) as i16,
             &PopupMeasurer(&self.text),
         );
-        let effect_owner = popup_effect_owner(&self.windows, output.id)
-            .ok_or("no dock window for audio popup effect owner")?;
         if std::env::var_os("XBAR_TRACE").is_some() {
             eprintln!("xbar trace: audio device layout outputs={output_devices:?} inputs={input_devices:?}");
         }
@@ -6522,7 +6530,7 @@ impl X11Platform {
                     | EventMask::BUTTON_RELEASE
                     | EventMask::POINTER_MOTION,
             )?;
-            self.configure_auxiliary_effect_surface(SurfaceRole::AudioPopup, window, effect_owner)?;
+            self.configure_auxiliary_effect_surface(SurfaceRole::AudioPopup, window, output.id)?;
             self.conn.map_window(window)?.check()?;
             if std::env::var_os("XBAR_TRACE").is_some() {
                 eprintln!(
@@ -6532,6 +6540,7 @@ impl X11Platform {
             }
             window
         };
+        self.configure_auxiliary_effect_surface(SurfaceRole::AudioPopup, window, output.id)?;
         let needs_resize = self.audio_popup.as_ref().is_some_and(|popup| {
             popup.rect.width != rect.width || popup.rect.height != rect.height
         });
@@ -6811,13 +6820,16 @@ impl X11Platform {
             }
             return Ok(());
         }
+        let output_id = state
+            .bluetooth_popup_output
+            .ok_or("no bluetooth popup origin")?;
         let anchor = self
-            .first_bar_popup_anchor(BarPopupSource::Bluetooth)
+            .bar_popup_anchor(output_id, BarPopupSource::Bluetooth)
             .ok_or("no bluetooth bar anchor")?;
         let output = state
             .outputs
             .iter()
-            .find(|output| output.id == anchor.output_id)
+            .find(|output| output.id == output_id)
             .ok_or("no output for bluetooth popup")?;
         let mut devices: Vec<_> = state
             .bluetooth
@@ -6850,8 +6862,6 @@ impl X11Platform {
             .enumerate()
             .map(|(i, d)| (d.path.clone(), layout::bluetooth_device_row(rect, i)))
             .collect();
-        let effect_owner = popup_effect_owner(&self.windows, output.id)
-            .ok_or("no dock window for bluetooth popup effect owner")?;
         let window = if let Some(p) = &self.bluetooth_popup {
             p.window
         } else {
@@ -6864,10 +6874,11 @@ impl X11Platform {
                 POPUP_STYLE.border_width,
                 EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION,
             )?;
-            self.configure_auxiliary_effect_surface(SurfaceRole::BluetoothPopup, w, effect_owner)?;
+            self.configure_auxiliary_effect_surface(SurfaceRole::BluetoothPopup, w, output.id)?;
             self.conn.map_window(w)?.check()?;
             w
         };
+        self.configure_auxiliary_effect_surface(SurfaceRole::BluetoothPopup, window, output.id)?;
         let resize = self
             .bluetooth_popup
             .as_ref()
@@ -7093,13 +7104,16 @@ impl X11Platform {
             }
             return Ok(());
         }
+        let output_id = state
+            .network_popup_output
+            .ok_or("no network popup origin")?;
         let anchor = self
-            .first_bar_popup_anchor(BarPopupSource::Network)
+            .bar_popup_anchor(output_id, BarPopupSource::Network)
             .ok_or("no network bar anchor")?;
         let output = state
             .outputs
             .iter()
-            .find(|output| output.id == anchor.output_id)
+            .find(|output| output.id == output_id)
             .ok_or("no output for network popup")?;
         let popup_width = 380_u16.min(output.width.max(1));
         let card_padding = POPUP_STYLE.card_padding as i16;
@@ -7150,8 +7164,6 @@ impl X11Platform {
             popup.window
         } else {
             let window = self.conn.generate_id()?;
-            let effect_owner = popup_effect_owner(&self.windows, output.id)
-                .ok_or("no dock window for network popup effect owner")?;
             trace_x11_resource("WINDOW_CREATE", "network-popup", window);
             self.create_glass_popup_window(
                 SurfaceRole::NetworkPopup,
@@ -7160,14 +7172,11 @@ impl X11Platform {
                 POPUP_STYLE.border_width,
                 EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION,
             )?;
-            self.configure_auxiliary_effect_surface(
-                SurfaceRole::NetworkPopup,
-                window,
-                effect_owner,
-            )?;
+            self.configure_auxiliary_effect_surface(SurfaceRole::NetworkPopup, window, output.id)?;
             self.conn.map_window(window)?.check()?;
             window
         };
+        self.configure_auxiliary_effect_surface(SurfaceRole::NetworkPopup, window, output.id)?;
         let resize = self
             .network_popup
             .as_ref()
@@ -7540,29 +7549,31 @@ impl X11Platform {
         } else {
             SurfaceRole::GlobalMenuPopup
         };
-        let anchor =
-            self.bar_hits
-                .iter()
-                .find_map(|(_, output_id, _, _, items, _, tray, _, _, _)| {
-                    if let Some(endpoint) = tray_endpoint {
-                        tray.iter()
-                            .find(|item| item.endpoint.service == endpoint.service)
-                            .map(|item| (*output_id, item.rect))
-                    } else {
-                        items
-                            .iter()
-                            .find(|item| item.id == root_id)
-                            .map(|item| (*output_id, item.rect))
-                    }
-                });
-        let Some((output_id, top_rect)) = anchor else {
+        let Some(output_id) = state.menu_popup_output else {
+            return Ok(());
+        };
+        let Some(top_rect) = self
+            .bar_hits
+            .iter()
+            .find(|(_, id, _, _, _, _, _, _, _, _)| *id == output_id)
+            .and_then(|(_, _, _, _, items, _, tray, _, _, _)| {
+                if let Some(endpoint) = tray_endpoint {
+                    tray.iter()
+                        .find(|item| item.endpoint.service == endpoint.service)
+                        .map(|item| item.rect)
+                } else {
+                    items
+                        .iter()
+                        .find(|item| item.id == root_id)
+                        .map(|item| item.rect)
+                }
+            })
+        else {
             return Ok(());
         };
         let Some(output) = state.outputs.iter().find(|output| output.id == output_id) else {
             return Ok(());
         };
-        let effect_owner = popup_effect_owner(&self.windows, output_id)
-            .ok_or("no dock window for menu popup effect owner")?;
         let structure_changed = self.popups.len() != state.menu_interaction.open_path.len()
             || self
                 .popups
@@ -7637,16 +7648,19 @@ impl X11Platform {
                         | EventMask::ENTER_WINDOW
                         | EventMask::LEAVE_WINDOW,
                 )?;
-                self.configure_auxiliary_effect_surface(popup_role, window, effect_owner)?;
+                self.configure_auxiliary_effect_surface(popup_role, window, output_id)?;
                 self.conn.map_window(window)?.check()?;
                 self.popups.push(PopupWindow {
                     window,
+                    output: output_id,
                     layout: popup_layout.clone(),
                     backing: None,
                 });
             } else {
                 self.set_xomposite_frame_policy(window, popup_role.frame_policy())?;
             }
+            self.popups[level].output = output_id;
+            self.configure_auxiliary_effect_surface(popup_role, window, output_id)?;
             let resize = self.popups[level].layout.rect != popup_layout.rect;
             let backing_replaced = !backing_matches(
                 self.popups[level].backing,
@@ -8090,7 +8104,7 @@ impl X11Platform {
                         && bar_y >= i.rect.y
                         && bar_y < i.rect.y + i.rect.height as i16
                 })
-                .map(|i| HitTarget::TopLevel(i.id))
+                .map(|i| HitTarget::TopLevel(i.id, *output))
             {
                 return item;
             }
@@ -8108,7 +8122,7 @@ impl X11Platform {
                     && root_y >= network.rect.y
                     && root_y < network.rect.y + network.rect.height as i16
                 {
-                    return HitTarget::Network;
+                    return HitTarget::Network(*output);
                 }
             }
             if let Some(audio) = audio {
@@ -8117,7 +8131,7 @@ impl X11Platform {
                     && root_y >= audio.rect.y
                     && root_y < audio.rect.y + audio.rect.height as i16
                 {
-                    return HitTarget::Audio;
+                    return HitTarget::Audio(*output);
                 }
             }
             if let Some(bluetooth) = bluetooth {
@@ -8126,11 +8140,11 @@ impl X11Platform {
                     && root_y >= bluetooth.rect.y
                     && root_y < bluetooth.rect.y + bluetooth.rect.height as i16
                 {
-                    return HitTarget::Bluetooth;
+                    return HitTarget::Bluetooth(*output);
                 }
             }
             return tray_hit(tray, root_x, root_y)
-                .map(HitTarget::Tray)
+                .map(|endpoint| HitTarget::Tray(endpoint, *output))
                 .unwrap_or(HitTarget::Outside);
         }
         if let Some(popup) = &self.audio_popup {
@@ -8513,9 +8527,9 @@ mod tests {
     use super::{
         ai_usage_hit_target, ai_usage_popup_anchor_for_plugins, ai_usage_popup_height,
         backing_matches, bar_backing_matches, blur_behind_rect, classify_attention_property_reply,
-        classify_property_string_reply, effect_owner_property_value, format_cache_age,
-        format_reset_at, frame_policy_property_value, install_passive_grabs, is_xbar_owned_window,
-        menu_popup_dirty_for_interaction_change, menu_popup_slot_for_window,
+        classify_property_string_reply, effect_owner_property_value, effect_owner_update,
+        format_cache_age, format_reset_at, frame_policy_property_value, install_passive_grabs,
+        is_xbar_owned_window, menu_popup_dirty_for_interaction_change, menu_popup_slot_for_window,
         menu_popup_slots_for_item, network_primary_row_label, notification_body_hit,
         notification_history_id_for, notification_hover_transition, notification_indicator_hit,
         notification_indicator_rect, notification_previous_scroll, notification_scroll_target,
@@ -8524,11 +8538,11 @@ mod tests {
         reconcile_notification_scroll, reconcile_toast_stack, reconcile_toast_stack_candidates,
         reconcile_toast_stack_grouped, template_icon_pixel, toast_members_that_fit,
         toast_presentation_items, tray_draw_size, tray_hit, union_menu_rects,
-        AttentionPropertyRead, BarBacking, BarWindow, GlobalPinShortcut, HitTarget, MenuPopupDirty,
-        PopupBacking, PopupHover, PopupSlot, PopupWindow, RenderTarget, SurfaceWindowGeometry,
-        ToastFitItem, X11Event, X11Platform, AI_USAGE_POPUP_MIN_HEIGHT, BAR_HEIGHT,
-        NOTIFICATION_CARD_SLOT_GAP, NOTIFICATION_GROUP_INTERNAL_GAP, NOTIFICATION_OUTER_PADDING,
-        XOMPOSITE_FRAME_POLICY_ATOM_NAME,
+        AttentionPropertyRead, BarBacking, BarWindow, EffectOwnerUpdate, GlobalPinShortcut,
+        HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot, PopupWindow, RenderTarget,
+        SurfaceWindowGeometry, ToastFitItem, X11Event, X11Platform, AI_USAGE_POPUP_MIN_HEIGHT,
+        BAR_HEIGHT, NOTIFICATION_CARD_SLOT_GAP, NOTIFICATION_GROUP_INTERNAL_GAP,
+        NOTIFICATION_OUTER_PADDING, XOMPOSITE_FRAME_POLICY_ATOM_NAME,
     };
     use crate::core::{
         HistoryEntryId, MenuItemId, NotificationActionProjection, NotificationActionView,
@@ -8954,21 +8968,53 @@ mod tests {
     fn network_effect_owner_is_the_dock_for_its_own_output() {
         let windows = [
             BarWindow {
-                output: crate::core::OutputId(1),
-                window: 0x400_002,
-                backing: None,
-            },
-            BarWindow {
                 output: crate::core::OutputId(2),
                 window: 0x400_003,
                 backing: None,
             },
+            BarWindow {
+                output: crate::core::OutputId(1),
+                window: 0x400_002,
+                backing: None,
+            },
         ];
+        assert_eq!(
+            popup_effect_owner(&windows, crate::core::OutputId(1)),
+            Some(0x400_002)
+        );
         assert_eq!(
             popup_effect_owner(&windows, crate::core::OutputId(2)),
             Some(0x400_003)
         );
         assert_eq!(popup_effect_owner(&windows, crate::core::OutputId(3)), None);
+    }
+
+    #[test]
+    fn effect_owner_update_has_no_cross_output_fallback() {
+        let windows = [
+            BarWindow {
+                output: crate::core::OutputId(2),
+                window: 0x400_003,
+                backing: None,
+            },
+            BarWindow {
+                output: crate::core::OutputId(1),
+                window: 0x400_002,
+                backing: None,
+            },
+        ];
+        assert_eq!(
+            effect_owner_update(&windows, crate::core::OutputId(1)),
+            EffectOwnerUpdate::Set(0x400_002)
+        );
+        assert_eq!(
+            effect_owner_update(&windows, crate::core::OutputId(2)),
+            EffectOwnerUpdate::Set(0x400_003)
+        );
+        assert_eq!(
+            effect_owner_update(&windows, crate::core::OutputId(3)),
+            EffectOwnerUpdate::Delete
+        );
     }
 
     #[test]
@@ -9479,6 +9525,7 @@ mod tests {
     fn menu_popup(window: u32, parent_id: i32, item_ids: &[i32]) -> PopupWindow {
         PopupWindow {
             window,
+            output: OutputId(1),
             layout: PopupLayout {
                 parent_id: MenuItemId(parent_id),
                 rect: MenuRect {

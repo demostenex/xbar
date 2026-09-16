@@ -942,6 +942,10 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             }
             changed
         }
+        Event::MenuRootClickedAt { id, output } => {
+            state.menu_popup_output = Some(output);
+            reduce(state, Event::MenuRootClicked(id), registry)
+        }
         Event::MenuRootClicked(id) => {
             state.audio_popup_open = false;
             state.audio_dragging = false;
@@ -1311,6 +1315,10 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             }
             changed
         }
+        Event::TrayMenuOpenRequestedAt { endpoint, output } => {
+            state.menu_popup_output = Some(output);
+            reduce(state, Event::TrayMenuOpenRequested { endpoint }, registry)
+        }
         Event::TrayMenuOpenRequested { .. } => {
             let changed = state.audio_popup_open
                 || state.audio_dragging
@@ -1566,6 +1574,10 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 && ap.saved_profile.is_some()
                 && !ap.is_active
         }),
+        Event::NetworkPopupOpenRequestedAt(output) => {
+            state.network_popup_output = Some(output);
+            reduce(state, Event::NetworkPopupOpenRequested, registry)
+        }
         Event::NetworkPopupOpenRequested => {
             if state.network_popup_open || state.network_popup_open_pending {
                 false
@@ -1610,9 +1622,16 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.network_popup_open_pending = false;
             pending
         }
+        Event::NetworkPopupToggledAt(output) => {
+            state.network_popup_output = Some(output);
+            reduce(state, Event::NetworkPopupToggled, registry)
+        }
         Event::NetworkPopupToggled => {
             state.network_popup_open = !state.network_popup_open;
             state.network_popup_open_pending = false;
+            if !state.network_popup_open {
+                state.network_popup_output = None;
+            }
             if state.network_popup_open {
                 state.audio_popup_open = false;
                 state.audio_dragging = false;
@@ -1702,8 +1721,15 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.bluetooth_popup_open = false;
             before != bluetooth_visual_state(&state.bluetooth)
         }
+        Event::BluetoothPopupToggledAt(output) => {
+            state.bluetooth_popup_output = Some(output);
+            reduce(state, Event::BluetoothPopupToggled, registry)
+        }
         Event::BluetoothPopupToggled => {
             state.bluetooth_popup_open = !state.bluetooth_popup_open;
+            if !state.bluetooth_popup_open {
+                state.bluetooth_popup_output = None;
+            }
             if state.bluetooth_popup_open {
                 state.audio_popup_open = false;
                 state.audio_dragging = false;
@@ -1797,8 +1823,15 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 true
             }
         }
+        Event::AudioPopupToggledAt(output) => {
+            state.audio_popup_output = Some(output);
+            reduce(state, Event::AudioPopupToggled, registry)
+        }
         Event::AudioPopupToggled => {
             state.audio_popup_open = !state.audio_popup_open;
+            if !state.audio_popup_open {
+                state.audio_popup_output = None;
+            }
             state.audio_dragging = false;
             state.audio_drag_input = false;
             if state.audio_popup_open {

@@ -72,6 +72,10 @@ pub enum Event {
         error: String,
     },
     MenuRootClicked(MenuItemId),
+    MenuRootClickedAt {
+        id: MenuItemId,
+        output: super::OutputId,
+    },
     MenuItemActivateRequested {
         window_id: WindowId,
         endpoint: MenuSource,
@@ -105,6 +109,10 @@ pub enum Event {
     },
     TrayMenuOpenRequested {
         endpoint: super::MenuEndpoint,
+    },
+    TrayMenuOpenRequestedAt {
+        endpoint: super::MenuEndpoint,
+        output: super::OutputId,
     },
     TrayMenuLoaded {
         endpoint: super::MenuEndpoint,
@@ -163,11 +171,13 @@ pub enum Event {
     NetworkPopupProjectionChanged(NetworkState),
     NetworkConnectSavedWifi(super::NetworkWifiTarget),
     NetworkPopupOpenRequested,
+    NetworkPopupOpenRequestedAt(super::OutputId),
     #[allow(dead_code)]
     NetworkPopupSnapshotReceived(NetworkState),
     #[allow(dead_code)]
     NetworkPopupSnapshotFailed,
     NetworkPopupToggled,
+    NetworkPopupToggledAt(super::OutputId),
     NetworkSetWireless(bool),
     NetworkActionFinished(NetworkPendingAction),
     #[allow(dead_code)]
@@ -179,6 +189,7 @@ pub enum Event {
     BluetoothSnapshotReceived(super::BluetoothState),
     BluetoothUnavailable,
     BluetoothPopupToggled,
+    BluetoothPopupToggledAt(super::OutputId),
     BluetoothSetPowered(bool),
     BluetoothConnectDevice(String),
     BluetoothDisconnectDevice(String),
@@ -207,6 +218,7 @@ pub enum Event {
         attention: bool,
     },
     AudioPopupToggled,
+    AudioPopupToggledAt(super::OutputId),
     AudioTrackChanged {
         input: bool,
         percent: u32,

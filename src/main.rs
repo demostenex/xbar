@@ -540,7 +540,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         root_y: _,
                         ..
                     }),
-                    Some(platform::x11::HitTarget::Tray(endpoint)),
+                    Some(platform::x11::HitTarget::Tray(endpoint, output)),
                 ) => {
                     let menu = state
                         .status_notifier_items
@@ -550,7 +550,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .and_then(|item| item.menu.clone());
                     if *button == 1 || *button == 3 {
                         if let Some(endpoint) = menu {
-                            Event::TrayMenuOpenRequested { endpoint }
+                            Event::TrayMenuOpenRequestedAt {
+                                endpoint,
+                                output: *output,
+                            }
                         } else {
                             tray_action_event(&event, endpoint, &state)
                         }
@@ -560,8 +563,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { .. }),
-                    Some(platform::x11::HitTarget::TopLevel(id)),
-                ) => Event::MenuRootClicked(*id),
+                    Some(platform::x11::HitTarget::TopLevel(id, output)),
+                ) => Event::MenuRootClickedAt {
+                    id: *id,
+                    output: *output,
+                },
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::AiUsage(plugin, output)),
@@ -594,20 +600,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                 ) => Event::CollapseNotificationGroup(key.clone()),
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
-                    Some(platform::x11::HitTarget::Audio),
-                ) => Event::AudioPopupToggled,
+                    Some(platform::x11::HitTarget::Audio(output)),
+                ) => Event::AudioPopupToggledAt(*output),
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
-                    Some(platform::x11::HitTarget::Bluetooth),
-                ) => Event::BluetoothPopupToggled,
+                    Some(platform::x11::HitTarget::Bluetooth(output)),
+                ) => Event::BluetoothPopupToggledAt(*output),
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
-                    Some(platform::x11::HitTarget::Network),
+                    Some(platform::x11::HitTarget::Network(output)),
                 ) => {
                     if state.network_popup_open {
-                        Event::NetworkPopupToggled
+                        Event::NetworkPopupToggledAt(*output)
                     } else {
-                        Event::NetworkPopupOpenRequested
+                        Event::NetworkPopupOpenRequestedAt(*output)
                     }
                 }
                 (
@@ -750,7 +756,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 )
                 | (
                     Event::X11(platform::x11::X11Event::ButtonPress { .. }),
-                    Some(platform::x11::HitTarget::Network),
+                    Some(platform::x11::HitTarget::Network(_)),
                 ) => event.clone(),
                 (
                     Event::X11(platform::x11::X11Event::MotionNotify { .. }),
@@ -758,7 +764,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 ) => Event::MenuItemHovered { path: path.clone() },
                 (
                     Event::X11(platform::x11::X11Event::MotionNotify { .. }),
-                    Some(platform::x11::HitTarget::TopLevel(id)),
+                    Some(platform::x11::HitTarget::TopLevel(id, _)),
                 ) => Event::MenuItemHovered { path: vec![*id] },
                 (
                     Event::X11(platform::x11::X11Event::MotionNotify { .. }),
@@ -868,11 +874,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 match (&event, mouse_target.as_ref()) {
                     (
                         Event::X11(platform::x11::X11Event::ButtonPress { .. }),
-                        Some(platform::x11::HitTarget::TopLevel(id)),
+                        Some(platform::x11::HitTarget::TopLevel(id, _)),
                     ) => eprintln!("xbar trace: top-level hit item={}", id.0),
                     (
                         Event::X11(platform::x11::X11Event::ButtonPress { .. }),
-                        Some(platform::x11::HitTarget::Tray(endpoint)),
+                        Some(platform::x11::HitTarget::Tray(endpoint, _)),
                     ) => eprintln!("xbar trace: tray hit endpoint={endpoint:?}"),
                     (
                         Event::X11(platform::x11::X11Event::ButtonPress { .. }),
@@ -932,8 +938,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                         state.menu_presentation_policy,
                         core::MenuPresentationPolicy::FollowFocus
                     ))
-                    || (matches!(&translated, Event::MenuRootClicked(_))
-                        && matches!(state.menu, core::MenuState::TrayLoaded { .. })));
+                    || (matches!(
+                        &translated,
+                        Event::MenuRootClicked(_) | Event::MenuRootClickedAt { .. }
+                    ) && matches!(state.menu, core::MenuState::TrayLoaded { .. })));
             if trace {
                 match &translated {
                     Event::WindowFocused(new_window) => eprintln!(
@@ -972,7 +980,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             let previous_audio_glyph = (state.audio.available, ui::view::audio_glyph(&state.audio));
             let mut semantic_render_target = render_target_for(&translated, &mouse_target, &x11);
             let tray_menu_open = match &translated {
-                Event::TrayMenuOpenRequested { endpoint } => Some(endpoint.clone()),
+                Event::TrayMenuOpenRequested { endpoint }
+                | Event::TrayMenuOpenRequestedAt { endpoint, .. } => Some(endpoint.clone()),
                 _ => None,
             };
             let tray_menu_reclick = tray_menu_open.as_ref().is_some_and(|endpoint| {
@@ -1366,7 +1375,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 _ => {}
             }
-            if matches!(translated, Event::NetworkPopupOpenRequested) && reduced {
+            if matches!(
+                translated,
+                Event::NetworkPopupOpenRequested | Event::NetworkPopupOpenRequestedAt(_)
+            ) && reduced
+            {
                 if trace {
                     eprintln!("xbar trace: NETWORK_POPUP_OPEN_REQUEST");
                 }
@@ -1946,19 +1959,24 @@ fn render_target_for(
         | Event::StatusNotifierItemUpdated(_) => Some(RenderTarget::Tray),
         Event::StatusNotifierHostRegistered => Some(RenderTarget::Tray),
         Event::MenuRootClicked(_)
+        | Event::MenuRootClickedAt { .. }
         | Event::MenuItemActivateRequested { .. }
         | Event::TrayMenuOpenRequested { .. }
+        | Event::TrayMenuOpenRequestedAt { .. }
         | Event::TrayMenuLoaded { .. }
         | Event::TrayMenuLoadFailed { .. }
         | Event::NetworkPopupProjectionChanged(_)
         | Event::NetworkConnectSavedWifi(_)
         | Event::NetworkPopupOpenRequested
+        | Event::NetworkPopupOpenRequestedAt(_)
         | Event::NetworkPopupSnapshotReceived(_)
         | Event::NetworkPopupSnapshotFailed
         | Event::NetworkPopupToggled
+        | Event::NetworkPopupToggledAt(_)
         | Event::NetworkSetWireless(_)
         | Event::NetworkActionFinished(_)
         | Event::BluetoothPopupToggled
+        | Event::BluetoothPopupToggledAt(_)
         | Event::BluetoothSetPowered(_)
         | Event::BluetoothConnectDevice(_)
         | Event::BluetoothDisconnectDevice(_)
@@ -1967,6 +1985,7 @@ fn render_target_for(
         | Event::AudioSelectOutput(_)
         | Event::AudioSelectInput(_)
         | Event::AudioPopupToggled
+        | Event::AudioPopupToggledAt(_)
         | Event::AudioTrackChanged { .. }
         | Event::AudioDragReleased
         | Event::AudioMuteToggled { .. } => Some(RenderTarget::Popup),
@@ -2010,13 +2029,13 @@ fn hover_render_target_for(
 ) -> Option<RenderTarget> {
     match mouse_target {
         Some(HitTarget::Item(_)) => Some(RenderTarget::Popup),
-        Some(HitTarget::TopLevel(_)) => Some(RenderTarget::DockContext),
+        Some(HitTarget::TopLevel(_, _)) => Some(RenderTarget::DockContext),
         Some(HitTarget::AiUsage(_, _)) => None,
         Some(HitTarget::AiUsageInside) => None,
         Some(HitTarget::Outside) | None => outside_target,
-        Some(HitTarget::Tray(_)) => None,
+        Some(HitTarget::Tray(_, _)) => None,
         Some(HitTarget::AudioTrack) | Some(HitTarget::AudioInputTrack) => Some(RenderTarget::Popup),
-        Some(HitTarget::Audio)
+        Some(HitTarget::Audio(_))
         | Some(HitTarget::AudioMute)
         | Some(HitTarget::AudioInputMute)
         | Some(HitTarget::AudioInside) => None,
@@ -2026,11 +2045,11 @@ fn hover_render_target_for(
         Some(HitTarget::BluetoothDevice(_)) => Some(RenderTarget::Popup),
         Some(HitTarget::BluetoothPower)
         | Some(HitTarget::BluetoothInside)
-        | Some(HitTarget::Bluetooth) => None,
+        | Some(HitTarget::Bluetooth(_)) => None,
         Some(HitTarget::NetworkWireless)
         | Some(HitTarget::NetworkInside)
         | Some(HitTarget::NetworkWifi(_))
-        | Some(HitTarget::Network) => None,
+        | Some(HitTarget::Network(_)) => None,
         Some(HitTarget::NotificationCenter(_)) => None,
         Some(HitTarget::NotificationCenterCard(_))
         | Some(HitTarget::NotificationCenterDismiss(_))
