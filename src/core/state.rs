@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WindowId(pub u32);
 
@@ -301,6 +303,25 @@ pub struct NotificationId(pub u32);
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HistoryEntryId(pub u64);
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NotificationImageData {
+    pub width: i32,
+    pub height: i32,
+    pub rowstride: i32,
+    pub has_alpha: bool,
+    pub bits_per_sample: i32,
+    pub channels: i32,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NotificationIconMetadata {
+    pub app_icon: Option<String>,
+    pub image_data: Option<NotificationImageData>,
+    pub image_path: Option<String>,
+    pub desktop_entry: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Notification {
     pub id: NotificationId,
@@ -309,6 +330,7 @@ pub struct Notification {
     pub app_name: String,
     pub summary: String,
     pub body: String,
+    pub icon_metadata: NotificationIconMetadata,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -331,6 +353,7 @@ pub struct NotificationHistoryEntry {
     pub app_name: String,
     pub summary: String,
     pub body: String,
+    pub icon_metadata: NotificationIconMetadata,
     pub order: u64,
     pub received_at: u64,
     pub updated_at: u64,
@@ -391,6 +414,7 @@ mod notification_group_tests {
             app_name: app_name.into(),
             summary: id.to_string(),
             body: String::new(),
+            icon_metadata: Default::default(),
             order: id,
             received_at: id,
             updated_at: id,

@@ -1,6 +1,7 @@
 use crate::core::{
     Event, HistoryEntryId, Notification, NotificationActionProjection, NotificationActionView,
-    NotificationHistoryEntry, NotificationId, NotificationSource, WindowId,
+    NotificationHistoryEntry, NotificationIconMetadata, NotificationId, NotificationImageData,
+    NotificationSource, WindowId,
 };
 use std::collections::BTreeMap;
 use std::io;
@@ -15,6 +16,68 @@ pub const REASON_EXPIRED: u32 = 1;
 pub const REASON_DISMISSED: u32 = 2;
 pub const REASON_CLOSED: u32 = 3;
 pub const MAX_SOUND_HINT_LENGTH: usize = 256;
+
+fn optional_metadata_string(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn metadata_string(value: &OwnedValue) -> Option<String> {
+    let value: &str = value.downcast_ref().ok()?;
+    optional_metadata_string(value.to_owned())
+}
+
+fn parse_image_data(value: &OwnedValue) -> Option<NotificationImageData> {
+    let (width, height, rowstride, has_alpha, bits_per_sample, channels, data) = value
+        .downcast_ref::<(i32, i32, i32, bool, i32, i32, Vec<u8>)>()
+        .ok()?;
+    let minimum_rowstride = width.checked_mul(channels)?;
+    let required_bytes = rowstride.checked_mul(height)?;
+    if width <= 0
+        || height <= 0
+        || bits_per_sample != 8
+        || (has_alpha && channels != 4)
+        || (!has_alpha && channels != 3)
+        || rowstride < minimum_rowstride
+        || required_bytes <= 0
+        || data.len() < usize::try_from(required_bytes).ok()?
+    {
+        return None;
+    }
+    Some(NotificationImageData {
+        width,
+        height,
+        rowstride,
+        has_alpha,
+        bits_per_sample,
+        channels,
+        data: data.clone(),
+    })
+}
+
+pub fn parse_notification_icon_metadata(
+    app_icon: String,
+    hints: &std::collections::HashMap<String, OwnedValue>,
+) -> NotificationIconMetadata {
+    let image_data = ["image-data", "image_data", "icon_data"]
+        .into_iter()
+        .filter_map(|name| hints.get(name))
+        .find_map(parse_image_data);
+    let image_path = ["image-path", "image_path"]
+        .into_iter()
+        .filter_map(|name| hints.get(name))
+        .find_map(metadata_string)
+        .and_then(optional_metadata_string);
+    let desktop_entry = hints
+        .get("desktop-entry")
+        .and_then(metadata_string)
+        .and_then(optional_metadata_string);
+    NotificationIconMetadata {
+        app_icon: optional_metadata_string(app_icon),
+        image_data,
+        image_path,
+        desktop_entry,
+    }
+}
 
 pub fn unix_epoch_millis() -> u64 {
     SystemTime::now()
@@ -223,6 +286,32 @@ impl Store {
         actions: Vec<NotificationAction>,
         resident: bool,
     ) -> (NotificationId, DeliveryKind) {
+        self.notify_with_disposition_at_with_actions_and_metadata(
+            replaces_id,
+            app_name,
+            summary,
+            body,
+            expire_timeout,
+            now,
+            actions,
+            resident,
+            NotificationIconMetadata::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn notify_with_disposition_at_with_actions_and_metadata(
+        &mut self,
+        replaces_id: u32,
+        app_name: String,
+        summary: String,
+        body: String,
+        expire_timeout: i32,
+        now: u64,
+        actions: Vec<NotificationAction>,
+        resident: bool,
+        icon_metadata: NotificationIconMetadata,
+    ) -> (NotificationId, DeliveryKind) {
         let replacing = replaces_id != 0 && self.records.contains_key(&NotificationId(replaces_id));
         let id = if replaces_id != 0 && self.records.contains_key(&NotificationId(replaces_id)) {
             NotificationId(replaces_id)
@@ -253,6 +342,7 @@ impl Store {
                     app_name,
                     summary,
                     body,
+                    icon_metadata,
                 },
                 deadline,
                 pending_history_id,
@@ -267,6 +357,7 @@ impl Store {
                 entry.app_name = self.records[&id].notification.app_name.clone();
                 entry.summary = self.records[&id].notification.summary.clone();
                 entry.body = self.records[&id].notification.body.clone();
+                entry.icon_metadata = self.records[&id].notification.icon_metadata.clone();
                 entry.order = self.next_order;
                 entry.updated_at = now;
                 self.history
@@ -288,6 +379,7 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn notify_with_actions(
         &mut self,
         replaces_id: u32,
@@ -298,7 +390,7 @@ impl Store {
         actions: Vec<NotificationAction>,
         resident: bool,
     ) -> (NotificationId, DeliveryKind) {
-        self.notify_with_disposition_at_with_actions(
+        self.notify_with_disposition_at_with_actions_and_metadata(
             replaces_id,
             app_name,
             summary,
@@ -307,6 +399,32 @@ impl Store {
             unix_epoch_millis(),
             actions,
             resident,
+            NotificationIconMetadata::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn notify_with_actions_and_icon_metadata(
+        &mut self,
+        replaces_id: u32,
+        app_name: String,
+        summary: String,
+        body: String,
+        expire_timeout: i32,
+        actions: Vec<NotificationAction>,
+        resident: bool,
+        icon_metadata: NotificationIconMetadata,
+    ) -> (NotificationId, DeliveryKind) {
+        self.notify_with_disposition_at_with_actions_and_metadata(
+            replaces_id,
+            app_name,
+            summary,
+            body,
+            expire_timeout,
+            unix_epoch_millis(),
+            actions,
+            resident,
+            icon_metadata,
         )
     }
 
@@ -335,6 +453,7 @@ impl Store {
                             app_name: app_name.clone(),
                             summary: format!("{app_name} needs attention"),
                             body: "A window is requesting attention".into(),
+                            icon_metadata: NotificationIconMetadata::default(),
                         },
                         deadline: None,
                         pending_history_id: None,
@@ -385,6 +504,7 @@ impl Store {
                 app_name: notification.app_name.clone(),
                 summary: notification.summary.clone(),
                 body: notification.body.clone(),
+                icon_metadata: notification.icon_metadata.clone(),
                 order: self.next_order,
                 received_at: now,
                 updated_at: now,
@@ -741,6 +861,131 @@ mod tests {
 
     fn bool_value(value: bool) -> OwnedValue {
         OwnedValue::try_from(zbus::zvariant::Value::from(value)).unwrap()
+    }
+
+    fn image_value(width: i32, height: i32, rowstride: i32) -> OwnedValue {
+        OwnedValue::try_from(zbus::zvariant::Value::from((
+            width,
+            height,
+            rowstride,
+            true,
+            8,
+            4,
+            vec![0_u8; rowstride.max(0).saturating_mul(height.max(0)) as usize],
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn notification_icon_metadata_preserves_protocol_sources_and_normalizes_empty_values() {
+        let metadata = parse_notification_icon_metadata(
+            "app-icon".into(),
+            &hints(&[
+                ("image-data", image_value(2, 2, 8)),
+                ("image-path", string_value("file:///tmp/icon.png")),
+                ("desktop-entry", string_value("example")),
+            ]),
+        );
+        assert_eq!(metadata.app_icon.as_deref(), Some("app-icon"));
+        assert_eq!(metadata.image_path.as_deref(), Some("file:///tmp/icon.png"));
+        assert_eq!(metadata.desktop_entry.as_deref(), Some("example"));
+        assert_eq!(
+            metadata.image_data.as_ref().map(|image| image.width),
+            Some(2)
+        );
+
+        let empty = parse_notification_icon_metadata(
+            String::new(),
+            &hints(&[
+                ("image-path", string_value("")),
+                ("desktop-entry", string_value("")),
+            ]),
+        );
+        assert_eq!(empty, NotificationIconMetadata::default());
+    }
+
+    #[test]
+    fn notification_icon_metadata_accepts_compatible_aliases_and_rejects_invalid_values() {
+        let aliases = parse_notification_icon_metadata(
+            String::new(),
+            &hints(&[
+                ("image_data", image_value(1, 1, 4)),
+                ("image_path", string_value("theme-name")),
+            ]),
+        );
+        assert!(aliases.image_data.is_some());
+        assert_eq!(aliases.image_path.as_deref(), Some("theme-name"));
+
+        let malformed = parse_notification_icon_metadata(
+            "ignored".into(),
+            &hints(&[
+                ("image-data", string_value("not-image-data")),
+                ("icon_data", image_value(0, 1, 4)),
+                ("desktop-entry", bool_value(true)),
+            ]),
+        );
+        assert_eq!(malformed.app_icon.as_deref(), Some("ignored"));
+        assert!(malformed.image_data.is_none());
+        assert!(malformed.desktop_entry.is_none());
+    }
+
+    #[test]
+    fn notification_icon_metadata_follows_live_history_expiration_and_replacement() {
+        let mut store = Store::default();
+        let first_metadata = NotificationIconMetadata {
+            app_icon: Some("old-icon".into()),
+            image_data: Some(NotificationImageData {
+                width: 1,
+                height: 1,
+                rowstride: 4,
+                has_alpha: true,
+                bits_per_sample: 8,
+                channels: 4,
+                data: vec![0, 0, 0, 255],
+            }),
+            image_path: Some("old-path".into()),
+            desktop_entry: Some("old-entry".into()),
+        };
+        let id = store
+            .notify_with_actions_and_icon_metadata(
+                0,
+                "app".into(),
+                "one".into(),
+                String::new(),
+                1,
+                Vec::new(),
+                false,
+                first_metadata.clone(),
+            )
+            .0;
+        assert_eq!(store.snapshot()[0].icon_metadata, first_metadata);
+        assert_eq!(store.history_snapshot()[0].icon_metadata, first_metadata);
+
+        let replacement = store.notify_with_actions_and_icon_metadata(
+            id.0,
+            "app".into(),
+            "two".into(),
+            String::new(),
+            0,
+            Vec::new(),
+            false,
+            NotificationIconMetadata::default(),
+        );
+        assert_eq!(replacement.0, id);
+        assert_eq!(
+            store.snapshot()[0].icon_metadata,
+            NotificationIconMetadata::default()
+        );
+        assert_eq!(
+            store.history_snapshot()[0].icon_metadata,
+            NotificationIconMetadata::default()
+        );
+
+        store.expired(Instant::now() + Duration::from_secs(1));
+        assert_eq!(
+            store.history_snapshot()[0].icon_metadata,
+            NotificationIconMetadata::default()
+        );
     }
 
     fn sound(delivery: DeliveryKind, values: &[(&str, OwnedValue)]) -> SoundDecision {
@@ -1179,6 +1424,7 @@ mod tests {
             app_name: "app".into(),
             summary: "restored".into(),
             body: String::new(),
+            icon_metadata: Default::default(),
             order: 1,
             received_at: 1,
             updated_at: 1,
@@ -1517,6 +1763,7 @@ mod tests {
             app_name: "app".into(),
             summary: "restored".into(),
             body: String::new(),
+            icon_metadata: Default::default(),
             order: 1,
             received_at: 10,
             updated_at: 10,
@@ -1532,6 +1779,7 @@ mod tests {
             app_name: "app".into(),
             summary: "stale".into(),
             body: String::new(),
+            icon_metadata: Default::default(),
             order: 1,
             received_at: 10,
             updated_at: 10,
@@ -1571,6 +1819,7 @@ mod tests {
                 app_name: "app".into(),
                 summary: "restored".into(),
                 body: "body".into(),
+                icon_metadata: Default::default(),
                 order: 9,
                 received_at: 100,
                 updated_at: 200,
@@ -1582,6 +1831,7 @@ mod tests {
                 app_name: "app".into(),
                 summary: "second".into(),
                 body: "body".into(),
+                icon_metadata: Default::default(),
                 order: 8,
                 received_at: 300,
                 updated_at: 400,

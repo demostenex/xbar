@@ -735,7 +735,7 @@ impl NotificationServer {
         &self,
         app_name: String,
         replaces_id: u32,
-        _app_icon: String,
+        app_icon: String,
         summary: String,
         body: String,
         actions: Vec<String>,
@@ -743,13 +743,14 @@ impl NotificationServer {
         expire_timeout: i32,
     ) -> zbus::fdo::Result<u32> {
         let parsed_hints = notifications::parse_sound_hints(&hints);
+        let icon_metadata = notifications::parse_notification_icon_metadata(app_icon, &hints);
         let actions = notifications::parse_notification_actions(actions);
         let resident = notifications::parse_resident_hint(&hints);
         let (id, delivery) = self
             .store
             .lock()
             .expect("notification store poisoned")
-            .notify_with_actions(
+            .notify_with_actions_and_icon_metadata(
                 replaces_id,
                 app_name,
                 summary,
@@ -757,6 +758,7 @@ impl NotificationServer {
                 expire_timeout,
                 actions,
                 resident,
+                icon_metadata,
             );
         let sound_decision = notifications::decide_notification_sound(delivery, &parsed_hints);
         if let Some(sound) = &self.sound {

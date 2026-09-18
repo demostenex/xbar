@@ -3,12 +3,14 @@ use crate::core::{
     GtkMenuEndpoint, MenuItemId, NetworkWifiTarget, NotificationActionProjection,
     NotificationActionView, OutputId, OutputState, State, StatusNotifierEndpoint, WindowId,
 };
+use crate::notification_icons::ResolvedNotificationIcon;
 use crate::ui::style::{self, FontMetrics, TextMeasurer, BAR_STYLE, POPUP_STYLE, TOAST_STYLE};
 use crate::ui::{layout, view};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::randr::{self, ConnectionExt as RandrExt};
 use x11rb::protocol::render::{self, ConnectionExt as RenderExt};
@@ -126,7 +128,55 @@ fn preserve_color_pixel(pixel: u32) -> Option<u32> {
     ((pixel >> 24) as u8 != 0).then_some(pixel & 0x00ff_ffff)
 }
 
+fn notification_icon_source_over_rgb(rgba: [u8; 4]) -> u32 {
+    let [red, green, blue, alpha] = rgba;
+    let channel = |source: u8, background: u8| {
+        ((u16::from(source) * u16::from(alpha)
+            + u16::from(background) * u16::from(u8::MAX - alpha)
+            + 127)
+            / 255) as u8
+    };
+    (u32::from(channel(red, 0x2a)) << 16)
+        | (u32::from(channel(green, 0x30)) << 8)
+        | u32::from(channel(blue, 0x3a))
+}
+
+fn precompose_notification_icon_pixels(icon: &ResolvedNotificationIcon) -> Option<Vec<u32>> {
+    let expected = usize::try_from(icon.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(icon.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4));
+    if icon.width == 0 || icon.height == 0 || expected != Some(icon.pixels.len()) {
+        return None;
+    }
+    Some(
+        icon.pixels
+            .chunks_exact(4)
+            .map(|pixel| {
+                notification_icon_source_over_rgb([pixel[0], pixel[1], pixel[2], pixel[3]])
+            })
+            .collect(),
+    )
+}
+
 const TRAY_ICON_MAX_SIZE: u16 = 14;
+const MAX_PREPARED_NOTIFICATION_ICONS: usize = 32;
+
+struct PreparedNotificationIcon {
+    source: Arc<ResolvedNotificationIcon>,
+    pixmap: xproto::Pixmap,
+    width: u16,
+    height: u16,
+    depth: u8,
+    visual: u32,
+    background: u32,
+}
+
+type PreparedNotificationIconHandle = (xproto::Pixmap, u16, u16);
 
 fn tray_draw_size(width: u16, height: u16) -> (u16, u16) {
     if width == 0 || height == 0 {
@@ -512,6 +562,8 @@ pub struct X11Platform {
     menu_popup_dirty: MenuPopupDirty,
     hover_repaint_active: bool,
     notification: Option<NotificationWindow>,
+    notification_icons: HashMap<crate::core::HistoryEntryId, Arc<ResolvedNotificationIcon>>,
+    prepared_notification_icons: VecDeque<PreparedNotificationIcon>,
     toast_stack: Vec<crate::core::HistoryEntryId>,
     toast_known_history: HashSet<crate::core::HistoryEntryId>,
     pending_notification_center_target: Option<crate::core::HistoryEntryId>,
@@ -926,6 +978,29 @@ struct NotificationCardHit {
     action_rects: Vec<NotificationActionHit>,
     pager_prev_rect: Option<layout::MenuRect>,
     pager_next_rect: Option<layout::MenuRect>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NotificationCardContentLayout {
+    icon_rect: Option<layout::MenuRect>,
+    text_x: i32,
+}
+
+fn notification_card_content_layout(
+    card: layout::MenuRect,
+    has_icon: bool,
+) -> NotificationCardContentLayout {
+    let text_x = i32::from(card.x) + NOTIFICATION_CARD_CONTENT_PADDING as i32;
+    let icon_rect = has_icon.then_some(layout::MenuRect {
+        x: card.x + NOTIFICATION_CARD_CONTENT_PADDING,
+        y: card.y + NOTIFICATION_CARD_CONTENT_PADDING,
+        width: 32,
+        height: 32,
+    });
+    NotificationCardContentLayout {
+        icon_rect,
+        text_x: text_x + if has_icon { 42 } else { 0 },
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3384,6 +3459,8 @@ impl X11Platform {
             menu_popup_dirty: MenuPopupDirty::None,
             hover_repaint_active: false,
             notification: None,
+            notification_icons: HashMap::new(),
+            prepared_notification_icons: VecDeque::new(),
             toast_stack: Vec::new(),
             toast_known_history: HashSet::new(),
             pending_notification_center_target: None,
@@ -3403,6 +3480,13 @@ impl X11Platform {
     }
     pub fn connection(&self) -> &XCBConnection {
         &self.conn
+    }
+
+    pub fn set_notification_icons(
+        &mut self,
+        icons: HashMap<crate::core::HistoryEntryId, Arc<ResolvedNotificationIcon>>,
+    ) {
+        self.notification_icons = icons;
     }
     pub fn root(&self) -> u32 {
         self.root
@@ -5130,6 +5214,153 @@ impl X11Platform {
         Ok(())
     }
 
+    fn prepared_notification_icon(
+        &mut self,
+        icon: &Arc<ResolvedNotificationIcon>,
+    ) -> Result<Option<PreparedNotificationIconHandle>, Box<dyn Error>> {
+        let width = u16::try_from(icon.width).ok();
+        let height = u16::try_from(icon.height).ok();
+        let Some((width, height)) = width.zip(height) else {
+            return Ok(None);
+        };
+        let background = notification_card_background(self.glass_surface);
+        let cache_position = self.prepared_notification_icons.iter().position(|entry| {
+            entry.depth == self.glass_surface.depth
+                && entry.visual == self.glass_surface.visual
+                && entry.background == background
+                && Arc::ptr_eq(&entry.source, icon)
+        });
+        if let Some(position) = cache_position {
+            let entry = self
+                .prepared_notification_icons
+                .remove(position)
+                .expect("cache position");
+            let result = (entry.pixmap, entry.width, entry.height);
+            self.prepared_notification_icons.push_back(entry);
+            return Ok(Some(result));
+        }
+
+        let Some(pixels) = precompose_notification_icon_pixels(icon) else {
+            return Ok(None);
+        };
+        let pixmap = self.conn.generate_id()?;
+        self.conn
+            .create_pixmap(self.glass_surface.depth, pixmap, self.root, width, height)?
+            .check()?;
+        let gc = self.conn.generate_id()?;
+        self.conn
+            .create_gc(gc, pixmap, &xproto::CreateGCAux::new())?
+            .check()?;
+        let upload = (|| -> Result<(), Box<dyn Error>> {
+            let format = self
+                .conn
+                .setup()
+                .pixmap_formats
+                .iter()
+                .find(|format| format.depth == self.glass_surface.depth)
+                .ok_or("missing X11 pixmap format")?;
+            let bits_per_pixel = usize::from(format.bits_per_pixel);
+            let bytes_per_pixel = bits_per_pixel.div_ceil(8);
+            if bytes_per_pixel == 0
+                || bytes_per_pixel > 4
+                || bits_per_pixel < usize::from(self.glass_surface.depth)
+            {
+                return Err("unsupported X11 pixmap format".into());
+            }
+            let scanline_pad = usize::from(format.scanline_pad).max(8);
+            let row_bits = usize::from(width) * bits_per_pixel;
+            let stride = row_bits.div_ceil(scanline_pad) * (scanline_pad / 8);
+            let mut data = vec![0_u8; stride * usize::from(height)];
+            for (index, pixel) in pixels.into_iter().enumerate() {
+                let native = self.glass_surface.opaque_pixel(pixel);
+                let native_bytes = match self.conn.setup().image_byte_order {
+                    xproto::ImageOrder::LSB_FIRST => native.to_le_bytes(),
+                    xproto::ImageOrder::MSB_FIRST => native.to_be_bytes(),
+                    _ => return Err("unsupported X11 image byte order".into()),
+                };
+                let row = index / usize::from(width);
+                let column = index % usize::from(width);
+                let offset = row * stride + column * bytes_per_pixel;
+                let source = if matches!(
+                    self.conn.setup().image_byte_order,
+                    xproto::ImageOrder::LSB_FIRST
+                ) {
+                    &native_bytes[..bytes_per_pixel]
+                } else {
+                    &native_bytes[4 - bytes_per_pixel..]
+                };
+                data[offset..offset + bytes_per_pixel].copy_from_slice(source);
+            }
+            self.conn
+                .put_image(
+                    xproto::ImageFormat::Z_PIXMAP,
+                    pixmap,
+                    gc,
+                    width,
+                    height,
+                    0,
+                    0,
+                    0,
+                    self.glass_surface.depth,
+                    &data,
+                )?
+                .check()?;
+            Ok(())
+        })();
+        self.conn.free_gc(gc)?.check()?;
+        if let Err(error) = upload {
+            self.conn.free_pixmap(pixmap)?.check()?;
+            return Err(error);
+        }
+        self.prepared_notification_icons
+            .push_back(PreparedNotificationIcon {
+                source: Arc::clone(icon),
+                pixmap,
+                width,
+                height,
+                depth: self.glass_surface.depth,
+                visual: self.glass_surface.visual,
+                background,
+            });
+        if self.prepared_notification_icons.len() > MAX_PREPARED_NOTIFICATION_ICONS {
+            if let Some(evicted) = self.prepared_notification_icons.pop_front() {
+                self.conn.free_pixmap(evicted.pixmap)?.check()?;
+            }
+        }
+        Ok(Some((pixmap, width, height)))
+    }
+
+    fn draw_notification_icon(
+        &mut self,
+        drawable: u32,
+        gc: u32,
+        icon_rect: layout::MenuRect,
+        icon: &Arc<ResolvedNotificationIcon>,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some((pixmap, width, height)) = self.prepared_notification_icon(icon)? else {
+            return Ok(());
+        };
+        if width > icon_rect.width || height > icon_rect.height {
+            return Ok(());
+        }
+        let offset_x = (icon_rect.width - width) / 2;
+        let offset_y = (icon_rect.height - height) / 2;
+        self.conn
+            .copy_area(
+                pixmap,
+                drawable,
+                gc,
+                0,
+                0,
+                icon_rect.x + offset_x as i16,
+                icon_rect.y + offset_y as i16,
+                width,
+                height,
+            )?
+            .check()?;
+        Ok(())
+    }
+
     fn render_notification_center(&mut self, state: &State) -> Result<(), Box<dyn Error>> {
         let Some(output_id) = state.notification_center_open else {
             self.pending_notification_center_target = None;
@@ -5750,6 +5981,16 @@ impl X11Platform {
                     )?;
                 }
             }
+            let content_layout = notification_card_content_layout(
+                card_rect,
+                self.notification_icons.contains_key(&entry.id),
+            );
+            if let (Some(icon_rect), Some(icon)) = (
+                content_layout.icon_rect,
+                self.notification_icons.get(&entry.id).cloned(),
+            ) {
+                self.draw_notification_icon(backing.pixmap, backing.gc, icon_rect, &icon)?;
+            }
             self.conn.flush()?;
             self.conn.get_input_focus()?.reply()?;
             self.text.prepare_drawable(
@@ -5758,7 +5999,7 @@ impl X11Platform {
                 self.glass_surface,
             )?;
             let text = notification_card_text(entry, expanded_member_ids.contains(&entry.id));
-            let text_x = i32::from(card_rect.x) + NOTIFICATION_CARD_CONTENT_PADDING as i32;
+            let text_x = content_layout.text_x;
             let content_bottom = if entry_layout.compact {
                 let has_action_row =
                     !entry_layout.actions.is_empty() || entry_layout.page_count > 1;
@@ -9006,6 +9247,9 @@ impl Drop for X11Platform {
             }
             let _ = self.conn.destroy_window(bar.window);
         }
+        for entry in self.prepared_notification_icons.drain(..) {
+            let _ = self.conn.free_pixmap(entry.pixmap);
+        }
         if let Some(colormap) = self.glass_surface.owned_colormap {
             let _ = self.conn.free_colormap(colormap);
         }
@@ -9112,24 +9356,27 @@ mod tests {
         format_cache_age, format_reset_at, frame_policy_property_value, install_passive_grabs,
         is_xbar_owned_window, menu_accelerator_x, menu_popup_dirty_for_interaction_change,
         menu_popup_slot_for_window, menu_popup_slots_for_item, network_primary_row_label,
-        notification_body_hit, notification_history_id_for, notification_hover_transition,
+        notification_body_hit, notification_card_content_layout, notification_history_id_for,
+        notification_hover_transition, notification_icon_source_over_rgb,
         notification_indicator_hit, notification_indicator_rect, notification_previous_scroll,
         notification_scroll_target, notification_wheel_direction, popup_effect_owner,
-        popup_hover_for, popup_hover_transition, popup_slot_is_selected, preserve_color_pixel,
-        raw_button_press_event, reconcile_notification_scroll, reconcile_toast_stack,
-        reconcile_toast_stack_candidates, reconcile_toast_stack_grouped, template_icon_pixel,
-        toast_members_that_fit, toast_presentation_items, tray_draw_size, tray_hit,
-        union_menu_rects, AttentionPropertyRead, BarBacking, BarWindow, EffectOwnerUpdate,
-        GlobalPinShortcut, HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot,
-        PopupWindow, RenderTarget, SurfaceWindowGeometry, ToastFitItem, X11Event, X11Platform,
-        BAR_HEIGHT, NOTIFICATION_CARD_SLOT_GAP, NOTIFICATION_GROUP_INTERNAL_GAP,
-        NOTIFICATION_OUTER_PADDING, XOMPOSITE_FRAME_POLICY_ATOM_NAME,
+        popup_hover_for, popup_hover_transition, popup_slot_is_selected,
+        precompose_notification_icon_pixels, preserve_color_pixel, raw_button_press_event,
+        reconcile_notification_scroll, reconcile_toast_stack, reconcile_toast_stack_candidates,
+        reconcile_toast_stack_grouped, template_icon_pixel, toast_members_that_fit,
+        toast_presentation_items, tray_draw_size, tray_hit, union_menu_rects,
+        AttentionPropertyRead, BarBacking, BarWindow, EffectOwnerUpdate, GlobalPinShortcut,
+        HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot, PopupWindow, RenderTarget,
+        SurfaceWindowGeometry, ToastFitItem, X11Event, X11Platform, BAR_HEIGHT,
+        NOTIFICATION_CARD_SLOT_GAP, NOTIFICATION_GROUP_INTERNAL_GAP, NOTIFICATION_OUTER_PADDING,
+        XOMPOSITE_FRAME_POLICY_ATOM_NAME,
     };
     use crate::core::{
         ChildrenDisplay, HistoryEntryId, MenuItem, MenuItemId, MenuItemType,
         NotificationActionProjection, NotificationActionView, NotificationHistoryEntry,
         NotificationSource, OutputId, OutputState, StatusNotifierEndpoint, StatusNotifierIcon,
     };
+    use crate::notification_icons::ResolvedNotificationIcon;
     use crate::ui::{
         layout::{MenuRect, PopupItemRect, PopupLayout},
         style::{self, FontMetrics, TextMeasurer},
@@ -9137,6 +9384,7 @@ mod tests {
         view::TrayVisualItem,
     };
     use std::collections::HashSet;
+    use std::sync::Arc;
     use x11rb::errors::ReplyError;
     use x11rb::protocol::xinput;
     use x11rb::protocol::xproto::{EventMask, ModMask};
@@ -9144,6 +9392,62 @@ mod tests {
     use x11rb::x11_utils::X11Error;
 
     struct FixedWidthMeasurer;
+
+    #[test]
+    fn notification_card_icon_layout_preserves_text_only_geometry() {
+        let card = MenuRect {
+            x: 20,
+            y: 40,
+            width: 396,
+            height: super::NOTIFICATION_BASE_CARD_HEIGHT,
+        };
+        let without_icon = notification_card_content_layout(card, false);
+        assert_eq!(without_icon.icon_rect, None);
+        assert_eq!(without_icon.text_x, 32);
+        assert_eq!(card.height, 78);
+        let with_icon = notification_card_content_layout(card, true);
+        assert_eq!(
+            with_icon.icon_rect,
+            Some(MenuRect {
+                x: 32,
+                y: 52,
+                width: 32,
+                height: 32
+            })
+        );
+        assert_eq!(with_icon.text_x, without_icon.text_x + 42);
+        assert!(with_icon.icon_rect.unwrap().x + 32 <= card.x + card.width as i16);
+        assert!(with_icon.icon_rect.unwrap().y + 32 <= card.y + card.height as i16);
+    }
+
+    #[test]
+    fn notification_icon_alpha_is_composited_against_card_material() {
+        assert_eq!(notification_icon_source_over_rgb([1, 2, 3, 0]), 0x2a303a);
+        assert_eq!(notification_icon_source_over_rgb([1, 2, 3, 255]), 0x010203);
+        assert_eq!(
+            notification_icon_source_over_rgb([255, 0, 0, 128]),
+            0x95181d
+        );
+        assert_eq!(
+            notification_icon_source_over_rgb([0, 255, 0, 128]),
+            0x15981d
+        );
+    }
+
+    #[test]
+    fn notification_icon_preparation_preserves_source_and_composes_once() {
+        let source: Arc<[u8]> =
+            Arc::from(vec![1, 2, 3, 0, 255, 0, 0, 255, 255, 0, 0, 128].into_boxed_slice());
+        let icon = ResolvedNotificationIcon {
+            width: 3,
+            height: 1,
+            pixels: Arc::clone(&source),
+        };
+        let prepared = precompose_notification_icon_pixels(&icon).unwrap();
+        assert_eq!(prepared, vec![0x2a303a, 0xff0000, 0x95181d]);
+        assert!(Arc::ptr_eq(&icon.pixels, &source));
+        assert_eq!(&*icon.pixels, &*source);
+    }
 
     impl TextMeasurer for FixedWidthMeasurer {
         fn measure_width(&self, text: &str) -> u16 {
@@ -11211,6 +11515,7 @@ mod tests {
             app_name: "app".into(),
             summary: "summary".into(),
             body: "body".into(),
+            icon_metadata: Default::default(),
             order: 1,
             received_at: 1,
             updated_at: 1,
@@ -11233,6 +11538,7 @@ mod tests {
             app_name: app_name.into(),
             summary: format!("summary {id}"),
             body: format!("body {id}"),
+            icon_metadata: Default::default(),
             order: id,
             received_at: id,
             updated_at: id,
@@ -11927,6 +12233,7 @@ mod tests {
                 app_name: String::new(),
                 summary: String::new(),
                 body: String::new(),
+                icon_metadata: Default::default(),
                 order: order as u64,
                 received_at: 0,
                 updated_at: 0,
@@ -12268,6 +12575,7 @@ mod tests {
                 app_name: "app".into(),
                 summary: id.to_string(),
                 body: String::new(),
+                icon_metadata: Default::default(),
                 order: id,
                 received_at: id,
                 updated_at: id,
@@ -12353,6 +12661,7 @@ mod tests {
             app_name: app_name.into(),
             summary: format!("summary {id}"),
             body: String::new(),
+            icon_metadata: Default::default(),
             order: id,
             received_at: id,
             updated_at: id,

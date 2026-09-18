@@ -16,6 +16,7 @@ resolver = "2"
 libc = "0.2"
 libpulse-binding = "2.30"
 futures-lite = "2"
+image = { version = "0.25.10", default-features = false, features = ["bmp", "ico", "jpeg", "png", "webp"] }
 async-io = "2"
 async-channel = "2"
 serde = { version = "1", features = ["derive"] }

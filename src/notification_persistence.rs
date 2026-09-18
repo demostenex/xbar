@@ -1,4 +1,4 @@
-use crate::core::{NotificationHistoryEntry, NotificationSource};
+use crate::core::{NotificationHistoryEntry, NotificationIconMetadata, NotificationSource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -24,6 +24,8 @@ struct PersistedEntry {
     app_name: String,
     summary: String,
     body: String,
+    #[serde(default)]
+    icon_metadata: NotificationIconMetadata,
     order: u64,
     received_at: u64,
     updated_at: u64,
@@ -119,6 +121,7 @@ impl Persistence {
                 app_name: persisted.app_name,
                 summary: persisted.summary,
                 body: persisted.body,
+                icon_metadata: persisted.icon_metadata,
                 order: persisted.order,
                 received_at: persisted.received_at,
                 updated_at: persisted.updated_at,
@@ -160,6 +163,7 @@ impl Persistence {
                     app_name: entry.app_name.clone(),
                     summary: entry.summary.clone(),
                     body: entry.body.clone(),
+                    icon_metadata: entry.icon_metadata.clone(),
                     order: entry.order,
                     received_at: entry.received_at,
                     updated_at: entry.updated_at,
@@ -214,6 +218,7 @@ mod tests {
             app_name: "app".into(),
             summary: format!("summary-{id}"),
             body: "body".into(),
+            icon_metadata: Default::default(),
             order,
             received_at,
             updated_at,
@@ -335,6 +340,7 @@ mod tests {
                         app_name: entry.app_name.clone(),
                         summary: entry.summary.clone(),
                         body: entry.body.clone(),
+                        icon_metadata: entry.icon_metadata.clone(),
                         order: entry.order,
                         received_at: entry.received_at,
                         updated_at: entry.updated_at,

@@ -6,6 +6,7 @@ mod dbus;
 mod external;
 mod i3;
 mod logging;
+mod notification_icons;
 mod notification_persistence;
 mod notification_sound;
 mod notifications;
@@ -93,6 +94,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         external_floating_terminal: config.external.floating_terminal(),
         ..State::default()
     };
+    let mut notification_icon_resolver = notification_icons::NotificationIconResolver::new();
     let external_launcher =
         external::ExternalLauncher::new(state.external_floating_terminal.clone());
     let registry = Arc::new(Mutex::new(core::MenuRegistry::default()));
@@ -1050,6 +1052,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 translated.clone(),
                 &mut registry.lock().expect("registry poisoned"),
             );
+            if matches!(&translated, Event::NotificationsState { .. }) {
+                notification_icon_resolver.resolve_history(&state.notification_history);
+                x11.set_notification_icons(notification_icon_resolver.resolved_history_icons());
+            }
             render_target = merge_render_target(
                 render_target,
                 ai_usage_update_render_target(
@@ -2373,6 +2379,7 @@ mod scheduler_tests {
             app_name: "app".into(),
             summary: "summary".into(),
             body: "body".into(),
+            icon_metadata: Default::default(),
             order: id,
             received_at: id,
             updated_at: id,
