@@ -1748,6 +1748,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         Event::BluetoothDisconnectDevice(path) => {
             begin_bluetooth_action(state, super::BluetoothPendingAction::DisconnectDevice(path))
         }
+        Event::BluetoothManagerRequested => reduce(state, Event::MenuClickedOutside, registry),
         Event::BluetoothActionFinished(action) => {
             let before = state.bluetooth_pending.len();
             state.bluetooth_pending.retain(|pending| pending != &action);

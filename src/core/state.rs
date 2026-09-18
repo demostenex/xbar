@@ -692,6 +692,8 @@ pub struct State {
     pub bluetooth_pending: Vec<BluetoothPendingAction>,
     pub bluetooth_popup_open: bool,
     pub bluetooth_popup_output: Option<OutputId>,
+    pub bluetooth_manager_command: Option<Vec<String>>,
+    pub external_floating_terminal: Option<Vec<String>>,
     pub network_popup_open: bool,
     pub network_popup_output: Option<OutputId>,
     pub network_popup_open_pending: bool,

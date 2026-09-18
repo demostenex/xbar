@@ -1,5 +1,23 @@
 # xbar
 
+## Configuração opcional do Bluetooth
+
+Para exibir a ação genérica `Mais configurações…` no popup Bluetooth, crie
+`~/.config/xbar/config.toml` com um vetor argv explícito:
+
+```toml
+[external]
+floating_terminal = ["seu-terminal", "--class", "XbarExternal,XbarExternal", "-e"]
+
+[bluetooth]
+manager_command = ["seu-gerenciador", "--argumento"]
+```
+
+O primeiro elemento de cada vetor é o executável e os demais são argumentos;
+o launcher compõe os vetores diretamente, sem shell. A ação Bluetooth só
+aparece quando `manager_command` existe; sem `floating_terminal`, o clique
+fecha o popup e registra a configuração ausente sem iniciar um fallback tiled.
+
 Barra modular para X11, inicialmente orientada a i3.
 
 ## Arquitetura atual

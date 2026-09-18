@@ -193,6 +193,7 @@ pub enum Event {
     BluetoothSetPowered(bool),
     BluetoothConnectDevice(String),
     BluetoothDisconnectDevice(String),
+    BluetoothManagerRequested,
     BluetoothActionFinished(BluetoothPendingAction),
     #[allow(dead_code)]
     NotificationsSnapshot(Vec<super::Notification>),

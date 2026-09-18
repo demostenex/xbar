@@ -1,7 +1,9 @@
 mod audio;
 mod clock;
+mod config;
 mod core;
 mod dbus;
+mod external;
 mod i3;
 mod logging;
 mod notification_persistence;
@@ -70,6 +72,13 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
+    let config = match config::Config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("xbar: failed to load config: {error}");
+            config::Config::default()
+        }
+    };
     let mut x11 = X11Platform::connect()?;
     if !x11.acquire_instance()? {
         eprintln!("xbar: another instance already owns _XBAR_INSTANCE");
@@ -79,7 +88,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut i3 = I3Client::connect(socket)?;
     let clock = ClockSource::new()?;
     let mut audio = audio::AudioBridge::start()?;
-    let mut state = State::default();
+    let mut state = State {
+        bluetooth_manager_command: config.bluetooth.manager_command(),
+        external_floating_terminal: config.external.floating_terminal(),
+        ..State::default()
+    };
+    let external_launcher =
+        external::ExternalLauncher::new(state.external_floating_terminal.clone());
     let registry = Arc::new(Mutex::new(core::MenuRegistry::default()));
     let mut dbus = dbus::DbusBridge::start(Arc::clone(&registry))?;
     let mut xnm = match xnm::XnmBridge::start() {
@@ -628,6 +643,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::BluetoothPower),
                 ) => Event::BluetoothSetPowered(!state.bluetooth.powered),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::BluetoothManager),
+                ) => Event::BluetoothManagerRequested,
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::BluetoothDevice(path)),
@@ -1334,6 +1353,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                     }
                     dbus.bluetooth_disconnect_device(path.clone())
                 }
+                Event::BluetoothManagerRequested => {
+                    if let Some(argv) = state.bluetooth_manager_command.clone() {
+                        let request = external::ExternalLaunchRequest {
+                            argv,
+                            presentation: external::ExternalPresentation::FloatingTerminal,
+                        };
+                        if let Err(error) = external_launcher.launch(&request) {
+                            eprintln!("xbar: {error}");
+                        }
+                    }
+                }
                 Event::NetworkSetWireless(enabled) => {
                     if trace {
                         eprintln!("xbar trace: NetworkCommand SetWireless enabled={enabled}");
@@ -1980,6 +2010,7 @@ fn render_target_for(
         | Event::BluetoothSetPowered(_)
         | Event::BluetoothConnectDevice(_)
         | Event::BluetoothDisconnectDevice(_)
+        | Event::BluetoothManagerRequested
         | Event::BluetoothActionFinished(_)
         | Event::AudioInventoryReceived { .. }
         | Event::AudioSelectOutput(_)
@@ -2042,7 +2073,9 @@ fn hover_render_target_for(
         Some(HitTarget::AudioOutputDevice(_)) | Some(HitTarget::AudioInputDevice(_)) => {
             Some(RenderTarget::Popup)
         }
-        Some(HitTarget::BluetoothDevice(_)) => Some(RenderTarget::Popup),
+        Some(HitTarget::BluetoothDevice(_)) | Some(HitTarget::BluetoothManager) => {
+            Some(RenderTarget::Popup)
+        }
         Some(HitTarget::BluetoothPower)
         | Some(HitTarget::BluetoothInside)
         | Some(HitTarget::Bluetooth(_)) => None,

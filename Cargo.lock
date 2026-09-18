@@ -3825,6 +3825,7 @@ dependencies = [
  "libpulse-binding",
  "serde",
  "serde_json",
+ "toml",
  "x11",
  "x11rb",
  "xbar-ai-protocol",

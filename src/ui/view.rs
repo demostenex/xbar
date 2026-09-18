@@ -250,14 +250,6 @@ pub fn audio_glyph(audio: &crate::core::AudioState) -> &'static str {
     }
 }
 
-pub fn microphone_glyph(audio: &crate::core::AudioState) -> &'static str {
-    if audio.input_muted || audio.input_volume_percent == 0 {
-        "󰍭"
-    } else {
-        "󰍬"
-    }
-}
-
 pub fn network_glyph(network: &crate::core::NetworkState) -> &'static str {
     if !network.available || matches!(network.connectivity, NetworkConnectivity::Disconnected) {
         return "󰤮";
@@ -746,21 +738,6 @@ mod tests {
         assert_eq!(audio_glyph(&audio), "󰕾");
         audio.muted = true;
         assert_eq!(audio_glyph(&audio), "󰖁");
-    }
-
-    #[test]
-    fn microphone_glyph_reflects_confirmed_mute_state() {
-        let mut audio = crate::core::AudioState {
-            available: true,
-            input_volume_percent: 40,
-            ..Default::default()
-        };
-        assert_eq!(microphone_glyph(&audio), "󰍬");
-        audio.input_muted = true;
-        assert_eq!(microphone_glyph(&audio), "󰍭");
-        audio.input_muted = false;
-        audio.input_volume_percent = 0;
-        assert_eq!(microphone_glyph(&audio), "󰍭");
     }
 
     #[test]

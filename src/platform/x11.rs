@@ -157,6 +157,161 @@ impl TextMeasurer for PopupMeasurer<'_> {
     }
 }
 
+const MENU_ACCELERATOR_GAP: u16 = 12;
+const MENU_ACCELERATOR_ARROW_GAP: u16 = 8;
+const MENU_SUBMENU_ARROW_ZONE: u16 = 16;
+
+fn menu_shortcut_text(item: &crate::core::MenuItem) -> Option<String> {
+    item.shortcut
+        .as_ref()
+        .and_then(|shortcut| shortcut.keys.first())
+        .map(|keys| {
+            keys.iter()
+                .map(|key| key.trim_matches('<'))
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+}
+
+fn menu_accelerator_x(
+    popup: layout::MenuRect,
+    item: layout::MenuRect,
+    accelerator_width: u16,
+    has_submenu: bool,
+) -> i16 {
+    item.x - popup.x + item.width as i16
+        - (POPUP_STYLE.row_horizontal_padding
+            + accelerator_width
+            + if has_submenu {
+                MENU_SUBMENU_ARROW_ZONE + MENU_ACCELERATOR_ARROW_GAP
+            } else {
+                0
+            }) as i16
+}
+
+fn global_menu_popup_layout_with_measurer<M: TextMeasurer>(
+    output: &OutputState,
+    parent: &crate::core::MenuItem,
+    anchor: layout::MenuRect,
+    submenu: bool,
+    measurer: &M,
+) -> layout::PopupLayout {
+    let mut popup = layout::popup_layout_with_measurer(output, parent, anchor, submenu, measurer);
+    let visible: Vec<_> = parent.children.iter().filter(|item| item.visible).collect();
+    let has_submenu = visible
+        .iter()
+        .any(|item| item.children_display.is_some() && !item.children.is_empty());
+    let max_accelerator_width = visible
+        .iter()
+        .filter_map(|item| menu_shortcut_text(item))
+        .map(|shortcut| measurer.measure_width(&shortcut))
+        .max()
+        .unwrap_or(0);
+    let mut content_width = 120_u16;
+    for item in &visible {
+        let label_width = item
+            .label
+            .as_deref()
+            .map(view::present_label)
+            .map(|label| measurer.measure_width(&label))
+            .unwrap_or(0);
+        let accelerator_width = menu_shortcut_text(item)
+            .map(|_| MENU_ACCELERATOR_GAP.saturating_add(max_accelerator_width))
+            .unwrap_or(0);
+        let arrow_width = if (item.children_display.is_some() && !item.children.is_empty())
+            || (has_submenu && menu_shortcut_text(item).is_some())
+        {
+            MENU_SUBMENU_ARROW_ZONE.saturating_add(MENU_ACCELERATOR_ARROW_GAP)
+        } else {
+            0
+        };
+        content_width = content_width.max(
+            POPUP_STYLE
+                .row_horizontal_padding
+                .saturating_mul(2)
+                .saturating_add(label_width)
+                .saturating_add(accelerator_width)
+                .saturating_add(arrow_width),
+        );
+    }
+    let width = content_width
+        .saturating_add(POPUP_STYLE.outer_padding.saturating_mul(2))
+        .min(output.width.max(1));
+    let rect = if submenu {
+        let right = i32::from(output.x) + i32::from(output.width);
+        let right_candidate = i32::from(anchor.x) + i32::from(anchor.width);
+        let x = if right_candidate + i32::from(width) <= right {
+            right_candidate
+        } else {
+            (i32::from(anchor.x) - i32::from(width)).max(i32::from(output.x))
+        };
+        layout::MenuRect {
+            x: x as i16,
+            y: popup.rect.y,
+            width,
+            height: popup.rect.height,
+        }
+    } else {
+        layout::place_bar_popup(
+            layout::PopupAnchor {
+                output_id: output.id,
+                source_rect: anchor,
+            },
+            width,
+            popup.rect.height,
+            output,
+        )
+        .popup_rect
+    };
+    let content = layout::MenuRect {
+        x: rect.x + POPUP_STYLE.outer_padding as i16,
+        y: rect.y + POPUP_STYLE.outer_padding as i16,
+        width: rect
+            .width
+            .saturating_sub(POPUP_STYLE.outer_padding.saturating_mul(2)),
+        height: rect
+            .height
+            .saturating_sub(POPUP_STYLE.outer_padding.saturating_mul(2)),
+    };
+    let any_submenu = has_submenu;
+    for item in &mut popup.items {
+        let Some(source) = visible.iter().find(|candidate| candidate.id == item.id) else {
+            continue;
+        };
+        let offset_y = item.rect.y - popup.rect.y;
+        item.rect = layout::MenuRect {
+            x: content.x,
+            y: rect.y + offset_y,
+            width: content.width,
+            height: item.rect.height,
+        };
+        let shortcut = menu_shortcut_text(source);
+        let arrow_width = if item.has_submenu || (any_submenu && shortcut.is_some()) {
+            MENU_SUBMENU_ARROW_ZONE.saturating_add(MENU_ACCELERATOR_ARROW_GAP)
+        } else {
+            0
+        };
+        let label_width = content
+            .width
+            .saturating_sub(POPUP_STYLE.row_horizontal_padding.saturating_mul(2))
+            .saturating_sub(arrow_width)
+            .saturating_sub(if shortcut.is_some() {
+                MENU_ACCELERATOR_GAP.saturating_add(max_accelerator_width)
+            } else {
+                0
+            });
+        item.label = source
+            .label
+            .as_deref()
+            .map(view::present_label)
+            .and_then(|label| layout::truncate_text_to_width(&label, label_width, measurer))
+            .unwrap_or_default();
+        item.shortcut = shortcut;
+    }
+    popup.rect = rect;
+    popup
+}
+
 const BAR_HEIGHT: u16 = layout::BAR_HEIGHT;
 const XK_G: u32 = 0x0067;
 const XK_M: u32 = 0x006d;
@@ -619,6 +774,7 @@ struct BluetoothPopupWindow {
     rect: layout::MenuRect,
     power: layout::MenuRect,
     devices: Vec<(String, layout::MenuRect)>,
+    manager: Option<layout::MenuRect>,
 }
 struct NetworkPopupWindow {
     window: u32,
@@ -638,6 +794,7 @@ enum PopupHover {
     AudioInputDevice(String),
     BluetoothPower,
     BluetoothDevice(String),
+    BluetoothManager,
     NetworkWifi(NetworkWifiTarget),
     NetworkWireless,
 }
@@ -697,7 +854,7 @@ struct NotificationCenterWindow {
     dirty: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct NotificationContentViewport {
     x: i32,
     y: i32,
@@ -861,6 +1018,197 @@ const NOTIFICATION_ACTION_ROW_GAP: u16 = 4;
 const NOTIFICATION_ACTION_TOP_GAP: u16 = 8;
 const NOTIFICATION_ACTION_BOTTOM_GAP: u16 = 8;
 const NOTIFICATION_ACTION_PAGER_WIDTH: u16 = 20;
+const AUDIO_CARD_TOP_PADDING: u16 = POPUP_STYLE.card_padding;
+const AUDIO_CARD_BOTTOM_PADDING: u16 = POPUP_STYLE.card_padding;
+const AUDIO_CARD_ROW_GAP: u16 = POPUP_STYLE.card_row_gap;
+const AUDIO_CARD_TEXT_ROW_HEIGHT: u16 = 20;
+const AUDIO_CARD_CONTROL_ROW_HEIGHT: u16 = 22;
+const AUDIO_MASTER_CARD_HEIGHT: u16 = audio_control_card_height();
+const AUDIO_MICROPHONE_CARD_HEIGHT: u16 = audio_control_card_height();
+const AUDIO_MICROPHONE_CARD_TOP: i16 =
+    12 + AUDIO_MASTER_CARD_HEIGHT as i16 + POPUP_STYLE.card_row_gap as i16;
+const AUDIO_OUTPUT_CARD_TOP: i16 = AUDIO_MICROPHONE_CARD_TOP
+    + AUDIO_MICROPHONE_CARD_HEIGHT as i16
+    + POPUP_STYLE.card_row_gap as i16;
+const AUDIO_SECTION_GAP: u16 = 10;
+const AUDIO_MUTE_HIT_WIDTH: u16 = 46;
+const AUDIO_MUTE_HIT_HEIGHT: u16 = 48;
+const AUDIO_MUTE_SWITCH_WIDTH: u16 = 46;
+const AUDIO_MUTE_SWITCH_HEIGHT: u16 = 22;
+const AUDIO_DEVICE_CARD_HEADER_HEIGHT: u16 = 29;
+const AUDIO_CONTENT_BASE_HEIGHT: u16 = POPUP_STYLE.outer_padding * 2
+    + AUDIO_MASTER_CARD_HEIGHT
+    + POPUP_STYLE.card_row_gap
+    + AUDIO_MICROPHONE_CARD_HEIGHT
+    + POPUP_STYLE.card_row_gap
+    + AUDIO_DEVICE_CARD_HEADER_HEIGHT
+    + AUDIO_SECTION_GAP
+    + AUDIO_DEVICE_CARD_HEADER_HEIGHT;
+const BLUETOOTH_HEADER_CARD_HEIGHT: u16 = 48;
+const BLUETOOTH_SECTION_HEIGHT: u16 = 24;
+const BLUETOOTH_COLLECTION_PADDING: u16 = POPUP_STYLE.card_padding;
+const BLUETOOTH_ROW_HEIGHT: u16 = 28;
+const BLUETOOTH_ROW_GAP: u16 = 2;
+const BLUETOOTH_ACTION_GAP: u16 = 10;
+const BLUETOOTH_ACTION_HEIGHT: u16 = 28;
+const BLUETOOTH_MANAGER_LABEL: &str = "Mais configurações…";
+
+const fn audio_control_card_height() -> u16 {
+    AUDIO_CARD_TOP_PADDING
+        + AUDIO_CARD_TEXT_ROW_HEIGHT
+        + AUDIO_CARD_ROW_GAP
+        + AUDIO_CARD_CONTROL_ROW_HEIGHT
+        + AUDIO_CARD_ROW_GAP
+        + AUDIO_CARD_CONTROL_ROW_HEIGHT
+        + AUDIO_CARD_ROW_GAP
+        + AUDIO_CARD_TEXT_ROW_HEIGHT
+        + AUDIO_CARD_BOTTOM_PADDING
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AudioControlCardLayout {
+    card: layout::MenuRect,
+    content: layout::MenuRect,
+    title_baseline: i16,
+    mute_hit: layout::MenuRect,
+    mute_switch: layout::MenuRect,
+    percent_baseline: i16,
+    slider: layout::MenuRect,
+    mute_label_baseline: i16,
+}
+
+fn audio_control_card_layout(card: layout::MenuRect) -> AudioControlCardLayout {
+    let content = layout::popup_card_content_rect(card);
+    let title_baseline = content.y + 14;
+    let mute_hit = layout::MenuRect {
+        x: content.x,
+        y: content.y + AUDIO_CARD_TEXT_ROW_HEIGHT as i16 + AUDIO_CARD_ROW_GAP as i16,
+        width: AUDIO_MUTE_HIT_WIDTH,
+        height: AUDIO_MUTE_HIT_HEIGHT,
+    };
+    let mute_switch = layout::MenuRect {
+        x: mute_hit.x,
+        y: mute_hit.y,
+        width: AUDIO_MUTE_SWITCH_WIDTH,
+        height: AUDIO_MUTE_SWITCH_HEIGHT,
+    };
+    let percent_baseline = mute_switch.y + 16;
+    let slider = layout::MenuRect {
+        x: content.x + 38,
+        y: mute_switch.y + AUDIO_CARD_CONTROL_ROW_HEIGHT as i16 + AUDIO_CARD_ROW_GAP as i16,
+        width: 240,
+        height: AUDIO_CARD_CONTROL_ROW_HEIGHT,
+    };
+    let mute_label_baseline =
+        slider.y + AUDIO_CARD_CONTROL_ROW_HEIGHT as i16 + AUDIO_CARD_ROW_GAP as i16 + 14;
+    AudioControlCardLayout {
+        card,
+        content,
+        title_baseline,
+        mute_hit,
+        mute_switch,
+        percent_baseline,
+        slider,
+        mute_label_baseline,
+    }
+}
+
+fn audio_mute_switch_enabled(muted: bool) -> bool {
+    muted
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct BluetoothPopupLayout {
+    header: layout::MenuRect,
+    section: layout::MenuRect,
+    collection: layout::MenuRect,
+    rows: Vec<layout::MenuRect>,
+    action: Option<layout::MenuRect>,
+}
+
+fn bluetooth_collection_height(device_count: usize) -> u16 {
+    BLUETOOTH_COLLECTION_PADDING
+        .saturating_mul(2)
+        .saturating_add(
+            BLUETOOTH_ROW_HEIGHT.saturating_mul(device_count.min(u16::MAX as usize) as u16),
+        )
+        .saturating_add(
+            BLUETOOTH_ROW_GAP
+                .saturating_mul(device_count.saturating_sub(1).min(u16::MAX as usize) as u16),
+        )
+}
+
+fn bluetooth_popup_height(device_count: usize, manager_configured: bool) -> u16 {
+    let action = if manager_configured {
+        BLUETOOTH_ACTION_GAP.saturating_add(BLUETOOTH_ACTION_HEIGHT)
+    } else {
+        0
+    };
+    POPUP_STYLE
+        .outer_padding
+        .saturating_mul(2)
+        .saturating_add(BLUETOOTH_HEADER_CARD_HEIGHT)
+        .saturating_add(POPUP_STYLE.card_gap)
+        .saturating_add(BLUETOOTH_SECTION_HEIGHT)
+        .saturating_add(POPUP_STYLE.card_gap)
+        .saturating_add(bluetooth_collection_height(device_count))
+        .saturating_add(action)
+}
+
+fn bluetooth_popup_layout(
+    rect: layout::MenuRect,
+    device_count: usize,
+    manager_configured: bool,
+) -> BluetoothPopupLayout {
+    let outer = POPUP_STYLE.outer_padding as i16;
+    let card_padding = POPUP_STYLE.card_padding as i16;
+    let card_width = rect.width.saturating_sub(POPUP_STYLE.outer_padding * 2);
+    let header = layout::MenuRect {
+        x: rect.x + outer,
+        y: rect.y + outer,
+        width: card_width,
+        height: BLUETOOTH_HEADER_CARD_HEIGHT,
+    };
+    let section = layout::MenuRect {
+        x: header.x,
+        y: header.y + header.height as i16 + POPUP_STYLE.card_gap as i16,
+        width: card_width,
+        height: BLUETOOTH_SECTION_HEIGHT,
+    };
+    let collection = layout::MenuRect {
+        x: header.x,
+        y: section.y + section.height as i16 + POPUP_STYLE.card_gap as i16,
+        width: card_width,
+        height: bluetooth_collection_height(device_count),
+    };
+    let row_width = collection.width.saturating_sub(card_padding as u16 * 2);
+    let rows = (0..device_count)
+        .map(|index| {
+            let canonical = layout::bluetooth_device_row(rect, index);
+            layout::MenuRect {
+                x: collection.x + card_padding,
+                y: collection.y
+                    + card_padding
+                    + (index as i16 * (BLUETOOTH_ROW_HEIGHT + BLUETOOTH_ROW_GAP) as i16),
+                width: row_width.min(canonical.width),
+                height: BLUETOOTH_ROW_HEIGHT.min(canonical.height),
+            }
+        })
+        .collect();
+    let action = manager_configured.then(|| layout::MenuRect {
+        x: collection.x,
+        y: collection.y + collection.height as i16 + BLUETOOTH_ACTION_GAP as i16,
+        width: collection.width,
+        height: BLUETOOTH_ACTION_HEIGHT,
+    });
+    BluetoothPopupLayout {
+        header,
+        section,
+        collection,
+        rows,
+        action,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 struct NotificationActionLayout {
@@ -1967,6 +2315,7 @@ pub enum HitTarget {
     Bluetooth(OutputId),
     BluetoothPower,
     BluetoothDevice(String),
+    BluetoothManager,
     BluetoothInside,
     Network(OutputId),
     NetworkWifi(NetworkWifiTarget),
@@ -2200,15 +2549,105 @@ fn effect_owner_update(windows: &[BarWindow], output: OutputId) -> EffectOwnerUp
     popup_effect_owner(windows, output).map_or(EffectOwnerUpdate::Delete, EffectOwnerUpdate::Set)
 }
 
-const AI_USAGE_POPUP_MIN_HEIGHT: u16 = 280;
-
 fn ai_usage_popup_height(quota_count: usize, status_count: usize, output_height: u16) -> u16 {
-    72_u16
-        .saturating_add((status_count as u16).saturating_mul(20))
-        .saturating_add((quota_count as u16).saturating_mul(68))
-        .saturating_add(3 * POPUP_STYLE.outer_padding)
-        .max(AI_USAGE_POPUP_MIN_HEIGHT)
+    ai_usage_provider_card_height(quota_count, status_count)
+        .saturating_add(POPUP_STYLE.outer_padding.saturating_mul(2))
         .min(output_height.saturating_sub(BAR_HEIGHT).max(1))
+}
+
+const AI_PROVIDER_TOP_PADDING: u16 = POPUP_STYLE.card_padding;
+const AI_PROVIDER_BOTTOM_PADDING: u16 = POPUP_STYLE.card_padding;
+const AI_PROVIDER_TITLE_HEIGHT: u16 = 24;
+const AI_PROVIDER_TITLE_QUOTA_GAP: u16 = POPUP_STYLE.card_gap;
+const AI_PROVIDER_STATUS_GAP: u16 = 4;
+const AI_PROVIDER_STATUS_HEIGHT: u16 = 20;
+const AI_QUOTA_CARD_HEIGHT: u16 = 60;
+const AI_QUOTA_CARD_GAP: u16 = POPUP_STYLE.card_row_gap;
+
+#[derive(Clone, Debug, PartialEq)]
+struct AiUsageProviderCardLayout {
+    card: layout::MenuRect,
+    title: layout::MenuRect,
+    statuses: Vec<layout::MenuRect>,
+    quotas: Vec<layout::MenuRect>,
+}
+
+fn ai_usage_provider_card_height(quota_count: usize, status_count: usize) -> u16 {
+    let status_height = if status_count == 0 {
+        0
+    } else {
+        AI_PROVIDER_STATUS_GAP.saturating_add(
+            AI_PROVIDER_STATUS_HEIGHT.saturating_mul(status_count.min(u16::MAX as usize) as u16),
+        )
+    };
+    let quota_height = AI_QUOTA_CARD_HEIGHT
+        .saturating_mul(quota_count.min(u16::MAX as usize) as u16)
+        .saturating_add(
+            AI_QUOTA_CARD_GAP
+                .saturating_mul(quota_count.saturating_sub(1).min(u16::MAX as usize) as u16),
+        );
+    AI_PROVIDER_TOP_PADDING
+        .saturating_add(AI_PROVIDER_TITLE_HEIGHT)
+        .saturating_add(status_height)
+        .saturating_add(AI_PROVIDER_TITLE_QUOTA_GAP)
+        .saturating_add(quota_height)
+        .saturating_add(AI_PROVIDER_BOTTOM_PADDING)
+}
+
+fn ai_usage_provider_card_layout(
+    rect: layout::MenuRect,
+    quota_count: usize,
+    status_count: usize,
+) -> AiUsageProviderCardLayout {
+    let card = layout::MenuRect {
+        x: rect.x + POPUP_STYLE.outer_padding as i16,
+        y: rect.y + POPUP_STYLE.outer_padding as i16,
+        width: rect.width.saturating_sub(POPUP_STYLE.outer_padding * 2),
+        height: ai_usage_provider_card_height(quota_count, status_count),
+    };
+    let content_x = card.x + POPUP_STYLE.card_padding as i16;
+    let content_width = card.width.saturating_sub(POPUP_STYLE.card_padding * 2);
+    let title = layout::MenuRect {
+        x: content_x,
+        y: card.y + AI_PROVIDER_TOP_PADDING as i16,
+        width: content_width,
+        height: AI_PROVIDER_TITLE_HEIGHT,
+    };
+    let mut cursor = title.y + title.height as i16;
+    if status_count > 0 {
+        cursor += AI_PROVIDER_STATUS_GAP as i16;
+    }
+    let statuses = (0..status_count)
+        .map(|_| {
+            let rect = layout::MenuRect {
+                x: content_x,
+                y: cursor,
+                width: content_width,
+                height: AI_PROVIDER_STATUS_HEIGHT,
+            };
+            cursor += AI_PROVIDER_STATUS_HEIGHT as i16;
+            rect
+        })
+        .collect();
+    cursor += AI_PROVIDER_TITLE_QUOTA_GAP as i16;
+    let quotas = (0..quota_count)
+        .map(|_| {
+            let rect = layout::MenuRect {
+                x: content_x,
+                y: cursor,
+                width: content_width,
+                height: AI_QUOTA_CARD_HEIGHT,
+            };
+            cursor += AI_QUOTA_CARD_HEIGHT as i16 + AI_QUOTA_CARD_GAP as i16;
+            rect
+        })
+        .collect();
+    AiUsageProviderCardLayout {
+        card,
+        title,
+        statuses,
+        quotas,
+    }
 }
 
 const fn effect_owner_property_value(dock: u32) -> [u32; 1] {
@@ -2545,37 +2984,17 @@ impl X11Platform {
         popup: layout::MenuRect,
         card: layout::MenuRect,
     ) -> Result<(), Box<dyn Error>> {
-        let x = card.x - popup.x;
-        let y = card.y - popup.y;
-        self.conn
-            .change_gc(
-                gc,
-                &xproto::ChangeGCAux::new().foreground(
-                    self.glass_surface
-                        .background_pixel(POPUP_STYLE.card_background),
-                ),
-            )?
-            .check()?;
-        self.fill_rounded_popup_card(window, gc, x, y, card.width, card.height)?;
-        Ok(())
-    }
-
-    fn fill_rounded_popup_card(
-        &self,
-        window: u32,
-        gc: u32,
-        x: i16,
-        y: i16,
-        width: u16,
-        height: u16,
-    ) -> Result<(), Box<dyn Error>> {
-        self.fill_rounded_popup_card_with_radius(
+        self.draw_notification_rounded_panel(
             window,
             gc,
-            x,
-            y,
-            width,
-            height,
+            layout::MenuRect {
+                x: card.x - popup.x,
+                y: card.y - popup.y,
+                width: card.width,
+                height: card.height,
+            },
+            self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+            notification_card_background(self.glass_surface),
             POPUP_STYLE.card_radius,
         )
     }
@@ -2677,26 +3096,68 @@ impl X11Platform {
         popup: layout::MenuRect,
         row: layout::MenuRect,
     ) -> Result<(), Box<dyn Error>> {
-        self.conn
-            .change_gc(
-                gc,
-                &xproto::ChangeGCAux::new().foreground(
-                    self.glass_surface
-                        .background_pixel(POPUP_STYLE.hover_background),
-                ),
-            )?
-            .check()?;
-        self.conn.poly_fill_rectangle(
+        self.draw_popup_hover_with_pixel(
             window,
             gc,
-            &[xproto::Rectangle {
-                x: row.x - popup.x,
-                y: row.y - popup.y,
-                width: row.width,
-                height: row.height,
-            }],
-        )?;
-        Ok(())
+            popup,
+            row,
+            self.glass_surface
+                .background_pixel(POPUP_STYLE.hover_background),
+        )
+    }
+
+    fn draw_network_popup_hover(
+        &self,
+        window: u32,
+        gc: u32,
+        popup: layout::MenuRect,
+        row: layout::MenuRect,
+    ) -> Result<(), Box<dyn Error>> {
+        self.draw_popup_hover_with_pixel(
+            window,
+            gc,
+            popup,
+            row,
+            network_row_material_pixel(self.glass_surface, POPUP_STYLE.hover_background),
+        )
+    }
+
+    fn draw_menu_popup_hover(
+        &self,
+        window: u32,
+        gc: u32,
+        popup: layout::MenuRect,
+        row: layout::MenuRect,
+    ) -> Result<(), Box<dyn Error>> {
+        self.draw_popup_hover_with_pixel(
+            window,
+            gc,
+            popup,
+            row,
+            network_row_material_pixel(self.glass_surface, POPUP_STYLE.hover_background),
+        )
+    }
+
+    fn draw_popup_hover_with_pixel(
+        &self,
+        window: u32,
+        gc: u32,
+        popup: layout::MenuRect,
+        row: layout::MenuRect,
+        fill_pixel: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        self.conn
+            .change_gc(gc, &xproto::ChangeGCAux::new().foreground(fill_pixel))?
+            .check()?;
+        self.fill_rounded_popup_card_with_radius(
+            window,
+            gc,
+            row.x - popup.x,
+            row.y - popup.y,
+            row.width,
+            row.height,
+            POPUP_STYLE.card_radius,
+        )
     }
 
     fn switch_thumb_rect(rect: layout::MenuRect, enabled: bool) -> layout::MenuRect {
@@ -2729,15 +3190,14 @@ impl X11Platform {
                 &xproto::ChangeGCAux::new().foreground(self.glass_surface.opaque_pixel(track)),
             )?
             .check()?;
-        self.conn.poly_fill_rectangle(
+        self.fill_rounded_popup_card_with_radius(
             window,
             gc,
-            &[xproto::Rectangle {
-                x: rect.x - popup.x,
-                y: rect.y - popup.y,
-                width: rect.width,
-                height: rect.height,
-            }],
+            rect.x - popup.x,
+            rect.y - popup.y,
+            rect.width,
+            rect.height,
+            rect.height / 2,
         )?;
         let thumb = Self::switch_thumb_rect(rect, enabled);
         self.conn
@@ -2749,17 +3209,15 @@ impl X11Platform {
                 ),
             )?
             .check()?;
-        self.conn.poly_fill_rectangle(
+        self.fill_rounded_popup_card_with_radius(
             window,
             gc,
-            &[xproto::Rectangle {
-                x: thumb.x - popup.x,
-                y: thumb.y - popup.y,
-                width: thumb.width,
-                height: thumb.height,
-            }],
-        )?;
-        Ok(())
+            thumb.x - popup.x,
+            thumb.y - popup.y,
+            thumb.width,
+            thumb.height,
+            thumb.height / 2,
+        )
     }
 
     fn fill_glass_background(
@@ -4590,7 +5048,7 @@ impl X11Platform {
         let card_border = self.glass_surface.opaque_pixel(TOAST_STYLE.card_border);
         let rear_material = self
             .glass_surface
-            .opaque_pixel(POPUP_STYLE.material.background.rgb());
+            .background_pixel(POPUP_STYLE.material.background);
         let card_material = notification_card_background(self.glass_surface);
         for card in &cards {
             for rect in card.rear_rects.iter().rev() {
@@ -5044,8 +5502,7 @@ impl X11Platform {
                         backing.gc,
                         *header_rect,
                         self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
-                        self.glass_surface
-                            .background_pixel(POPUP_STYLE.card_background),
+                        self.glass_surface.opaque_pixel(0x2a303a),
                         NOTIFICATION_GROUP_HEADER_RADIUS,
                     )?;
                     self.conn.flush()?;
@@ -5417,8 +5874,7 @@ impl X11Platform {
                 backing.gc,
                 empty_rect,
                 self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
-                self.glass_surface
-                    .background_pixel(POPUP_STYLE.card_background),
+                self.glass_surface.opaque_pixel(0x2a303a),
                 NOTIFICATION_CARD_RADIUS,
             )?;
             self.conn.flush()?;
@@ -6223,9 +6679,10 @@ impl X11Platform {
             .saturating_add(2 * POPUP_STYLE.outer_padding + 64)
             .clamp(300, 520)
             .min(output.width.max(1));
-        let quota_height = 68_u16;
         let height = ai_usage_popup_height(quota_rows.len(), status_lines.len(), output.height);
         let rect = layout::place_bar_popup(anchor, width, height, output).popup_rect;
+        let provider_layout =
+            ai_usage_provider_card_layout(rect, quota_rows.len(), status_lines.len());
         let window = if let Some(popup) = &self.ai_usage_popup {
             popup.window
         } else {
@@ -6304,45 +6761,66 @@ impl X11Platform {
         let gc = backing.gc;
         self.fill_glass_background(backing.pixmap, gc, rect.width, rect.height)?;
         self.draw_popup_frame(backing.pixmap, gc, rect.width, rect.height)?;
-        let card = layout::MenuRect {
-            x: rect.x + POPUP_STYLE.outer_padding as i16,
-            y: rect.y + POPUP_STYLE.outer_padding as i16,
-            width: rect.width.saturating_sub(2 * POPUP_STYLE.outer_padding),
-            height: rect.height.saturating_sub(2 * POPUP_STYLE.outer_padding),
-        };
-        self.draw_popup_card(backing.pixmap, gc, rect, card)?;
-        let content_x = POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding;
-        let content_width = card.width.saturating_sub(2 * POPUP_STYLE.card_padding);
+        self.draw_notification_rounded_panel(
+            backing.pixmap,
+            gc,
+            layout::MenuRect {
+                x: provider_layout.card.x - rect.x,
+                y: provider_layout.card.y - rect.y,
+                width: provider_layout.card.width,
+                height: provider_layout.card.height,
+            },
+            self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+            notification_card_background(self.glass_surface),
+            POPUP_STYLE.card_radius,
+        )?;
         self.text.draw_popup_utf8(
-            &layout::truncate_text_to_width(&header, content_width, &PopupMeasurer(&self.text))
-                .unwrap_or_default(),
-            content_x as i32,
-            (POPUP_STYLE.outer_padding + 24) as i32,
+            &layout::truncate_text_to_width(
+                &header,
+                provider_layout.title.width,
+                &PopupMeasurer(&self.text),
+            )
+            .unwrap_or_default(),
+            (provider_layout.title.x - rect.x) as i32,
+            (provider_layout.title.y - rect.y + 16) as i32,
             BAR_STYLE.material.foreground,
         )?;
-        let mut cursor = POPUP_STYLE.outer_padding + 42;
-        for status in status_lines {
+        for (status, status_rect) in status_lines.iter().zip(&provider_layout.statuses) {
             self.text.draw_popup_utf8(
-                &layout::truncate_text_to_width(&status, content_width, &PopupMeasurer(&self.text))
-                    .unwrap_or_default(),
-                content_x as i32,
-                cursor as i32,
+                &layout::truncate_text_to_width(
+                    status,
+                    status_rect.width,
+                    &PopupMeasurer(&self.text),
+                )
+                .unwrap_or_default(),
+                (status_rect.x - rect.x) as i32,
+                (status_rect.y - rect.y + 15) as i32,
                 0xb9c3d2,
             )?;
-            cursor = cursor.saturating_add(20);
         }
-        for (label, value, reset, percent) in quota_rows {
-            let quota_card = layout::MenuRect {
-                x: card.x + POPUP_STYLE.card_padding as i16,
-                y: rect.y + cursor as i16,
-                width: card.width.saturating_sub(2 * POPUP_STYLE.card_padding),
-                height: 60,
-            };
-            self.draw_popup_card(backing.pixmap, gc, rect, quota_card)?;
+        for ((label, value, reset, percent), quota_card) in
+            quota_rows.into_iter().zip(&provider_layout.quotas)
+        {
+            self.draw_notification_rounded_panel(
+                backing.pixmap,
+                gc,
+                layout::MenuRect {
+                    x: quota_card.x - rect.x,
+                    y: quota_card.y - rect.y,
+                    width: quota_card.width,
+                    height: quota_card.height,
+                },
+                self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                notification_card_background(self.glass_surface),
+                POPUP_STYLE.card_radius,
+            )?;
             let local_x = quota_card.x - rect.x + POPUP_STYLE.card_padding as i16;
+            let value_width = self.text.measure_popup_width(&value);
             let label_width = quota_card
                 .width
-                .saturating_sub(2 * POPUP_STYLE.card_padding);
+                .saturating_sub(POPUP_STYLE.card_padding.saturating_mul(2))
+                .saturating_sub(value_width)
+                .saturating_sub(8);
             let quota_label_result = self.text.draw_popup_utf8(
                 &layout::truncate_text_to_width(&label, label_width, &PopupMeasurer(&self.text))
                     .unwrap_or_default(),
@@ -6351,7 +6829,6 @@ impl X11Platform {
                 BAR_STYLE.material.foreground,
             );
             quota_label_result?;
-            let value_width = self.text.measure_popup_width(&value);
             self.text.draw_popup_utf8(
                 &value,
                 (quota_card.x - rect.x + quota_card.width as i16
@@ -6400,7 +6877,6 @@ impl X11Platform {
                     0x9daabd,
                 )?;
             }
-            cursor = cursor.saturating_add(quota_height);
         }
         self.text.release_drawable(backing.pixmap);
         self.conn
@@ -6437,7 +6913,8 @@ impl X11Platform {
             .ok_or("no output for audio popup")?;
         let output_count = state.audio.outputs.len().min(8);
         let input_count = state.audio.inputs.len().min(8);
-        let content_height = 316 + output_count as u16 * 24 + input_count as u16 * 24;
+        let content_height =
+            AUDIO_CONTENT_BASE_HEIGHT + output_count as u16 * 24 + input_count as u16 * 24;
         let popup_width = 340_u16.min(output.width.max(1));
         let popup_height = content_height
             .max(280)
@@ -6449,57 +6926,41 @@ impl X11Platform {
             x: card_x,
             y: rect.y + POPUP_STYLE.outer_padding as i16,
             width: card_width,
-            height: 92,
+            height: AUDIO_MASTER_CARD_HEIGHT,
         };
         let input_control_card = layout::MenuRect {
             x: card_x,
-            y: rect.y + 112,
+            y: rect.y + AUDIO_MICROPHONE_CARD_TOP,
             width: card_width,
-            height: 104,
+            height: AUDIO_MICROPHONE_CARD_HEIGHT,
         };
         let output_card = layout::MenuRect {
             x: card_x,
-            y: rect.y + 220,
+            y: rect.y + AUDIO_OUTPUT_CARD_TOP,
             width: card_width,
-            height: 29 + output_count as u16 * 24,
+            height: AUDIO_DEVICE_CARD_HEADER_HEIGHT + output_count as u16 * 24,
         };
         let input_card = layout::MenuRect {
             x: card_x,
-            y: output_card.y + output_card.height as i16 + POPUP_STYLE.card_row_gap as i16,
+            y: output_card.y + output_card.height as i16 + AUDIO_SECTION_GAP as i16,
             width: card_width,
-            height: 29 + input_count as u16 * 24,
+            height: AUDIO_DEVICE_CARD_HEADER_HEIGHT + input_count as u16 * 24,
         };
-        let master_content = layout::popup_card_content_rect(master_card);
-        let input_content = layout::popup_card_content_rect(input_control_card);
-        let audio_content_x = master_content.x - rect.x - layout::AUDIO_POPUP_BORDER as i16;
-        let track = layout::MenuRect {
-            x: master_content.x + 38,
-            y: master_content.y + 34,
-            width: 240,
-            height: 22,
-        };
-        let mute = layout::MenuRect {
-            x: master_content.x,
-            y: master_content.y,
-            width: 46,
-            height: 48,
-        };
-        let input_track = layout::MenuRect {
-            x: input_content.x + 38,
-            y: input_content.y + 34,
-            width: 240,
-            height: 22,
-        };
-        let input_mute = layout::MenuRect {
-            x: input_content.x,
-            y: input_content.y,
-            width: 46,
-            height: 48,
-        };
+        let master_layout = audio_control_card_layout(master_card);
+        let input_layout = audio_control_card_layout(input_control_card);
+        let audio_content_x = master_layout.content.x - rect.x - layout::AUDIO_POPUP_BORDER as i16;
+        let track = master_layout.slider;
+        let mute = master_layout.mute_hit;
+        let mute_switch = master_layout.mute_switch;
+        let input_track = input_layout.slider;
+        let input_mute = input_layout.mute_hit;
+        let input_mute_switch = input_layout.mute_switch;
         let output_label_y = (output_card.y - rect.y - layout::AUDIO_POPUP_BORDER as i16
             + POPUP_STYLE.card_padding as i16
             + 14) as i32;
-        let input_label_y = output_label_y + 22 + output_count as i32 * 24;
+        let input_label_y = (input_card.y - rect.y - layout::AUDIO_POPUP_BORDER as i16
+            + POPUP_STYLE.card_padding as i16
+            + 14) as i32;
         let output_devices = layout::audio_device_rows(
             rect,
             &state.audio.outputs,
@@ -6655,8 +7116,34 @@ impl X11Platform {
         self.fill_glass_background(backing.pixmap, gc, rect.width, rect.height)?;
         self.draw_popup_frame(backing.pixmap, gc, rect.width, rect.height)?;
         for card in [master_card, input_control_card, output_card, input_card] {
-            self.draw_popup_card(backing.pixmap, gc, rect, card)?;
+            self.draw_notification_rounded_panel(
+                backing.pixmap,
+                gc,
+                layout::MenuRect {
+                    x: card.x - rect.x,
+                    y: card.y - rect.y,
+                    width: card.width,
+                    height: card.height,
+                },
+                self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                self.glass_surface.opaque_pixel(0x2a303a),
+                POPUP_STYLE.card_radius,
+            )?;
         }
+        self.draw_switch(
+            backing.pixmap,
+            gc,
+            rect,
+            mute_switch,
+            audio_mute_switch_enabled(state.audio.muted),
+        )?;
+        self.draw_switch(
+            backing.pixmap,
+            gc,
+            rect,
+            input_mute_switch,
+            audio_mute_switch_enabled(state.audio.input_muted),
+        )?;
         for device in &output_devices {
             if matches!(
                 self.popup_hover,
@@ -6678,17 +7165,13 @@ impl X11Platform {
         self.text.draw_popup_utf8(
             "Som",
             audio_content_x as i32,
-            (master_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 14) as i32,
+            (master_layout.title_baseline - rect.y - layout::AUDIO_POPUP_BORDER as i16) as i32,
             BAR_STYLE.material.foreground,
         )?;
         self.text.draw_popup_utf8(
-            &format!(
-                "{}   {}%",
-                view::audio_glyph(&state.audio),
-                state.audio.volume_percent
-            ),
-            audio_content_x as i32,
-            (master_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 40) as i32,
+            &format!("{}%", state.audio.volume_percent),
+            (mute_switch.x - rect.x + AUDIO_MUTE_SWITCH_WIDTH as i16 + 8) as i32,
+            (master_layout.percent_baseline - rect.y - layout::AUDIO_POPUP_BORDER as i16) as i32,
             BAR_STYLE.material.foreground,
         )?;
         self.text.draw_popup_utf8(
@@ -6743,23 +7226,19 @@ impl X11Platform {
         self.text.draw_popup_utf8(
             "Mudo",
             audio_content_x as i32,
-            (master_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 82) as i32,
+            (master_layout.mute_label_baseline - rect.y - layout::AUDIO_POPUP_BORDER as i16) as i32,
             BAR_STYLE.material.foreground,
         )?;
         self.text.draw_popup_utf8(
             "Microfone",
             audio_content_x as i32,
-            (input_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 14) as i32,
+            (input_layout.title_baseline - rect.y - layout::AUDIO_POPUP_BORDER as i16) as i32,
             BAR_STYLE.material.foreground,
         )?;
         self.text.draw_popup_utf8(
-            &format!(
-                "{}   {}%",
-                view::microphone_glyph(&state.audio),
-                state.audio.input_volume_percent
-            ),
-            audio_content_x as i32,
-            (input_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 40) as i32,
+            &format!("{}%", state.audio.input_volume_percent),
+            (input_mute_switch.x - rect.x + AUDIO_MUTE_SWITCH_WIDTH as i16 + 8) as i32,
+            (input_layout.percent_baseline - rect.y - layout::AUDIO_POPUP_BORDER as i16) as i32,
             BAR_STYLE.material.foreground,
         )?;
         self.draw_audio_slider(
@@ -6771,7 +7250,7 @@ impl X11Platform {
         self.text.draw_popup_utf8(
             "Mudo",
             audio_content_x as i32,
-            (input_content.y - rect.y - layout::AUDIO_POPUP_BORDER as i16 + 82) as i32,
+            (input_layout.mute_label_baseline - rect.y - layout::AUDIO_POPUP_BORDER as i16) as i32,
             BAR_STYLE.material.foreground,
         )?;
         self.text.release_drawable(backing.pixmap);
@@ -6837,31 +7316,39 @@ impl X11Platform {
             .iter()
             .filter(|d| d.connected || d.paired)
             .collect();
+        let manager_configured = state
+            .bluetooth_manager_command
+            .as_ref()
+            .is_some_and(|argv| {
+                argv.first()
+                    .is_some_and(|executable| !executable.is_empty())
+            });
         let popup_width = 330_u16.min(output.width.max(1));
-        let popup_height = (72_u32
-            .saturating_add(
-                u32::try_from(devices.len())
-                    .unwrap_or(u32::MAX)
-                    .saturating_mul(30),
-            )
-            .min(u32::from(u16::MAX)) as u16)
-            .min(output.height.saturating_sub(26).max(1));
-        devices.truncate(usize::from(popup_height.saturating_sub(72) / 30));
+        let max_popup_height = output.height.saturating_sub(26).max(1);
+        let visible_count = (0..=devices.len())
+            .rev()
+            .find(|count| bluetooth_popup_height(*count, manager_configured) <= max_popup_height)
+            .unwrap_or(0);
+        devices.truncate(visible_count);
+        let popup_height = bluetooth_popup_height(devices.len(), manager_configured)
+            .min(max_popup_height)
+            .max(1);
         let rect = layout::place_bar_popup(anchor, popup_width, popup_height, output).popup_rect;
+        let bluetooth_layout = bluetooth_popup_layout(rect, devices.len(), manager_configured);
         let power = layout::MenuRect {
-            x: rect.x + rect.width as i16
-                - POPUP_STYLE.outer_padding as i16
+            x: bluetooth_layout.header.x + bluetooth_layout.header.width as i16
                 - POPUP_STYLE.card_padding as i16
                 - 46,
-            y: rect.y + POPUP_STYLE.outer_padding as i16 + POPUP_STYLE.card_padding as i16,
+            y: bluetooth_layout.header.y + POPUP_STYLE.card_padding as i16,
             width: 46,
             height: 22,
         };
         let rows: Vec<_> = devices
             .iter()
             .enumerate()
-            .map(|(i, d)| (d.path.clone(), layout::bluetooth_device_row(rect, i)))
+            .map(|(i, d)| (d.path.clone(), bluetooth_layout.rows[i]))
             .collect();
+        let manager = bluetooth_layout.action;
         let window = if let Some(p) = &self.bluetooth_popup {
             p.window
         } else {
@@ -6888,6 +7375,7 @@ impl X11Platform {
             rect,
             power,
             devices: rows.clone(),
+            manager,
         });
         let backing_replaced = !backing_matches(
             self.bluetooth_backing,
@@ -6981,17 +7469,65 @@ impl X11Platform {
         let gc = backing.gc;
         self.fill_glass_background(backing.pixmap, gc, rect.width, rect.height)?;
         self.draw_popup_frame(backing.pixmap, gc, rect.width, rect.height)?;
-        self.draw_popup_card(
+        self.draw_notification_rounded_panel(
             backing.pixmap,
             gc,
-            rect,
             layout::MenuRect {
-                x: rect.x + POPUP_STYLE.outer_padding as i16,
-                y: rect.y + POPUP_STYLE.outer_padding as i16,
-                width: rect.width.saturating_sub(POPUP_STYLE.outer_padding * 2),
-                height: rect.height.saturating_sub(POPUP_STYLE.outer_padding * 2),
+                x: bluetooth_layout.header.x - rect.x,
+                y: bluetooth_layout.header.y - rect.y,
+                width: bluetooth_layout.header.width,
+                height: bluetooth_layout.header.height,
             },
+            self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+            notification_card_background(self.glass_surface),
+            POPUP_STYLE.card_radius,
         )?;
+        self.draw_notification_rounded_panel(
+            backing.pixmap,
+            gc,
+            layout::MenuRect {
+                x: bluetooth_layout.collection.x - rect.x,
+                y: bluetooth_layout.collection.y - rect.y,
+                width: bluetooth_layout.collection.width,
+                height: bluetooth_layout.collection.height,
+            },
+            self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+            notification_card_background(self.glass_surface),
+            POPUP_STYLE.card_radius,
+        )?;
+        for (_, row) in &rows {
+            self.draw_notification_rounded_panel(
+                backing.pixmap,
+                gc,
+                layout::MenuRect {
+                    x: row.x - rect.x,
+                    y: row.y - rect.y,
+                    width: row.width,
+                    height: row.height,
+                },
+                self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                network_row_material_pixel(self.glass_surface, POPUP_STYLE.card_background),
+                POPUP_STYLE.card_radius,
+            )?;
+        }
+        if let Some(action) = manager {
+            self.draw_notification_rounded_panel(
+                backing.pixmap,
+                gc,
+                layout::MenuRect {
+                    x: action.x - rect.x,
+                    y: action.y - rect.y,
+                    width: action.width,
+                    height: action.height,
+                },
+                self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                network_row_material_pixel(self.glass_surface, POPUP_STYLE.card_background),
+                POPUP_STYLE.card_radius,
+            )?;
+            if matches!(self.popup_hover, Some(PopupHover::BluetoothManager)) {
+                self.draw_network_popup_hover(backing.pixmap, gc, rect, action)?;
+            }
+        }
         if matches!(self.popup_hover, Some(PopupHover::BluetoothPower)) {
             self.draw_popup_hover(backing.pixmap, gc, rect, power)?;
         }
@@ -7000,27 +7536,27 @@ impl X11Platform {
                 self.popup_hover,
                 Some(PopupHover::BluetoothDevice(ref hovered)) if hovered == path
             ) {
-                self.draw_popup_hover(backing.pixmap, gc, rect, *device)?;
+                self.draw_network_popup_hover(backing.pixmap, gc, rect, *device)?;
             }
         }
         self.draw_switch(backing.pixmap, gc, rect, power, state.bluetooth.powered)?;
         self.conn.flush()?;
         self.conn.get_input_focus()?.reply()?;
+        let header_content = layout::popup_card_content_rect(bluetooth_layout.header);
         self.text.draw_popup_utf8(
             "Bluetooth",
-            (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding - POPUP_STYLE.border_width)
-                as i32,
-            35,
+            (header_content.x - rect.x) as i32,
+            (header_content.y - rect.y + 14) as i32,
             BAR_STYLE.material.foreground,
         )?;
         self.text.draw_popup_utf8(
             "Dispositivos",
-            (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding - POPUP_STYLE.border_width)
-                as i32,
-            59,
+            (bluetooth_layout.section.x - rect.x) as i32,
+            (bluetooth_layout.section.y - rect.y
+                + self.text.popup_baseline(bluetooth_layout.section.height)) as i32,
             BAR_STYLE.material.foreground,
         )?;
-        for (i, d) in devices.iter().enumerate() {
+        for ((_, row), d) in rows.iter().zip(&devices) {
             let name = if !d.alias.is_empty() {
                 &d.alias
             } else if !d.name.is_empty() {
@@ -7028,7 +7564,6 @@ impl X11Platform {
             } else {
                 &d.address
             };
-            let marker = if d.connected { "✓" } else { " " };
             let status = state
                 .bluetooth_pending
                 .iter()
@@ -7045,22 +7580,45 @@ impl X11Platform {
                 })
                 .unwrap_or(if d.connected { "Connected" } else { "Paired" });
             let status_width = self.text.measure_popup_width(status);
-            let name_width = popup_width
-                .saturating_sub(
-                    POPUP_STYLE
-                        .outer_padding
-                        .saturating_add(POPUP_STYLE.card_padding)
-                        .saturating_mul(2),
-                )
+            let row_padding = POPUP_STYLE.card_padding;
+            let marker_width = if d.connected { 16 } else { 0 };
+            let name_width = row
+                .width
+                .saturating_sub(row_padding.saturating_mul(2))
                 .saturating_sub(status_width)
-                .saturating_sub(24);
+                .saturating_sub(marker_width)
+                .saturating_sub(8);
             let name = layout::truncate_text_to_width(name, name_width, &PopupMeasurer(&self.text))
                 .unwrap_or_default();
+            let baseline = (row.y - rect.y + self.text.popup_baseline(row.height)) as i32;
+            let name_x = row.x - rect.x + row_padding as i16 + marker_width as i16;
+            if d.connected {
+                self.text.draw_popup_utf8(
+                    "✓",
+                    (row.x - rect.x + row_padding as i16) as i32,
+                    baseline,
+                    BAR_STYLE.material.foreground,
+                )?;
+            }
             self.text.draw_popup_utf8(
-                &format!("{marker} {name} {status}"),
-                (POPUP_STYLE.outer_padding + POPUP_STYLE.card_padding - POPUP_STYLE.border_width)
+                &name,
+                name_x as i32,
+                baseline,
+                BAR_STYLE.material.foreground,
+            )?;
+            self.text.draw_popup_utf8(
+                status,
+                (row.x - rect.x + row.width as i16 - row_padding as i16 - status_width as i16)
                     as i32,
-                81 + i as i32 * 30,
+                baseline,
+                BAR_STYLE.material.foreground,
+            )?;
+        }
+        if let Some(action) = manager {
+            self.text.draw_popup_utf8(
+                BLUETOOTH_MANAGER_LABEL,
+                (action.x - rect.x + POPUP_STYLE.card_padding as i16) as i32,
+                (action.y - rect.y + self.text.popup_baseline(action.height)) as i32,
                 BAR_STYLE.material.foreground,
             )?;
         }
@@ -7279,9 +7837,33 @@ impl X11Platform {
         let gc = backing.gc;
         self.fill_glass_background(backing.pixmap, gc, rect.width, rect.height)?;
         self.draw_popup_frame(backing.pixmap, gc, rect.width, rect.height)?;
-        self.draw_popup_card(backing.pixmap, gc, rect, status_card)?;
+        self.draw_notification_rounded_panel(
+            backing.pixmap,
+            gc,
+            layout::MenuRect {
+                x: status_card.x - rect.x,
+                y: status_card.y - rect.y,
+                width: status_card.width,
+                height: status_card.height,
+            },
+            self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+            notification_card_background(self.glass_surface),
+            POPUP_STYLE.card_radius,
+        )?;
         for interface in &network_layout.interfaces {
-            self.draw_popup_card(backing.pixmap, gc, rect, interface.card)?;
+            self.draw_notification_rounded_panel(
+                backing.pixmap,
+                gc,
+                layout::MenuRect {
+                    x: interface.card.x - rect.x,
+                    y: interface.card.y - rect.y,
+                    width: interface.card.width,
+                    height: interface.card.height,
+                },
+                self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                notification_card_background(self.glass_surface),
+                POPUP_STYLE.card_radius,
+            )?;
         }
         let wireless_label = state
             .network_pending
@@ -7312,19 +7894,25 @@ impl X11Platform {
             state.network.wireless_enabled,
         )?;
         for (target, row) in &rows {
+            self.draw_notification_rounded_panel(
+                backing.pixmap,
+                gc,
+                layout::MenuRect {
+                    x: row.x - rect.x,
+                    y: row.y - rect.y,
+                    width: row.width,
+                    height: row.height,
+                },
+                self.glass_surface.opaque_pixel(POPUP_STYLE.card_border),
+                network_row_material_pixel(self.glass_surface, POPUP_STYLE.card_background),
+                POPUP_STYLE.card_radius,
+            )?;
             if matches!(
                 self.popup_hover,
                 Some(PopupHover::NetworkWifi(ref hovered)) if hovered == target
             ) {
-                self.draw_popup_hover(backing.pixmap, gc, rect, *row)?;
+                self.draw_network_popup_hover(backing.pixmap, gc, rect, *row)?;
             }
-            let button = layout::MenuRect {
-                x: row.x + row.width as i16 - 78,
-                y: row.y + 4,
-                width: 68,
-                height: row.height.saturating_sub(8),
-            };
-            self.draw_popup_card(backing.pixmap, gc, rect, button)?;
         }
         self.conn.flush()?;
         self.conn.get_input_focus()?.reply()?;
@@ -7386,17 +7974,10 @@ impl X11Platform {
                         && crate::core::wifi_band(access_point.frequency) == target.band
                 })
                 .expect("network popup row has matching access point");
-            let button = layout::MenuRect {
-                x: row.x + row.width as i16 - 78,
-                y: row.y + 4,
-                width: 68,
-                height: row.height.saturating_sub(8),
-            };
-            let label_width = button
-                .x
-                .saturating_sub(row.x)
-                .saturating_sub(card_padding)
-                .saturating_sub(4) as u16;
+            let label_width = row
+                .width
+                .saturating_sub(card_padding as u16 * 2)
+                .saturating_sub(24);
             let label = layout::truncate_text_to_width(
                 &network_primary_row_label(&access_point.ssid, access_point.is_active),
                 label_width,
@@ -7411,8 +7992,8 @@ impl X11Platform {
             )?;
             self.text.draw_popup_utf8(
                 if access_point.is_active { "✓" } else { "↗" },
-                (button.x - rect.x + 25) as i32,
-                (button.y - rect.y + self.text.popup_baseline(button.height)) as i32,
+                (row.x - rect.x + row.width as i16 - card_padding - 18) as i32,
+                (row.y - rect.y + self.text.popup_baseline(row.height)) as i32,
                 BAR_STYLE.material.foreground,
             )?;
         }
@@ -7465,16 +8046,7 @@ impl X11Platform {
                 &xproto::ChangeGCAux::new().foreground(self.glass_surface.opaque_pixel(0x596273)),
             )?
             .check()?;
-        self.conn.poly_fill_rectangle(
-            window,
-            gc,
-            &[xproto::Rectangle {
-                x,
-                y,
-                width: width as u16,
-                height: 4,
-            }],
-        )?;
+        self.fill_rounded_popup_card_with_radius(window, gc, x, y, width as u16, 4, 2)?;
         self.conn
             .change_gc(
                 gc,
@@ -7485,26 +8057,18 @@ impl X11Platform {
             )?
             .check()?;
         let fill = (width as u32 * percent.min(100) / 100) as u16;
-        self.conn.poly_fill_rectangle(
+        self.fill_rounded_popup_card_with_radius(window, gc, x, y, fill, 4, 2)?;
+        let thumb_size = 12_u16;
+        let thumb_x =
+            (x + fill as i16 - (thumb_size / 2) as i16).clamp(x, x + width - thumb_size as i16);
+        self.fill_rounded_popup_card_with_radius(
             window,
             gc,
-            &[xproto::Rectangle {
-                x,
-                y,
-                width: fill,
-                height: 4,
-            }],
-        )?;
-        let thumb_x = x + fill as i16 - 4;
-        self.conn.poly_fill_rectangle(
-            window,
-            gc,
-            &[xproto::Rectangle {
-                x: thumb_x,
-                y: y - 4,
-                width: 8,
-                height: 12,
-            }],
+            thumb_x,
+            y - 4,
+            thumb_size,
+            thumb_size,
+            thumb_size / 2,
         )?;
         Ok(())
     }
@@ -7615,7 +8179,7 @@ impl X11Platform {
                 };
                 anchor = previous.rect;
             }
-            let popup_layout = layout::popup_layout_with_measurer(
+            let popup_layout = global_menu_popup_layout_with_measurer(
                 output,
                 parent,
                 anchor,
@@ -7796,7 +8360,7 @@ impl X11Platform {
                 }
                 let hovered = state.menu_interaction.hovered_path.last() == Some(&item.id);
                 if hovered {
-                    self.draw_popup_hover(backing.pixmap, gc, popup_layout.rect, item.rect)?;
+                    self.draw_menu_popup_hover(backing.pixmap, gc, popup_layout.rect, item.rect)?;
                     self.conn
                         .change_gc(
                             gc,
@@ -7843,13 +8407,12 @@ impl X11Platform {
                     let width = self.text.measure_popup_width(shortcut);
                     self.text.draw_popup_utf8(
                         shortcut,
-                        popup_layout
-                            .rect
-                            .x
-                            .saturating_sub(popup_layout.rect.x)
-                            .saturating_add(item.rect.width as i16)
-                            .saturating_sub((POPUP_STYLE.row_horizontal_padding + width) as i16)
-                            as i32,
+                        menu_accelerator_x(
+                            popup_layout.rect,
+                            item.rect,
+                            width,
+                            popup_layout.items.iter().any(|entry| entry.has_submenu),
+                        ) as i32,
                         (item.rect.y - popup_layout.rect.y) as i32
                             + self.text.popup_baseline(POPUP_STYLE.row_height) as i32,
                         color,
@@ -8248,6 +8811,9 @@ impl X11Platform {
                 if let Some((path, _)) = popup.devices.iter().find(|(_, r)| r.contains(rx, ry)) {
                     return HitTarget::BluetoothDevice(path.clone());
                 }
+                if popup.manager.is_some_and(|rect| rect.contains(rx, ry)) {
+                    return HitTarget::BluetoothManager;
+                }
                 return HitTarget::BluetoothInside;
             }
         }
@@ -8348,6 +8914,7 @@ fn popup_hover_for(target: Option<&HitTarget>) -> Option<PopupHover> {
         Some(HitTarget::AudioInputDevice(name)) => Some(PopupHover::AudioInputDevice(name.clone())),
         Some(HitTarget::BluetoothPower) => Some(PopupHover::BluetoothPower),
         Some(HitTarget::BluetoothDevice(path)) => Some(PopupHover::BluetoothDevice(path.clone())),
+        Some(HitTarget::BluetoothManager) => Some(PopupHover::BluetoothManager),
         Some(HitTarget::NetworkWifi(target)) => Some(PopupHover::NetworkWifi(target.clone())),
         Some(HitTarget::NetworkWireless) => Some(PopupHover::NetworkWireless),
         _ => None,
@@ -8505,7 +9072,21 @@ fn notification_card_text(
 }
 
 fn notification_card_background(surface: SurfaceVisual) -> u32 {
-    surface.opaque_pixel(POPUP_STYLE.card_background.rgb())
+    surface.opaque_pixel(0x2a303a)
+}
+
+fn network_row_material_pixel(surface: SurfaceVisual, color: style::Rgba) -> u32 {
+    let card = style::Rgba::opaque_rgb(0x2a303a);
+    let alpha = u32::from(color.alpha);
+    let inverse_alpha = u32::from(u8::MAX - color.alpha);
+    let precomposed = |foreground: u8, background: u8| {
+        ((u32::from(foreground) * alpha + u32::from(background) * inverse_alpha + 127) / 255) as u8
+    };
+    surface.opaque_pixel(
+        (u32::from(precomposed(color.red, card.red)) << 16)
+            | (u32::from(precomposed(color.green, card.green)) << 8)
+            | u32::from(precomposed(color.blue, card.blue)),
+    )
 }
 
 fn is_xbar_owned_window(
@@ -8529,29 +9110,29 @@ mod tests {
         backing_matches, bar_backing_matches, blur_behind_rect, classify_attention_property_reply,
         classify_property_string_reply, effect_owner_property_value, effect_owner_update,
         format_cache_age, format_reset_at, frame_policy_property_value, install_passive_grabs,
-        is_xbar_owned_window, menu_popup_dirty_for_interaction_change, menu_popup_slot_for_window,
-        menu_popup_slots_for_item, network_primary_row_label, notification_body_hit,
-        notification_history_id_for, notification_hover_transition, notification_indicator_hit,
-        notification_indicator_rect, notification_previous_scroll, notification_scroll_target,
-        notification_wheel_direction, popup_effect_owner, popup_hover_for, popup_hover_transition,
-        popup_slot_is_selected, preserve_color_pixel, raw_button_press_event,
-        reconcile_notification_scroll, reconcile_toast_stack, reconcile_toast_stack_candidates,
-        reconcile_toast_stack_grouped, template_icon_pixel, toast_members_that_fit,
-        toast_presentation_items, tray_draw_size, tray_hit, union_menu_rects,
-        AttentionPropertyRead, BarBacking, BarWindow, EffectOwnerUpdate, GlobalPinShortcut,
-        HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot, PopupWindow, RenderTarget,
-        SurfaceWindowGeometry, ToastFitItem, X11Event, X11Platform, AI_USAGE_POPUP_MIN_HEIGHT,
+        is_xbar_owned_window, menu_accelerator_x, menu_popup_dirty_for_interaction_change,
+        menu_popup_slot_for_window, menu_popup_slots_for_item, network_primary_row_label,
+        notification_body_hit, notification_history_id_for, notification_hover_transition,
+        notification_indicator_hit, notification_indicator_rect, notification_previous_scroll,
+        notification_scroll_target, notification_wheel_direction, popup_effect_owner,
+        popup_hover_for, popup_hover_transition, popup_slot_is_selected, preserve_color_pixel,
+        raw_button_press_event, reconcile_notification_scroll, reconcile_toast_stack,
+        reconcile_toast_stack_candidates, reconcile_toast_stack_grouped, template_icon_pixel,
+        toast_members_that_fit, toast_presentation_items, tray_draw_size, tray_hit,
+        union_menu_rects, AttentionPropertyRead, BarBacking, BarWindow, EffectOwnerUpdate,
+        GlobalPinShortcut, HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot,
+        PopupWindow, RenderTarget, SurfaceWindowGeometry, ToastFitItem, X11Event, X11Platform,
         BAR_HEIGHT, NOTIFICATION_CARD_SLOT_GAP, NOTIFICATION_GROUP_INTERNAL_GAP,
         NOTIFICATION_OUTER_PADDING, XOMPOSITE_FRAME_POLICY_ATOM_NAME,
     };
     use crate::core::{
-        HistoryEntryId, MenuItemId, NotificationActionProjection, NotificationActionView,
-        NotificationHistoryEntry, NotificationSource, OutputId, OutputState,
-        StatusNotifierEndpoint, StatusNotifierIcon,
+        ChildrenDisplay, HistoryEntryId, MenuItem, MenuItemId, MenuItemType,
+        NotificationActionProjection, NotificationActionView, NotificationHistoryEntry,
+        NotificationSource, OutputId, OutputState, StatusNotifierEndpoint, StatusNotifierIcon,
     };
     use crate::ui::{
         layout::{MenuRect, PopupItemRect, PopupLayout},
-        style,
+        style::{self, FontMetrics, TextMeasurer},
         view::TrayIconRenderMode,
         view::TrayVisualItem,
     };
@@ -8561,6 +9142,208 @@ mod tests {
     use x11rb::protocol::xproto::{EventMask, ModMask};
     use x11rb::protocol::{xproto, ErrorKind};
     use x11rb::x11_utils::X11Error;
+
+    struct FixedWidthMeasurer;
+
+    impl TextMeasurer for FixedWidthMeasurer {
+        fn measure_width(&self, text: &str) -> u16 {
+            text.len().saturating_mul(8).min(u16::MAX as usize) as u16
+        }
+
+        fn metrics(&self) -> FontMetrics {
+            FontMetrics {
+                ascent: 12,
+                descent: 4,
+            }
+        }
+    }
+
+    fn menu_test_item(id: i32, label: &str, shortcut: Option<&str>, submenu: bool) -> MenuItem {
+        MenuItem {
+            id: MenuItemId(id),
+            label: Some(label.to_owned()),
+            enabled: true,
+            visible: true,
+            item_type: MenuItemType::Standard,
+            children_display: submenu.then_some(ChildrenDisplay::Submenu),
+            shortcut: shortcut.map(|text| crate::core::MenuShortcut {
+                keys: vec![text.split('+').map(str::to_owned).collect()],
+            }),
+            icon_name: None,
+            action: None,
+            children: if submenu {
+                vec![MenuItem {
+                    id: MenuItemId(id + 100),
+                    label: Some("child".into()),
+                    enabled: true,
+                    visible: true,
+                    item_type: MenuItemType::Standard,
+                    children_display: None,
+                    shortcut: None,
+                    icon_name: None,
+                    action: None,
+                    children: Vec::new(),
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    #[test]
+    fn global_menu_columns_keep_accelerators_and_arrows_separate() {
+        let parent = MenuItem {
+            id: MenuItemId(1),
+            label: None,
+            enabled: true,
+            visible: true,
+            item_type: MenuItemType::Standard,
+            children_display: None,
+            shortcut: None,
+            icon_name: None,
+            action: None,
+            children: vec![
+                menu_test_item(2, "Extensões e temas", Some("Control+Shift+a"), false),
+                menu_test_item(3, "Gerenciador de tarefas", Some("Shift+Escape"), true),
+            ],
+        };
+        let output = OutputState {
+            id: OutputId(1),
+            name: "test".into(),
+            x: 0,
+            y: 0,
+            width: 1200,
+            height: 900,
+        };
+        let popup = super::global_menu_popup_layout_with_measurer(
+            &output,
+            &parent,
+            MenuRect {
+                x: 100,
+                y: 26,
+                width: 120,
+                height: 60,
+            },
+            false,
+            &FixedWidthMeasurer,
+        );
+        assert!(popup.rect.width > 120);
+        assert_eq!(popup.items[0].label, "Extensões e temas");
+        assert_eq!(popup.items[0].shortcut.as_deref(), Some("Control+Shift+a"));
+        assert!(popup.items[1].has_submenu);
+        assert_eq!(popup.items[0].rect.width, popup.items[1].rect.width);
+        let content = popup.content_rect();
+        let reserved = super::MENU_ACCELERATOR_GAP
+            + super::MENU_SUBMENU_ARROW_ZONE
+            + super::MENU_ACCELERATOR_ARROW_GAP;
+        assert!(content.width >= reserved + 12 + 8);
+        assert_eq!(super::MENU_ACCELERATOR_GAP, 12);
+    }
+
+    #[test]
+    fn tray_command_accelerator_keeps_content_inset_and_history_width_independent() {
+        let popup = MenuRect {
+            x: 100,
+            y: 40,
+            width: 650,
+            height: 240,
+        };
+        let command = PopupItemRect {
+            id: MenuItemId(10),
+            rect: MenuRect {
+                x: popup.x + 12,
+                y: popup.y + 12,
+                width: 626,
+                height: 28,
+            },
+            label: "Alternar Armazenamento da Área de Transferência".into(),
+            enabled: true,
+            separator: false,
+            has_submenu: false,
+            shortcut: Some("Control+Shift+X".into()),
+        };
+        let label_width = FixedWidthMeasurer.measure_width(&command.label);
+        let accelerator_width =
+            FixedWidthMeasurer.measure_width(command.shortcut.as_deref().expect("accelerator"));
+        let label_right = command.rect.x - popup.x
+            + style::POPUP_STYLE.row_horizontal_padding as i16
+            + label_width as i16;
+        let accelerator_x = menu_accelerator_x(popup, command.rect, accelerator_width, false);
+        assert!(accelerator_x >= label_right + 12);
+        assert!(
+            command.rect.width >= accelerator_width + style::POPUP_STYLE.row_horizontal_padding * 2
+        );
+        let visual_rect = command.rect;
+        let hit_rect = command.rect;
+        assert_eq!(visual_rect, hit_rect);
+        assert_eq!(tray_draw_size(100, 100), (14, 14));
+    }
+
+    #[test]
+    fn r13_audio_cards_are_content_driven_with_shared_layout_authority() {
+        assert_eq!(super::AUDIO_CARD_TOP_PADDING, 10);
+        assert_eq!(super::AUDIO_CARD_BOTTOM_PADDING, 10);
+        assert_eq!(super::AUDIO_CARD_ROW_GAP, 4);
+        assert_eq!(super::AUDIO_CARD_TEXT_ROW_HEIGHT, 20);
+        assert_eq!(super::AUDIO_CARD_CONTROL_ROW_HEIGHT, 22);
+        assert_eq!(super::audio_control_card_height(), 116);
+        assert_eq!(super::AUDIO_MASTER_CARD_HEIGHT, 116);
+        assert_eq!(super::AUDIO_MICROPHONE_CARD_HEIGHT, 116);
+        assert_eq!(super::AUDIO_CONTENT_BASE_HEIGHT, 332);
+        assert_eq!(super::AUDIO_SECTION_GAP, 10);
+
+        let popup_y = 60_i16;
+        let microphone_y = popup_y + super::AUDIO_MICROPHONE_CARD_TOP;
+        let output_y = popup_y + super::AUDIO_OUTPUT_CARD_TOP;
+        assert_eq!(microphone_y, popup_y + 12 + 116 + 4);
+        assert_eq!(output_y, microphone_y + 116 + 4);
+        assert_eq!(output_y - (microphone_y + 116), 4);
+
+        let card = MenuRect {
+            x: 100,
+            y: 120,
+            width: 300,
+            height: 116,
+        };
+        let layout = super::audio_control_card_layout(card);
+        assert_eq!(layout.title_baseline, 144);
+        assert_eq!(layout.mute_hit.y, 154);
+        assert_eq!(
+            layout.mute_switch,
+            MenuRect {
+                x: 110,
+                y: 154,
+                width: 46,
+                height: 22
+            }
+        );
+        assert_eq!(layout.percent_baseline, 170);
+        assert_eq!(
+            layout.slider,
+            MenuRect {
+                x: 148,
+                y: 180,
+                width: 240,
+                height: 22
+            }
+        );
+        assert_eq!(layout.mute_label_baseline, 220);
+        assert_eq!(card.y + card.height as i16 - layout.mute_label_baseline, 16);
+        assert_eq!(super::AUDIO_MUTE_HIT_WIDTH, 46);
+        assert_eq!(super::AUDIO_MUTE_HIT_HEIGHT, 48);
+        assert_eq!(layout.mute_switch.width, super::AUDIO_MUTE_SWITCH_WIDTH);
+        assert_eq!(layout.mute_switch.height, super::AUDIO_MUTE_SWITCH_HEIGHT);
+        assert_eq!(
+            super::X11Platform::switch_thumb_rect(layout.mute_switch, false).width,
+            16
+        );
+        assert_eq!(
+            super::X11Platform::switch_thumb_rect(layout.mute_switch, true).width,
+            16
+        );
+        assert!(super::audio_mute_switch_enabled(true));
+        assert!(!super::audio_mute_switch_enabled(false));
+    }
 
     #[test]
     fn xinput_raw_button_press_is_an_observational_x11_event() {
@@ -9100,15 +9883,59 @@ mod tests {
 
     #[test]
     fn ai_usage_height_is_minimum_content_driven_and_output_bounded() {
-        let two_quotas = ai_usage_popup_height(2, 0, 1080);
-        assert_eq!(two_quotas, AI_USAGE_POPUP_MIN_HEIGHT);
-        assert!(two_quotas >= 280);
+        assert_eq!(super::ai_usage_provider_card_height(1, 0), 114);
+        assert_eq!(super::ai_usage_provider_card_height(2, 0), 178);
+        assert_eq!(ai_usage_popup_height(1, 0, 1080), 138);
+        assert_eq!(ai_usage_popup_height(2, 0, 1080), 202);
+        assert_eq!(ai_usage_popup_height(3, 0, 1080), 266);
 
-        assert_eq!(
-            ai_usage_popup_height(2, 0, 300),
-            300_u16.saturating_sub(BAR_HEIGHT).max(1)
-        );
+        assert_eq!(ai_usage_popup_height(2, 0, 300), 202);
         assert_eq!(ai_usage_popup_height(0, 0, BAR_HEIGHT), 1);
+    }
+
+    #[test]
+    fn ai_usage_provider_layout_has_no_trailing_quota_space() {
+        let popup = MenuRect {
+            x: 100,
+            y: 200,
+            width: 340,
+            height: ai_usage_popup_height(2, 0, 1080),
+        };
+        let layout = super::ai_usage_provider_card_layout(popup, 2, 0);
+        assert_eq!(layout.card.height, 178);
+        assert_eq!(layout.title.y, layout.card.y + 10);
+        assert_eq!(layout.quotas.len(), 2);
+        assert_eq!(layout.quotas[0].y, layout.card.y + 44);
+        assert_eq!(layout.quotas[1].y - layout.quotas[0].y, 64);
+        assert_eq!(
+            layout.quotas[1].y + layout.quotas[1].height as i16,
+            layout.card.y + layout.card.height as i16 - 10
+        );
+    }
+
+    #[test]
+    fn ai_usage_cards_and_progress_use_opaque_materials() {
+        let surface = super::SurfaceVisual::argb(
+            1,
+            2,
+            super::DirectPixelFormat {
+                red_shift: 16,
+                red_mask: 0xff,
+                green_shift: 8,
+                green_mask: 0xff,
+                blue_shift: 0,
+                blue_mask: 0xff,
+                alpha_shift: 24,
+                alpha_mask: 0xff,
+            },
+        );
+        assert_eq!(
+            super::notification_card_background(surface),
+            surface.opaque_pixel(0x2a303a)
+        );
+        assert_eq!(surface.opaque_pixel(0x47515f) >> 24, 0xff);
+        assert_eq!(surface.opaque_pixel(0x8fb3ff) >> 24, 0xff);
+        assert_eq!(super::POPUP_STYLE.material.background.alpha, 0x98);
     }
 
     #[test]
@@ -9976,12 +10803,223 @@ mod tests {
     }
 
     #[test]
-    fn r3_notification_cards_use_opaque_existing_card_material() {
-        let surface = super::super::surface::SurfaceVisual::default(0x21, 24, 0x31);
+    fn notification_cards_use_opaque_card_material() {
+        let surface = super::super::surface::SurfaceVisual::argb(
+            1,
+            2,
+            super::DirectPixelFormat {
+                red_shift: 16,
+                red_mask: 0xff,
+                green_shift: 8,
+                green_mask: 0xff,
+                blue_shift: 0,
+                blue_mask: 0xff,
+                alpha_shift: 24,
+                alpha_mask: 0xff,
+            },
+        );
+        assert_eq!(super::notification_card_background(surface) >> 24, 0xff);
+    }
+
+    #[test]
+    fn network_ap_rows_are_precomposed_opaque_and_keep_state_contrast() {
+        let surface = super::super::surface::SurfaceVisual::argb(
+            1,
+            2,
+            super::DirectPixelFormat {
+                red_shift: 16,
+                red_mask: 0xff,
+                green_shift: 8,
+                green_mask: 0xff,
+                blue_shift: 0,
+                blue_mask: 0xff,
+                alpha_shift: 24,
+                alpha_mask: 0xff,
+            },
+        );
+        let normal = super::network_row_material_pixel(surface, super::POPUP_STYLE.card_background);
+        let hover = super::network_row_material_pixel(surface, super::POPUP_STYLE.hover_background);
+        assert_eq!(normal, surface.opaque_pixel(0x2a303a));
+        assert_eq!(normal >> 24, 0xff);
+        assert_eq!(hover, surface.opaque_pixel(0x3f4958));
+        assert_eq!(hover >> 24, 0xff);
+        assert_ne!(normal, hover);
+        assert_eq!(super::POPUP_STYLE.material.background.alpha, 0x98);
+    }
+
+    #[test]
+    fn global_menu_surfaces_are_opaque_and_hover_is_precomposed() {
+        let surface = super::super::surface::SurfaceVisual::argb(
+            1,
+            2,
+            super::DirectPixelFormat {
+                red_shift: 16,
+                red_mask: 0xff,
+                green_shift: 8,
+                green_mask: 0xff,
+                blue_shift: 0,
+                blue_mask: 0xff,
+                alpha_shift: 24,
+                alpha_mask: 0xff,
+            },
+        );
+        let menu_surface = super::notification_card_background(surface);
+        let hover = super::network_row_material_pixel(surface, super::POPUP_STYLE.hover_background);
+        assert_eq!(menu_surface, surface.opaque_pixel(0x2a303a));
+        assert_eq!(menu_surface >> 24, 0xff);
+        assert_eq!(hover, surface.opaque_pixel(0x3f4958));
+        assert_eq!(hover >> 24, 0xff);
+        assert_ne!(menu_surface, hover);
+        assert_eq!(super::POPUP_STYLE.material.background.alpha, 0x98);
+    }
+
+    #[test]
+    fn bluetooth_internal_card_reuses_opaque_notification_material() {
+        let surface = super::super::surface::SurfaceVisual::argb(
+            1,
+            2,
+            super::DirectPixelFormat {
+                red_shift: 16,
+                red_mask: 0xff,
+                green_shift: 8,
+                green_mask: 0xff,
+                blue_shift: 0,
+                blue_mask: 0xff,
+                alpha_shift: 24,
+                alpha_mask: 0xff,
+            },
+        );
         assert_eq!(
             super::notification_card_background(surface),
-            super::POPUP_STYLE.card_background.rgb()
+            surface.opaque_pixel(0x2a303a)
         );
+        assert_eq!(super::notification_card_background(surface) >> 24, 0xff);
+        assert_eq!(super::POPUP_STYLE.material.background.alpha, 0x98);
+    }
+
+    #[test]
+    fn bluetooth_device_rows_reuse_opaque_network_row_material() {
+        let surface = super::super::surface::SurfaceVisual::argb(
+            1,
+            2,
+            super::DirectPixelFormat {
+                red_shift: 16,
+                red_mask: 0xff,
+                green_shift: 8,
+                green_mask: 0xff,
+                blue_shift: 0,
+                blue_mask: 0xff,
+                alpha_shift: 24,
+                alpha_mask: 0xff,
+            },
+        );
+        let normal = super::network_row_material_pixel(surface, super::POPUP_STYLE.card_background);
+        let hover = super::network_row_material_pixel(surface, super::POPUP_STYLE.hover_background);
+        assert_eq!(normal, surface.opaque_pixel(0x2a303a));
+        assert_eq!(hover, surface.opaque_pixel(0x3f4958));
+        assert_eq!(normal >> 24, 0xff);
+        assert_eq!(hover >> 24, 0xff);
+        assert_ne!(normal, hover);
+    }
+
+    #[test]
+    fn bluetooth_network_family_layout_has_header_section_and_content_card() {
+        let popup = MenuRect {
+            x: 100,
+            y: 200,
+            width: 330,
+            height: super::bluetooth_popup_height(4, false),
+        };
+        let layout = super::bluetooth_popup_layout(popup, 4, false);
+        assert_eq!(layout.header.height, 48);
+        assert_eq!(
+            layout.section.y,
+            layout.header.y + layout.header.height as i16 + 10
+        );
+        assert_eq!(
+            layout.collection.y,
+            layout.section.y + layout.section.height as i16 + 10
+        );
+        assert_eq!(layout.collection.height, 138);
+        assert_eq!(layout.rows.len(), 4);
+        assert_eq!(layout.rows[0].x, layout.collection.x + 10);
+        assert_eq!(layout.rows[0].y, layout.collection.y + 10);
+        for pair in layout.rows.windows(2) {
+            assert_eq!(pair[1].y - pair[0].y, 30);
+        }
+        for row in &layout.rows {
+            assert!(row.x >= layout.collection.x + 10);
+            assert!(
+                row.x + row.width as i16
+                    <= layout.collection.x + layout.collection.width as i16 - 10
+            );
+            assert!(row.y >= layout.collection.y + 10);
+            assert!(
+                row.y + row.height as i16
+                    <= layout.collection.y + layout.collection.height as i16 - 10
+            );
+        }
+        assert_eq!(super::bluetooth_popup_height(4, false), 254);
+    }
+
+    #[test]
+    fn bluetooth_manager_action_is_optional_external_to_device_collection() {
+        let popup_without = MenuRect {
+            x: 100,
+            y: 200,
+            width: 330,
+            height: super::bluetooth_popup_height(2, false),
+        };
+        let popup_with = MenuRect {
+            x: 100,
+            y: 200,
+            width: 330,
+            height: super::bluetooth_popup_height(2, true),
+        };
+        let without = super::bluetooth_popup_layout(popup_without, 2, false);
+        let with = super::bluetooth_popup_layout(popup_with, 2, true);
+        assert_eq!(super::bluetooth_popup_height(2, false), 194);
+        assert_eq!(
+            super::bluetooth_popup_height(2, true) - super::bluetooth_popup_height(2, false),
+            38
+        );
+        assert!(without.action.is_none());
+        let action = with.action.expect("configured manager action");
+        assert_eq!(
+            action.y - with.collection.y - with.collection.height as i16,
+            10
+        );
+        assert_eq!(action.height, 28);
+        assert_eq!(action, with.action.expect("same canonical hit rect"));
+        assert_eq!(super::BLUETOOTH_MANAGER_LABEL, "Mais configurações…");
+        assert_eq!(
+            super::popup_hover_for(Some(&HitTarget::BluetoothManager)),
+            Some(PopupHover::BluetoothManager)
+        );
+    }
+
+    #[test]
+    fn network_internal_cards_reuse_opaque_notification_material() {
+        let surface = super::super::surface::SurfaceVisual::argb(
+            1,
+            2,
+            super::DirectPixelFormat {
+                red_shift: 16,
+                red_mask: 0xff,
+                green_shift: 8,
+                green_mask: 0xff,
+                blue_shift: 0,
+                blue_mask: 0xff,
+                alpha_shift: 24,
+                alpha_mask: 0xff,
+            },
+        );
+        assert_eq!(
+            super::notification_card_background(surface),
+            surface.opaque_pixel(0x2a303a)
+        );
+        assert_eq!(super::notification_card_background(surface) >> 24, 0xff);
+        assert_eq!(super::POPUP_STYLE.material.background.alpha, 0x98);
     }
 
     #[test]
