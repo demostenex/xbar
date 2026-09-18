@@ -1,7 +1,8 @@
 use crate::core::menu::{GtkActionGroupPath, GtkActionGroupRole};
 use crate::core::{
     GtkMenuEndpoint, MenuItemId, NetworkWifiTarget, NotificationActionProjection,
-    NotificationActionView, OutputId, OutputState, State, StatusNotifierEndpoint, WindowId,
+    NotificationActionView, OutputId, OutputState, State, StatusNotifierEndpoint,
+    StatusNotifierIcon, StatusNotifierItem, WindowId,
 };
 use crate::notification_icons::ResolvedNotificationIcon;
 use crate::ui::style::{self, FontMetrics, TextMeasurer, BAR_STYLE, POPUP_STYLE, TOAST_STYLE};
@@ -165,6 +166,7 @@ fn precompose_notification_icon_pixels(icon: &ResolvedNotificationIcon) -> Optio
 
 const TRAY_ICON_MAX_SIZE: u16 = 14;
 const MAX_PREPARED_NOTIFICATION_ICONS: usize = 32;
+const MAX_PREPARED_TRAY_ICONS: usize = 32;
 
 struct PreparedNotificationIcon {
     source: Arc<ResolvedNotificationIcon>,
@@ -177,6 +179,57 @@ struct PreparedNotificationIcon {
 }
 
 type PreparedNotificationIconHandle = (xproto::Pixmap, u16, u16);
+
+struct PreparedTrayIcon {
+    endpoint: StatusNotifierEndpoint,
+    revision: u64,
+    pixmap: xproto::Pixmap,
+    width: u16,
+    height: u16,
+    depth: u8,
+    visual: u32,
+    mode: view::TrayIconRenderMode,
+    foreground: u32,
+    background: u32,
+}
+
+type PreparedTrayIconHandle = (xproto::Pixmap, u16, u16);
+
+fn prepare_tray_icon_pixels(
+    icon: &StatusNotifierIcon,
+    width: u16,
+    height: u16,
+    mode: view::TrayIconRenderMode,
+    foreground: u32,
+    background: u32,
+) -> Option<Vec<Option<u32>>> {
+    let StatusNotifierIcon::Pixmap {
+        width: source_width,
+        height: source_height,
+        argb,
+    } = icon;
+    let source_len = usize::from(*source_width).checked_mul(usize::from(*source_height))?;
+    if argb.len() != source_len {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(usize::from(width) * usize::from(height));
+    for py in 0..height {
+        for px in 0..width {
+            let source_x = px * *source_width / width.max(1);
+            let source_y = py * *source_height / height.max(1);
+            let index = usize::from(source_y) * usize::from(*source_width) + usize::from(source_x);
+            let pixel = argb[index];
+            let rendered = match mode {
+                view::TrayIconRenderMode::Template => {
+                    template_icon_pixel(pixel, foreground, background)
+                }
+                view::TrayIconRenderMode::PreserveColor => preserve_color_pixel(pixel),
+            };
+            pixels.push(rendered);
+        }
+    }
+    Some(pixels)
+}
 
 fn tray_draw_size(width: u16, height: u16) -> (u16, u16) {
     if width == 0 || height == 0 {
@@ -564,6 +617,9 @@ pub struct X11Platform {
     notification: Option<NotificationWindow>,
     notification_icons: HashMap<crate::core::HistoryEntryId, Arc<ResolvedNotificationIcon>>,
     prepared_notification_icons: VecDeque<PreparedNotificationIcon>,
+    prepared_tray_icons: VecDeque<PreparedTrayIcon>,
+    tray_icon_revisions: HashMap<StatusNotifierEndpoint, u64>,
+    next_tray_icon_revision: u64,
     toast_stack: Vec<crate::core::HistoryEntryId>,
     toast_known_history: HashSet<crate::core::HistoryEntryId>,
     pending_notification_center_target: Option<crate::core::HistoryEntryId>,
@@ -3502,6 +3558,9 @@ impl X11Platform {
             notification: None,
             notification_icons: HashMap::new(),
             prepared_notification_icons: VecDeque::new(),
+            prepared_tray_icons: VecDeque::new(),
+            tray_icon_revisions: HashMap::new(),
+            next_tray_icon_revision: 1,
             toast_stack: Vec::new(),
             toast_known_history: HashSet::new(),
             pending_notification_center_target: None,
@@ -3528,6 +3587,13 @@ impl X11Platform {
         icons: HashMap<crate::core::HistoryEntryId, Arc<ResolvedNotificationIcon>>,
     ) {
         self.notification_icons = icons;
+    }
+
+    pub fn note_status_notifier_item_update(&mut self, item: &StatusNotifierItem) {
+        let revision = self.next_tray_icon_revision;
+        self.next_tray_icon_revision = self.next_tray_icon_revision.saturating_add(1);
+        self.tray_icon_revisions
+            .insert(item.endpoint.clone(), revision);
     }
     pub fn root(&self) -> u32 {
         self.root
@@ -5412,6 +5478,153 @@ impl X11Platform {
         Ok(())
     }
 
+    fn prepared_tray_icon(
+        &mut self,
+        item: &view::TrayVisualItem,
+    ) -> Result<Option<PreparedTrayIconHandle>, Box<dyn Error>> {
+        let StatusNotifierIcon::Pixmap { width, height, .. } = &item.icon;
+        let (target_width, target_height) = tray_draw_size(*width, *height);
+        if target_width == 0 || target_height == 0 {
+            return Ok(None);
+        }
+        let revision = self
+            .tray_icon_revisions
+            .get(&item.endpoint)
+            .copied()
+            .unwrap_or(0);
+        let foreground = BAR_STYLE.material.foreground;
+        let background = BAR_STYLE.material.background.rgb();
+        let cache_position = self.prepared_tray_icons.iter().position(|entry| {
+            entry.endpoint == item.endpoint
+                && entry.revision == revision
+                && entry.width == target_width
+                && entry.height == target_height
+                && entry.depth == self.glass_surface.depth
+                && entry.visual == self.glass_surface.visual
+                && entry.mode == item.render_mode
+                && entry.foreground == foreground
+                && entry.background == background
+        });
+        if let Some(position) = cache_position {
+            let entry = self
+                .prepared_tray_icons
+                .remove(position)
+                .expect("tray cache position");
+            let result = (entry.pixmap, entry.width, entry.height);
+            self.prepared_tray_icons.push_back(entry);
+            return Ok(Some(result));
+        }
+
+        let Some(pixels) = prepare_tray_icon_pixels(
+            &item.icon,
+            target_width,
+            target_height,
+            item.render_mode,
+            foreground,
+            background,
+        ) else {
+            return Ok(None);
+        };
+        let pixmap = self.conn.generate_id()?;
+        self.conn
+            .create_pixmap(
+                self.glass_surface.depth,
+                pixmap,
+                self.root,
+                target_width,
+                target_height,
+            )?
+            .check()?;
+        let gc = self.conn.generate_id()?;
+        self.conn
+            .create_gc(gc, pixmap, &xproto::CreateGCAux::new())?
+            .check()?;
+        let upload = (|| -> Result<(), Box<dyn Error>> {
+            let format = self
+                .conn
+                .setup()
+                .pixmap_formats
+                .iter()
+                .find(|format| format.depth == self.glass_surface.depth)
+                .ok_or("missing X11 pixmap format")?;
+            let bits_per_pixel = usize::from(format.bits_per_pixel);
+            let bytes_per_pixel = bits_per_pixel.div_ceil(8);
+            if bytes_per_pixel == 0
+                || bytes_per_pixel > 4
+                || bits_per_pixel < usize::from(self.glass_surface.depth)
+            {
+                return Err("unsupported X11 pixmap format".into());
+            }
+            let scanline_pad = usize::from(format.scanline_pad).max(8);
+            let row_bits = usize::from(target_width) * bits_per_pixel;
+            let stride = row_bits.div_ceil(scanline_pad) * (scanline_pad / 8);
+            let mut data = vec![0_u8; stride * usize::from(target_height)];
+            let background_native = self
+                .glass_surface
+                .background_pixel(BAR_STYLE.material.background);
+            for (index, pixel) in pixels.into_iter().enumerate() {
+                let native = pixel
+                    .map(|rgb| self.glass_surface.opaque_pixel(rgb))
+                    .unwrap_or(background_native);
+                let native_bytes = match self.conn.setup().image_byte_order {
+                    xproto::ImageOrder::LSB_FIRST => native.to_le_bytes(),
+                    xproto::ImageOrder::MSB_FIRST => native.to_be_bytes(),
+                    _ => return Err("unsupported X11 image byte order".into()),
+                };
+                let row = index / usize::from(target_width);
+                let column = index % usize::from(target_width);
+                let offset = row * stride + column * bytes_per_pixel;
+                let source = if matches!(
+                    self.conn.setup().image_byte_order,
+                    xproto::ImageOrder::LSB_FIRST
+                ) {
+                    &native_bytes[..bytes_per_pixel]
+                } else {
+                    &native_bytes[4 - bytes_per_pixel..]
+                };
+                data[offset..offset + bytes_per_pixel].copy_from_slice(source);
+            }
+            self.conn
+                .put_image(
+                    xproto::ImageFormat::Z_PIXMAP,
+                    pixmap,
+                    gc,
+                    target_width,
+                    target_height,
+                    0,
+                    0,
+                    0,
+                    self.glass_surface.depth,
+                    &data,
+                )?
+                .check()?;
+            Ok(())
+        })();
+        self.conn.free_gc(gc)?.check()?;
+        if let Err(error) = upload {
+            self.conn.free_pixmap(pixmap)?.check()?;
+            return Err(error);
+        }
+        self.prepared_tray_icons.push_back(PreparedTrayIcon {
+            endpoint: item.endpoint.clone(),
+            revision,
+            pixmap,
+            width: target_width,
+            height: target_height,
+            depth: self.glass_surface.depth,
+            visual: self.glass_surface.visual,
+            mode: item.render_mode,
+            foreground,
+            background,
+        });
+        if self.prepared_tray_icons.len() > MAX_PREPARED_TRAY_ICONS {
+            if let Some(evicted) = self.prepared_tray_icons.pop_front() {
+                self.conn.free_pixmap(evicted.pixmap)?.check()?;
+            }
+        }
+        Ok(Some((pixmap, target_width, target_height)))
+    }
+
     fn render_notification_center(&mut self, state: &State) -> Result<(), Box<dyn Error>> {
         let Some(output_id) = state.notification_center_open else {
             self.pending_notification_center_target = None;
@@ -6693,59 +6906,26 @@ impl X11Platform {
                 if !draw_tray {
                     continue;
                 }
-                let crate::core::StatusNotifierIcon::Pixmap {
-                    width,
-                    height,
-                    argb,
-                } = &tray.icon;
-                let (draw_width, draw_height) = tray_draw_size(*width, *height);
+                let Some((pixmap, draw_width, draw_height)) = self.prepared_tray_icon(tray)? else {
+                    continue;
+                };
                 let x0 = tray.rect.x.saturating_sub(output.x)
                     + ((tray.rect.width - draw_width) / 2) as i16;
                 let y0 = tray.rect.y.saturating_sub(output.y)
                     + ((tray.rect.height - draw_height) / 2) as i16;
-                for py in 0..draw_height {
-                    for px in 0..draw_width {
-                        let source_x = px * *width / draw_width.max(1);
-                        let source_y = py * *height / draw_height.max(1);
-                        let index = (source_y * *width + source_x) as usize;
-                        let pixel = argb[index];
-                        let rendered_pixel = match tray.render_mode {
-                            view::TrayIconRenderMode::Template => {
-                                let Some(template_pixel) = template_icon_pixel(
-                                    pixel,
-                                    BAR_STYLE.material.foreground,
-                                    BAR_STYLE.material.background.rgb(),
-                                ) else {
-                                    continue;
-                                };
-                                template_pixel
-                            }
-                            view::TrayIconRenderMode::PreserveColor => {
-                                let Some(color_pixel) = preserve_color_pixel(pixel) else {
-                                    continue;
-                                };
-                                color_pixel
-                            }
-                        };
-                        self.conn
-                            .change_gc(
-                                gc,
-                                &xproto::ChangeGCAux::new()
-                                    .foreground(self.glass_surface.opaque_pixel(rendered_pixel)),
-                            )?
-                            .check()?;
-                        self.conn.poly_fill_rectangle(
-                            backing.pixmap,
-                            gc,
-                            &[xproto::Rectangle {
-                                x: x0 + px as i16,
-                                y: y0 + py as i16,
-                                width: 1,
-                                height: 1,
-                            }],
-                        )?;
-                    }
-                }
+                self.conn
+                    .copy_area(
+                        pixmap,
+                        backing.pixmap,
+                        gc,
+                        0,
+                        0,
+                        x0,
+                        y0,
+                        draw_width,
+                        draw_height,
+                    )?
+                    .check()?;
             }
             for plugin in &context.plugins {
                 if !draw_plugins {
@@ -9304,6 +9484,9 @@ impl Drop for X11Platform {
         for entry in self.prepared_notification_icons.drain(..) {
             let _ = self.conn.free_pixmap(entry.pixmap);
         }
+        for entry in self.prepared_tray_icons.drain(..) {
+            let _ = self.conn.free_pixmap(entry.pixmap);
+        }
         if let Some(colormap) = self.glass_surface.owned_colormap {
             let _ = self.conn.free_colormap(colormap);
         }
@@ -10716,6 +10899,94 @@ mod tests {
         assert_eq!(tray_draw_size(16, 16), (14, 14));
         assert_eq!(tray_draw_size(32, 16), (14, 7));
         assert_eq!(tray_draw_size(8, 16), (7, 14));
+    }
+
+    #[test]
+    fn prepared_tray_template_pixels_preserve_existing_alpha_semantics() {
+        let icon = StatusNotifierIcon::Pixmap {
+            width: 3,
+            height: 1,
+            argb: vec![0x0000_00ff, 0xffff_00ff, 0x8000_00ff],
+        };
+        let prepared = super::prepare_tray_icon_pixels(
+            &icon,
+            3,
+            1,
+            crate::ui::view::TrayIconRenderMode::Template,
+            0xe6eaf0,
+            0x20242b,
+        )
+        .expect("valid tray pixels");
+
+        assert_eq!(prepared[0], None);
+        assert_eq!(prepared[1], Some(0xe6eaf0));
+        assert_eq!(
+            prepared[2],
+            template_icon_pixel(0x8000_00ff, 0xe6eaf0, 0x20242b)
+        );
+    }
+
+    #[test]
+    fn prepared_tray_preserve_color_pixels_keep_nonzero_rgb() {
+        let icon = StatusNotifierIcon::Pixmap {
+            width: 3,
+            height: 1,
+            argb: vec![0x0012_3456, 0x8012_3456, 0xffab_cdef],
+        };
+        let prepared = super::prepare_tray_icon_pixels(
+            &icon,
+            3,
+            1,
+            crate::ui::view::TrayIconRenderMode::PreserveColor,
+            0xe6eaf0,
+            0x20242b,
+        )
+        .expect("valid tray pixels");
+
+        assert_eq!(prepared, vec![None, Some(0x123456), Some(0xabcdef)]);
+    }
+
+    #[test]
+    fn prepared_tray_pixels_keep_aspect_preserving_target_dimensions() {
+        let icon = StatusNotifierIcon::Pixmap {
+            width: 32,
+            height: 16,
+            argb: vec![0xffff_ffff; 32 * 16],
+        };
+        let (width, height) = tray_draw_size(32, 16);
+        let prepared = super::prepare_tray_icon_pixels(
+            &icon,
+            width,
+            height,
+            crate::ui::view::TrayIconRenderMode::PreserveColor,
+            0xe6eaf0,
+            0x20242b,
+        )
+        .expect("valid tray pixels");
+
+        assert_eq!((width, height), (14, 7));
+        assert_eq!(prepared.len(), usize::from(width) * usize::from(height));
+        assert!(prepared.iter().all(|pixel| *pixel == Some(0xffffff)));
+    }
+
+    #[test]
+    fn malformed_tray_pixmap_does_not_prepare_pixels() {
+        let icon = StatusNotifierIcon::Pixmap {
+            width: 2,
+            height: 2,
+            argb: vec![0xffff_ffff; 3],
+        };
+        assert_eq!(
+            super::prepare_tray_icon_pixels(
+                &icon,
+                2,
+                2,
+                crate::ui::view::TrayIconRenderMode::PreserveColor,
+                0xe6eaf0,
+                0x20242b,
+            ),
+            None
+        );
     }
 
     #[test]

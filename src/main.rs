@@ -1029,6 +1029,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     state.plugin_zone.plugins.len()
                 );
             }
+            if let Event::StatusNotifierItemUpdated(item) = &translated {
+                x11.note_status_notifier_item_update(item);
+            }
             let presentation_before = state.menu_presentation.clone();
             let menu_interaction_before = (
                 state.menu_interaction.open_root,
