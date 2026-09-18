@@ -2583,6 +2583,19 @@ fn workspace_as_menu(rect: layout::WorkspaceRect) -> layout::MenuRect {
     }
 }
 
+const WORKSPACE_INDICATOR_Y: i16 = 4;
+const WORKSPACE_INDICATOR_HEIGHT: u16 = 18;
+const WORKSPACE_INDICATOR_RADIUS: u16 = 4;
+
+fn workspace_indicator_rect(rect: layout::WorkspaceRect, output_x: i16) -> xproto::Rectangle {
+    xproto::Rectangle {
+        x: rect.x.saturating_sub(output_x).saturating_add(4),
+        y: WORKSPACE_INDICATOR_Y,
+        width: rect.width.saturating_sub(8).max(1),
+        height: WORKSPACE_INDICATOR_HEIGHT,
+    }
+}
+
 fn render_direct_format(
     formats: Option<&render::QueryPictFormatsReply>,
     screen: usize,
@@ -6513,8 +6526,7 @@ impl X11Platform {
                 if !draw_workspaces {
                     break;
                 }
-                let x = rect.x.saturating_sub(output.x).saturating_add(4);
-                let width = rect.width.saturating_sub(8).max(1);
+                let indicator = workspace_indicator_rect(*rect, output.x);
                 let color = if workspace.focused {
                     self.glass_surface
                         .opaque_pixel(BAR_STYLE.workspace_background)
@@ -6525,16 +6537,20 @@ impl X11Platform {
                 self.conn
                     .change_gc(gc, &xproto::ChangeGCAux::new().foreground(color))?
                     .check()?;
-                self.conn.poly_fill_rectangle(
-                    backing.pixmap,
-                    gc,
-                    &[xproto::Rectangle {
-                        x,
-                        y: 4,
-                        width,
-                        height: 18,
-                    }],
-                )?;
+                if workspace.focused {
+                    self.fill_rounded_popup_card_with_radius(
+                        backing.pixmap,
+                        gc,
+                        indicator.x,
+                        indicator.y,
+                        indicator.width,
+                        indicator.height,
+                        WORKSPACE_INDICATOR_RADIUS,
+                    )?;
+                } else {
+                    self.conn
+                        .poly_fill_rectangle(backing.pixmap, gc, &[indicator])?;
+                }
                 self.conn
                     .change_gc(
                         gc,
@@ -6552,7 +6568,7 @@ impl X11Platform {
                         &self.text,
                     )
                     .unwrap_or_default(),
-                    x: x as i32 + BAR_STYLE.horizontal_padding as i32,
+                    x: indicator.x as i32 + BAR_STYLE.horizontal_padding as i32,
                     y: self.text.baseline(BAR_HEIGHT) as i32,
                     color: BAR_STYLE.workspace_foreground,
                 });
@@ -9403,11 +9419,12 @@ mod tests {
         reconcile_notification_scroll, reconcile_toast_stack, reconcile_toast_stack_candidates,
         reconcile_toast_stack_grouped, template_icon_pixel, toast_card_content_layout,
         toast_members_that_fit, toast_presentation_items, tray_draw_size, tray_hit,
-        union_menu_rects, AttentionPropertyRead, BarBacking, BarWindow, EffectOwnerUpdate,
-        GlobalPinShortcut, HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot,
-        PopupWindow, RenderTarget, SurfaceWindowGeometry, ToastFitItem, X11Event, X11Platform,
-        BAR_HEIGHT, NOTIFICATION_CARD_SLOT_GAP, NOTIFICATION_GROUP_INTERNAL_GAP,
-        NOTIFICATION_OUTER_PADDING, XOMPOSITE_FRAME_POLICY_ATOM_NAME,
+        union_menu_rects, workspace_as_menu, workspace_indicator_rect, AttentionPropertyRead,
+        BarBacking, BarWindow, EffectOwnerUpdate, GlobalPinShortcut, HitTarget, MenuPopupDirty,
+        PopupBacking, PopupHover, PopupSlot, PopupWindow, RenderTarget, SurfaceWindowGeometry,
+        ToastFitItem, X11Event, X11Platform, BAR_HEIGHT, NOTIFICATION_CARD_SLOT_GAP,
+        NOTIFICATION_GROUP_INTERNAL_GAP, NOTIFICATION_OUTER_PADDING,
+        XOMPOSITE_FRAME_POLICY_ATOM_NAME,
     };
     use crate::core::{
         ChildrenDisplay, HistoryEntryId, MenuItem, MenuItemId, MenuItemType,
@@ -10477,6 +10494,42 @@ mod tests {
         assert_eq!(RenderTarget::Workspaces.0, RenderTarget::WORKSPACES);
         assert!(!RenderTarget::Workspaces.contains(RenderTarget::CONTEXT));
         assert!(!RenderTarget::Workspaces.contains(RenderTarget::PLUGIN_ZONE));
+    }
+
+    #[test]
+    fn workspace_indicator_is_compact_and_vertically_centered() {
+        let workspace = crate::ui::layout::WorkspaceRect {
+            x: 8,
+            y: 0,
+            width: 24,
+            height: BAR_HEIGHT,
+        };
+        let indicator = workspace_indicator_rect(workspace, 0);
+
+        assert_eq!(indicator.x, 12);
+        assert_eq!(indicator.y, 4);
+        assert_eq!(indicator.width, 16);
+        assert_eq!(indicator.height, 18);
+        assert_eq!(indicator.y as u16, (BAR_HEIGHT - indicator.height) / 2);
+        assert_eq!(BAR_HEIGHT - (indicator.y as u16 + indicator.height), 4);
+    }
+
+    #[test]
+    fn workspace_indicator_stays_inside_canonical_hit_rect() {
+        let workspace = crate::ui::layout::WorkspaceRect {
+            x: 8,
+            y: 0,
+            width: 48,
+            height: BAR_HEIGHT,
+        };
+        let indicator = workspace_indicator_rect(workspace, 0);
+
+        assert!(indicator.x >= workspace.x);
+        assert!(indicator.x + indicator.width as i16 <= workspace.x + workspace.width as i16);
+        assert!(indicator.y >= workspace.y);
+        assert!(indicator.y + indicator.height as i16 <= workspace.y + workspace.height as i16);
+        assert_eq!(workspace_as_menu(workspace).width, workspace.width);
+        assert_eq!(workspace_as_menu(workspace).height, workspace.height);
     }
 
     #[test]
