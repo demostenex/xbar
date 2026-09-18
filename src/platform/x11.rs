@@ -878,6 +878,7 @@ struct ToastRenderItem {
     title: String,
     secondary: String,
     body: String,
+    icon: Option<Arc<ResolvedNotificationIcon>>,
     rect: layout::MenuRect,
     rear_rects: Vec<layout::MenuRect>,
 }
@@ -1076,6 +1077,8 @@ const TOAST_WIDTH: u16 = 400;
 const TOAST_CARD_RADIUS: u16 = NOTIFICATION_CARD_RADIUS;
 const TOAST_CARD_INSET: i16 = 10;
 const TOAST_CARD_PADDING: i16 = 12;
+const TOAST_ICON_SIZE: u16 = 32;
+const TOAST_ICON_TEXT_GAP: i32 = 10;
 const TOAST_CARD_GAP: u16 = 8;
 const TOAST_CANVAS_CLEAR: style::Rgba = style::Rgba::new(0, 0, 0, 0);
 const NOTIFICATION_HEADER_CONTROL_WIDTH: u16 = 76;
@@ -1344,6 +1347,31 @@ fn toast_card_geometry(
         Vec::new()
     };
     (rect, rear_rects)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ToastCardContentLayout {
+    icon_rect: Option<layout::MenuRect>,
+    text_x: i32,
+}
+
+fn toast_card_content_layout(card: layout::MenuRect, has_icon: bool) -> ToastCardContentLayout {
+    let text_x = i32::from(card.x) + i32::from(TOAST_CARD_PADDING);
+    let icon_rect = has_icon.then_some(layout::MenuRect {
+        x: card.x + TOAST_CARD_PADDING,
+        y: card.y + TOAST_CARD_PADDING,
+        width: TOAST_ICON_SIZE,
+        height: TOAST_ICON_SIZE,
+    });
+    ToastCardContentLayout {
+        icon_rect,
+        text_x: text_x
+            + if has_icon {
+                i32::from(TOAST_ICON_SIZE) + TOAST_ICON_TEXT_GAP
+            } else {
+                0
+            },
+    }
 }
 
 fn notification_center_width(output_width: u16) -> u16 {
@@ -5006,6 +5034,7 @@ impl X11Platform {
                 title,
                 secondary,
                 body,
+                icon: self.notification_icons.get(&history_id).cloned(),
                 rect,
                 rear_rects,
             });
@@ -5154,12 +5183,21 @@ impl X11Platform {
                 TOAST_CARD_RADIUS,
             )?;
         }
+        for card in &cards {
+            let icon = card.icon.clone();
+            if let (Some(icon_rect), Some(icon)) = (
+                toast_card_content_layout(card.rect, icon.is_some()).icon_rect,
+                icon,
+            ) {
+                self.draw_notification_icon(backing.pixmap, backing.gc, icon_rect, &icon)?;
+            }
+        }
         self.conn.flush()?;
         self.conn.get_input_focus()?.reply()?;
         self.text
             .prepare_drawable("notification", backing.pixmap, self.glass_surface)?;
         for card in &cards {
-            let text_x = i32::from(card.rect.x) + i32::from(TOAST_CARD_PADDING);
+            let text_x = toast_card_content_layout(card.rect, card.icon.is_some()).text_x;
             self.text.draw_popup_utf8(
                 &card.title,
                 text_x,
@@ -9363,13 +9401,13 @@ mod tests {
         popup_hover_for, popup_hover_transition, popup_slot_is_selected,
         precompose_notification_icon_pixels, preserve_color_pixel, raw_button_press_event,
         reconcile_notification_scroll, reconcile_toast_stack, reconcile_toast_stack_candidates,
-        reconcile_toast_stack_grouped, template_icon_pixel, toast_members_that_fit,
-        toast_presentation_items, tray_draw_size, tray_hit, union_menu_rects,
-        AttentionPropertyRead, BarBacking, BarWindow, EffectOwnerUpdate, GlobalPinShortcut,
-        HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot, PopupWindow, RenderTarget,
-        SurfaceWindowGeometry, ToastFitItem, X11Event, X11Platform, BAR_HEIGHT,
-        NOTIFICATION_CARD_SLOT_GAP, NOTIFICATION_GROUP_INTERNAL_GAP, NOTIFICATION_OUTER_PADDING,
-        XOMPOSITE_FRAME_POLICY_ATOM_NAME,
+        reconcile_toast_stack_grouped, template_icon_pixel, toast_card_content_layout,
+        toast_members_that_fit, toast_presentation_items, tray_draw_size, tray_hit,
+        union_menu_rects, AttentionPropertyRead, BarBacking, BarWindow, EffectOwnerUpdate,
+        GlobalPinShortcut, HitTarget, MenuPopupDirty, PopupBacking, PopupHover, PopupSlot,
+        PopupWindow, RenderTarget, SurfaceWindowGeometry, ToastFitItem, X11Event, X11Platform,
+        BAR_HEIGHT, NOTIFICATION_CARD_SLOT_GAP, NOTIFICATION_GROUP_INTERNAL_GAP,
+        NOTIFICATION_OUTER_PADDING, XOMPOSITE_FRAME_POLICY_ATOM_NAME,
     };
     use crate::core::{
         ChildrenDisplay, HistoryEntryId, MenuItem, MenuItemId, MenuItemType,
@@ -12145,6 +12183,34 @@ mod tests {
         assert!(rear_rects.is_empty());
         assert!(rect.width > 2);
         assert!(rect.height > 2);
+    }
+
+    #[test]
+    fn toast_icon_layout_preserves_legacy_text_and_card_geometry() {
+        let card = MenuRect {
+            x: super::TOAST_CARD_INSET,
+            y: 0,
+            width: 380,
+            height: 64,
+        };
+        let without_icon = toast_card_content_layout(card, false);
+        assert_eq!(without_icon.icon_rect, None);
+        assert_eq!(without_icon.text_x, 22);
+        let with_icon = toast_card_content_layout(card, true);
+        assert_eq!(
+            with_icon.icon_rect,
+            Some(MenuRect {
+                x: 22,
+                y: 12,
+                width: 32,
+                height: 32,
+            })
+        );
+        assert_eq!(with_icon.text_x, without_icon.text_x + 42);
+        let icon = with_icon.icon_rect.unwrap();
+        assert!(icon.y + icon.height as i16 <= card.y + card.height as i16);
+        assert!(with_icon.text_x >= i32::from(icon.x + icon.width as i16));
+        assert!(with_icon.text_x < i32::from(card.x + card.width as i16 - 12));
     }
 
     #[test]
