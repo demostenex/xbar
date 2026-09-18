@@ -734,6 +734,37 @@ struct BarText {
     y: i32,
     color: u32,
 }
+
+struct DeferredNotificationText {
+    text: String,
+    x: i32,
+    y: i32,
+    color: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NotificationTextPhasePlan {
+    xcb_handoffs: usize,
+    xft_prepares: usize,
+    xft_releases: usize,
+}
+
+fn notification_text_phase_plan(text_count: usize) -> NotificationTextPhasePlan {
+    if text_count == 0 {
+        NotificationTextPhasePlan {
+            xcb_handoffs: 0,
+            xft_prepares: 0,
+            xft_releases: 0,
+        }
+    } else {
+        NotificationTextPhasePlan {
+            xcb_handoffs: 1,
+            xft_prepares: 1,
+            xft_releases: 1,
+        }
+    }
+}
+
 struct PopupWindow {
     window: u32,
     output: OutputId,
@@ -5874,6 +5905,7 @@ impl X11Platform {
         let clear_all_text_width = self.text.measure_popup_width("Clear All");
         let clear_all_rect =
             notification_header_for_history(width, clear_all_text_width, has_header);
+        let mut deferred_text = Vec::new();
         if let Some(rect) = clear_all_rect {
             let clear_all_hovered = self
                 .notification_center
@@ -5891,18 +5923,11 @@ impl X11Platform {
                 }),
                 NOTIFICATION_CLEAR_ALL_RADIUS,
             )?;
-            self.conn.flush()?;
-            self.conn.get_input_focus()?.reply()?;
-            self.text.prepare_drawable(
-                "notification-center",
-                backing.pixmap,
-                self.glass_surface,
-            )?;
             let baseline = notification_header_text_baseline(rect, self.text.popup_metrics());
-            self.text.draw_popup_utf8(
-                "Notification Center",
-                12,
-                notification_header_text_baseline(
+            deferred_text.push(DeferredNotificationText {
+                text: "Notification Center".to_owned(),
+                x: 12,
+                y: notification_header_text_baseline(
                     layout::MenuRect {
                         x: 0,
                         y: 0,
@@ -5911,8 +5936,8 @@ impl X11Platform {
                     },
                     self.text.popup_metrics(),
                 ) as i32,
-                BAR_STYLE.material.foreground,
-            )?;
+                color: BAR_STYLE.material.foreground,
+            });
             let (clear_all_x, clear_all_baseline) = notification_header_text_origin(rect, baseline);
             if notification_ui_trace_enabled() {
                 eprintln!(
@@ -5928,13 +5953,12 @@ impl X11Platform {
                     backing.pixmap,
                 );
             }
-            self.text.draw_popup_utf8(
-                "Clear All",
-                clear_all_x,
-                clear_all_baseline,
-                BAR_STYLE.material.foreground,
-            )?;
-            self.text.release_drawable(backing.pixmap);
+            deferred_text.push(DeferredNotificationText {
+                text: "Clear All".to_owned(),
+                x: clear_all_x,
+                y: clear_all_baseline,
+                color: BAR_STYLE.material.foreground,
+            });
         }
         if !state.notification_history.is_empty() {
             let content_clip = xproto::Rectangle {
@@ -6000,13 +6024,6 @@ impl X11Platform {
                         self.glass_surface.opaque_pixel(0x2a303a),
                         NOTIFICATION_GROUP_HEADER_RADIUS,
                     )?;
-                    self.conn.flush()?;
-                    self.conn.get_input_focus()?.reply()?;
-                    self.text.prepare_drawable(
-                        "notification-center",
-                        backing.pixmap,
-                        self.glass_surface,
-                    )?;
                     let crate::core::GroupKey::ApplicationName(label) = key;
                     let baseline = i32::from(header_rect.y)
                         + i32::from(
@@ -6019,27 +6036,26 @@ impl X11Platform {
                         baseline,
                         self.text.popup_metrics(),
                     ) {
-                        self.text.draw_popup_utf8(
-                            &format!("{label} · {}", members.len()),
-                            i32::from(header_rect.x) + NOTIFICATION_CARD_CONTENT_PADDING as i32,
-                            baseline,
-                            BAR_STYLE.material.foreground,
-                        )?;
+                        deferred_text.push(DeferredNotificationText {
+                            text: format!("{label} · {}", members.len()),
+                            x: i32::from(header_rect.x) + NOTIFICATION_CARD_CONTENT_PADDING as i32,
+                            y: baseline,
+                            color: BAR_STYLE.material.foreground,
+                        });
                     }
                     if notification_content_text_visible(
                         content_viewport,
                         baseline,
                         self.text.popup_metrics(),
                     ) {
-                        self.text.draw_popup_utf8(
-                            "⌄",
-                            i32::from(header_rect.x)
+                        deferred_text.push(DeferredNotificationText {
+                            text: "⌄".to_owned(),
+                            x: i32::from(header_rect.x)
                                 + i32::from(header_rect.width.saturating_sub(20)),
-                            baseline,
-                            POPUP_STYLE.muted_foreground,
-                        )?;
+                            y: baseline,
+                            color: POPUP_STYLE.muted_foreground,
+                        });
                     }
-                    self.text.release_drawable(backing.pixmap);
                     group_hits.push(NotificationGroupHit {
                         key: key.clone(),
                         body_rect: layout::MenuRect {
@@ -6255,13 +6271,6 @@ impl X11Platform {
             ) {
                 self.draw_notification_icon(backing.pixmap, backing.gc, icon_rect, &icon)?;
             }
-            self.conn.flush()?;
-            self.conn.get_input_focus()?.reply()?;
-            self.text.prepare_drawable(
-                "notification-center",
-                backing.pixmap,
-                self.glass_surface,
-            )?;
             let text = notification_card_text(entry, expanded_member_ids.contains(&entry.id));
             let text_x = content_layout.text_x;
             let content_bottom = if entry_layout.compact {
@@ -6282,12 +6291,12 @@ impl X11Platform {
                     self.text.popup_metrics(),
                 )
             {
-                self.text.draw_popup_utf8(
-                    &text.title,
-                    text_x,
-                    i32::from(card_rect.y) + 24,
-                    BAR_STYLE.material.foreground,
-                )?;
+                deferred_text.push(DeferredNotificationText {
+                    text: text.title.clone(),
+                    x: text_x,
+                    y: i32::from(card_rect.y) + 24,
+                    color: BAR_STYLE.material.foreground,
+                });
             }
             if let Some(secondary) = &text.secondary {
                 let baseline =
@@ -6297,12 +6306,12 @@ impl X11Platform {
                     baseline,
                     self.text.popup_metrics(),
                 ) {
-                    self.text.draw_popup_utf8(
-                        secondary,
-                        text_x,
-                        baseline,
-                        POPUP_STYLE.muted_foreground,
-                    )?;
+                    deferred_text.push(DeferredNotificationText {
+                        text: secondary.clone(),
+                        x: text_x,
+                        y: baseline,
+                        color: POPUP_STYLE.muted_foreground,
+                    });
                 }
             }
             if let Some(tertiary) = &text.tertiary {
@@ -6312,12 +6321,12 @@ impl X11Platform {
                     baseline,
                     self.text.popup_metrics(),
                 ) {
-                    self.text.draw_popup_utf8(
-                        tertiary,
-                        text_x,
-                        baseline,
-                        POPUP_STYLE.muted_foreground,
-                    )?;
+                    deferred_text.push(DeferredNotificationText {
+                        text: tertiary.clone(),
+                        x: text_x,
+                        y: baseline,
+                        color: POPUP_STYLE.muted_foreground,
+                    });
                 }
             }
             if let Some(dismiss_rect) = dismiss_rect {
@@ -6326,12 +6335,12 @@ impl X11Platform {
                     i32::from(dismiss_rect.y) + 16,
                     self.text.popup_metrics(),
                 ) {
-                    self.text.draw_popup_utf8(
-                        "×",
-                        i32::from(dismiss_rect.x) + 5,
-                        i32::from(dismiss_rect.y) + 16,
-                        BAR_STYLE.material.foreground,
-                    )?;
+                    deferred_text.push(DeferredNotificationText {
+                        text: "×".to_owned(),
+                        x: i32::from(dismiss_rect.x) + 5,
+                        y: i32::from(dismiss_rect.y) + 16,
+                        color: BAR_STYLE.material.foreground,
+                    });
                 }
             }
             let action_baseline_offset = self
@@ -6346,12 +6355,12 @@ impl X11Platform {
                 ) {
                     continue;
                 }
-                self.text.draw_popup_utf8(
-                    &action.label,
-                    action.rect.x as i32 + 8,
-                    action.rect.y as i32 + i32::from(action_baseline_offset),
-                    BAR_STYLE.material.foreground,
-                )?;
+                deferred_text.push(DeferredNotificationText {
+                    text: action.label.clone(),
+                    x: action.rect.x as i32 + 8,
+                    y: action.rect.y as i32 + i32::from(action_baseline_offset),
+                    color: BAR_STYLE.material.foreground,
+                });
             }
             for (rect, glyph) in [(pager_prev_rect, "<"), (pager_next_rect, ">")].into_iter() {
                 if let Some(rect) = rect {
@@ -6362,15 +6371,14 @@ impl X11Platform {
                     ) {
                         continue;
                     }
-                    self.text.draw_popup_utf8(
-                        glyph,
-                        rect.x as i32 + 6,
-                        rect.y as i32 + i32::from(action_baseline_offset),
-                        BAR_STYLE.material.foreground,
-                    )?;
+                    deferred_text.push(DeferredNotificationText {
+                        text: glyph.to_owned(),
+                        x: rect.x as i32 + 6,
+                        y: rect.y as i32 + i32::from(action_baseline_offset),
+                        color: BAR_STYLE.material.foreground,
+                    });
                 }
             }
-            self.text.release_drawable(backing.pixmap);
         }
         if state.notification_history.is_empty() {
             let empty_rect = notification_empty_state_rect(width, height);
@@ -6382,6 +6390,15 @@ impl X11Platform {
                 self.glass_surface.opaque_pixel(0x2a303a),
                 NOTIFICATION_CARD_RADIUS,
             )?;
+            deferred_text.push(DeferredNotificationText {
+                text: "No notifications".to_owned(),
+                x: i32::from(empty_rect.x) + NOTIFICATION_CARD_CONTENT_PADDING as i32,
+                y: i32::from(empty_rect.y) + 34,
+                color: BAR_STYLE.material.foreground,
+            });
+        }
+        let text_phase = notification_text_phase_plan(deferred_text.len());
+        if text_phase.xcb_handoffs == 1 {
             self.conn.flush()?;
             self.conn.get_input_focus()?.reply()?;
             self.text.prepare_drawable(
@@ -6389,12 +6406,10 @@ impl X11Platform {
                 backing.pixmap,
                 self.glass_surface,
             )?;
-            self.text.draw_popup_utf8(
-                "No notifications",
-                i32::from(empty_rect.x) + NOTIFICATION_CARD_CONTENT_PADDING as i32,
-                i32::from(empty_rect.y) + 34,
-                BAR_STYLE.material.foreground,
-            )?;
+            for text in deferred_text {
+                self.text
+                    .draw_popup_utf8(&text.text, text.x, text.y, text.color)?;
+            }
             self.text.release_drawable(backing.pixmap);
         }
         self.conn
@@ -9596,8 +9611,8 @@ mod tests {
         notification_body_hit, notification_card_content_layout, notification_history_id_for,
         notification_hover_transition, notification_icon_source_over_rgb,
         notification_indicator_hit, notification_indicator_rect, notification_previous_scroll,
-        notification_scroll_target, notification_wheel_direction, popup_effect_owner,
-        popup_hover_for, popup_hover_transition, popup_slot_is_selected,
+        notification_scroll_target, notification_text_phase_plan, notification_wheel_direction,
+        popup_effect_owner, popup_hover_for, popup_hover_transition, popup_slot_is_selected,
         precompose_notification_icon_pixels, preserve_color_pixel, raw_button_press_event,
         reconcile_notification_scroll, reconcile_toast_stack, reconcile_toast_stack_candidates,
         reconcile_toast_stack_grouped, template_icon_pixel, toast_card_content_layout,
@@ -9630,6 +9645,30 @@ mod tests {
     use x11rb::x11_utils::X11Error;
 
     struct FixedWidthMeasurer;
+
+    #[test]
+    fn notification_text_phase_batches_one_handoff_and_xft_lifecycle() {
+        assert_eq!(
+            notification_text_phase_plan(10),
+            super::NotificationTextPhasePlan {
+                xcb_handoffs: 1,
+                xft_prepares: 1,
+                xft_releases: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn notification_without_text_has_no_synchronization_phase() {
+        assert_eq!(
+            notification_text_phase_plan(0),
+            super::NotificationTextPhasePlan {
+                xcb_handoffs: 0,
+                xft_prepares: 0,
+                xft_releases: 0,
+            }
+        );
+    }
 
     #[test]
     fn notification_card_icon_layout_preserves_text_only_geometry() {
