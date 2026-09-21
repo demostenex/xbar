@@ -15,14 +15,15 @@ pub use reducer::reduce;
 pub use state::{
     notification_center_items, notification_group_for_history_id, notification_group_keys,
     wifi_band, wifi_device_state_label, AboutToShowPending, AccountIdentity, ActiveAgentUsage,
-    AudioDevice, AudioState, BluetoothDevice, BluetoothPendingAction, BluetoothState, ClockState,
-    GroupKey, HistoryEntryId, KeyboardGrabState, LazyRootOpenPending, MenuNavigationSession,
-    MenuPresentation, MenuPresentationPolicy, MenuState, NetworkAccessPoint, NetworkConnectivity,
-    NetworkLinkKind, NetworkPendingAction, NetworkState, NetworkStatus, NetworkWifiTarget,
-    Notification, NotificationActionProjection, NotificationActionView, NotificationCenterItem,
-    NotificationHistoryEntry, NotificationIconMetadata, NotificationId, NotificationImageData,
-    NotificationSource, OutputId, OutputState, PluginId, PluginStatus, PluginSummary, State,
-    UsageMeter, UsageStatus, UsageSummary, UsageValue, WifiDevice, WindowId, WorkspaceState,
+    AgendaItem, AgendaStatus, AudioDevice, AudioState, BluetoothDevice, BluetoothPendingAction,
+    BluetoothState, CalendarSnapshot, ClockState, GroupKey, HistoryEntryId, KeyboardGrabState,
+    LazyRootOpenPending, MenuNavigationSession, MenuPresentation, MenuPresentationPolicy,
+    MenuState, NetworkAccessPoint, NetworkConnectivity, NetworkLinkKind, NetworkPendingAction,
+    NetworkState, NetworkStatus, NetworkWifiTarget, Notification, NotificationActionProjection,
+    NotificationActionView, NotificationCenterItem, NotificationHistoryEntry,
+    NotificationIconMetadata, NotificationId, NotificationImageData, NotificationSource, OutputId,
+    OutputState, PluginId, PluginStatus, PluginSummary, State, TodayAgenda, UsageMeter,
+    UsageStatus, UsageSummary, UsageValue, WifiDevice, WindowId, WorkspaceState,
 };
 pub use status_notifier::{
     parse_notifier_item_id, StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierIcon,

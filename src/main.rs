@@ -1,5 +1,6 @@
 mod audio;
 mod calendar;
+mod calendar_sensor;
 mod clock;
 mod config;
 mod core;
@@ -89,6 +90,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let socket = i3::socket_path(&x11)?;
     let mut i3 = I3Client::connect(socket)?;
     let clock = ClockSource::new()?;
+    let mut calendar_sensor = calendar_sensor::CalendarSensor::from_environment();
     let mut audio = audio::AudioBridge::start()?;
     let mut state = State {
         bluetooth_manager_command: config.bluetooth.manager_command(),
@@ -136,6 +138,26 @@ fn run() -> Result<(), Box<dyn Error>> {
         Event::ClockUpdated(clock.sample()?),
         &mut registry.lock().expect("registry poisoned"),
     );
+    if calendar_sensor.enabled() {
+        match calendar_sensor.request() {
+            Ok(true) => {
+                core::reduce(
+                    &mut state,
+                    Event::CalendarRefreshStarted,
+                    &mut registry.lock().expect("registry poisoned"),
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("xbar: calendar adapter unavailable ({error})");
+                core::reduce(
+                    &mut state,
+                    Event::CalendarSnapshotFailed("adapter request failed".to_owned()),
+                    &mut registry.lock().expect("registry poisoned"),
+                );
+            }
+        }
+    }
     if trace {
         eprintln!("xbar trace: initial outputs={:?}", state.outputs);
     }
@@ -199,6 +221,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                 revents: 0,
             },
             libc::pollfd {
+                fd: calendar_sensor.stdout_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: calendar_sensor.stderr_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
                 fd: xnm.as_ref().map_or(-1, xnm::XnmBridge::raw_fd),
                 events: libc::POLLIN,
                 revents: 0,
@@ -234,7 +266,27 @@ fn run() -> Result<(), Box<dyn Error>> {
         if fds[5].revents & libc::POLLIN != 0 {
             dbus.notification_timer_fired();
         }
-        if fds[6].revents & libc::POLLIN != 0 {
+        if fds[6].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+            || fds[7].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+        {
+            let calendar_events = calendar_sensor.drain_events(fds[6].revents, fds[7].revents);
+            for event in calendar_events {
+                if trace {
+                    match &event {
+                        Event::CalendarSnapshotUpdated(agenda) => eprintln!(
+                            "xbar trace: calendar snapshot received items={}",
+                            agenda.items.len()
+                        ),
+                        Event::CalendarSnapshotFailed(error) => {
+                            eprintln!("xbar trace: calendar snapshot failed category={error}")
+                        }
+                        _ => {}
+                    }
+                }
+                events.push(event);
+            }
+        }
+        if fds[8].revents & libc::POLLIN != 0 {
             if let Some(bridge) = xnm.as_mut() {
                 for event in bridge.drain_events()? {
                     if trace {
@@ -284,6 +336,29 @@ fn run() -> Result<(), Box<dyn Error>> {
                             device.state.frequency
                         );
                     }
+                }
+            }
+        }
+
+        let calendar_refresh_signal = events.iter().any(|event| {
+            matches!(
+                event,
+                Event::ClockUpdated(_) | Event::CalendarPopupToggledAt(_)
+            )
+        });
+        if calendar_refresh_signal
+            && calendar_sensor.should_refresh(state.clock, state.calendar_popup_open)
+        {
+            match calendar_sensor.request() {
+                Ok(true) => {
+                    events.push(Event::CalendarRefreshStarted);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("xbar: calendar adapter request failed ({error})");
+                    events.push(Event::CalendarSnapshotFailed(
+                        "adapter request failed".to_owned(),
+                    ));
                 }
             }
         }
@@ -384,7 +459,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             let previous_active_source =
                 state.active_menu_endpoint(&registry.lock().expect("registry poisoned"));
             if trace {
-                eprintln!("xbar trace: event={event:?}");
+                match &event {
+                    Event::CalendarSnapshotUpdated(agenda) => eprintln!(
+                        "xbar trace: calendar snapshot received items={}",
+                        agenda.items.len()
+                    ),
+                    Event::CalendarSnapshotFailed(error) => {
+                        eprintln!("xbar trace: calendar snapshot failed category={error}")
+                    }
+                    _ => eprintln!("xbar trace: event={event:?}"),
+                }
             }
             if matches!(event, Event::X11(platform::x11::X11Event::Close)) {
                 return Ok(());
@@ -2034,6 +2118,9 @@ fn render_target_for(
             RenderTarget::Popup
         }),
         Event::ClockUpdated(_) => Some(RenderTarget::DateTime),
+        Event::CalendarRefreshStarted
+        | Event::CalendarSnapshotUpdated(_)
+        | Event::CalendarSnapshotFailed(_) => Some(RenderTarget::Popup),
         Event::AudioSnapshotReceived(_) | Event::AudioUnavailable => Some(RenderTarget::Audio),
         Event::NetworkStatusChanged(_) | Event::NetworkSnapshotReceived(_) => {
             Some(RenderTarget::Network)

@@ -1243,6 +1243,12 @@ const CALENDAR_NAV_WIDTH: u16 = 22;
 const CALENDAR_NAV_HEIGHT: u16 = 20;
 const CALENDAR_TODAY_WIDTH: u16 = 22;
 const CALENDAR_TODAY_HEIGHT: u16 = 20;
+const CALENDAR_AGENDA_TOP_GAP: u16 = 6;
+const CALENDAR_AGENDA_HEADER_HEIGHT: u16 = 22;
+const CALENDAR_AGENDA_SEPARATOR_GAP: u16 = 5;
+const CALENDAR_AGENDA_ROW_HEIGHT: u16 = 22;
+const CALENDAR_AGENDA_BOTTOM_PADDING: u16 = 8;
+const CALENDAR_AGENDA_TITLE_GAP: u16 = 8;
 
 const fn calendar_popup_height(rows: u8) -> u16 {
     CALENDAR_OUTER_PADDING * 2
@@ -1251,6 +1257,31 @@ const fn calendar_popup_height(rows: u8) -> u16 {
         + CALENDAR_WEEKDAY_HEIGHT
         + CALENDAR_WEEKDAY_GRID_GAP
         + rows as u16 * CALENDAR_CELL_HEIGHT
+}
+
+fn calendar_popup_height_with_agenda(rows: u8, agenda_rows: usize) -> u16 {
+    calendar_popup_height(rows)
+        + CALENDAR_AGENDA_TOP_GAP
+        + CALENDAR_AGENDA_HEADER_HEIGHT
+        + CALENDAR_AGENDA_SEPARATOR_GAP
+        + agenda_rows as u16 * CALENDAR_AGENDA_ROW_HEIGHT
+        + CALENDAR_AGENDA_BOTTOM_PADDING
+}
+
+fn calendar_agenda_label_width<M: style::TextMeasurer>(measurer: &M) -> u16 {
+    measurer
+        .measure_width("Dia todo")
+        .max(measurer.measure_width("23:59"))
+}
+
+fn calendar_agenda_title_offset<M: style::TextMeasurer>(measurer: &M) -> u16 {
+    CALENDAR_OUTER_PADDING + calendar_agenda_label_width(measurer) + CALENDAR_AGENDA_TITLE_GAP
+}
+
+fn calendar_agenda_title_width<M: style::TextMeasurer>(popup_width: u16, measurer: &M) -> u16 {
+    popup_width
+        .saturating_sub(CALENDAR_OUTER_PADDING)
+        .saturating_sub(calendar_agenda_title_offset(measurer))
 }
 
 const fn audio_control_card_height() -> u16 {
@@ -7486,7 +7517,16 @@ impl X11Platform {
             .find(|output| output.id == output_id)
             .ok_or("no output for calendar popup")?;
         let rows = crate::calendar::grid_rows(state.calendar_year, state.calendar_month);
-        let height = calendar_popup_height(rows);
+        let mut agenda_items =
+            crate::calendar::visible_agenda_items(&state.today_agenda, state.clock);
+        let overflow = agenda_items.len().saturating_sub(5);
+        agenda_items.truncate(5);
+        let agenda_row_count = if agenda_items.is_empty() && overflow == 0 {
+            1
+        } else {
+            agenda_items.len() + usize::from(overflow > 0)
+        };
+        let height = calendar_popup_height_with_agenda(rows, agenda_row_count);
         let rect = layout::place_bar_popup(
             anchor,
             CALENDAR_WIDTH.min(output.width.max(1)),
@@ -7723,6 +7763,28 @@ impl X11Platform {
                 }
             }
         }
+        let base_height = calendar_popup_height(rows);
+        let agenda_top = rect.y + base_height as i16 - CALENDAR_OUTER_PADDING as i16
+            + CALENDAR_AGENDA_TOP_GAP as i16;
+        self.conn
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new()
+                    .foreground(self.glass_surface.opaque_pixel(POPUP_STYLE.card_border)),
+            )?
+            .check()?;
+        self.conn
+            .poly_fill_rectangle(
+                backing.pixmap,
+                gc,
+                &[xproto::Rectangle {
+                    x: CALENDAR_OUTER_PADDING as i16,
+                    y: agenda_top - rect.y + CALENDAR_AGENDA_HEADER_HEIGHT as i16,
+                    width: rect.width.saturating_sub(CALENDAR_OUTER_PADDING * 2),
+                    height: 1,
+                }],
+            )?
+            .check()?;
         self.conn.flush()?;
         self.conn.get_input_focus()?.reply()?;
         for (day, cell) in &cells {
@@ -7734,6 +7796,72 @@ impl X11Platform {
                     (cell.x - rect.x + ((cell.width - width) / 2) as i16) as i32,
                     (cell.y - rect.y + 17) as i32,
                     POPUP_STYLE.material.foreground,
+                )?;
+            }
+        }
+        let agenda_x = rect.x + CALENDAR_OUTER_PADDING as i16;
+        self.text.draw_popup_utf8(
+            "Hoje",
+            (agenda_x - rect.x) as i32,
+            (agenda_top - rect.y + 16) as i32,
+            POPUP_STYLE.material.foreground,
+        )?;
+        let agenda_measurer = PopupMeasurer(&self.text);
+        let agenda_title_offset = calendar_agenda_title_offset(&agenda_measurer);
+        let agenda_title_width = calendar_agenda_title_width(rect.width, &agenda_measurer);
+        if agenda_items.is_empty() {
+            let message = match state.today_agenda.status {
+                crate::core::AgendaStatus::Loading => "Carregando...",
+                crate::core::AgendaStatus::Unavailable | crate::core::AgendaStatus::Disabled => {
+                    "Agenda indisponível"
+                }
+                _ => "Nenhum evento",
+            };
+            self.text.draw_popup_utf8(
+                message,
+                (agenda_x - rect.x) as i32,
+                (agenda_top - rect.y
+                    + CALENDAR_AGENDA_HEADER_HEIGHT as i16
+                    + CALENDAR_AGENDA_SEPARATOR_GAP as i16
+                    + 16) as i32,
+                0x9daabd,
+            )?;
+        } else {
+            for (index, item) in agenda_items.iter().enumerate() {
+                let row_y = agenda_top
+                    + CALENDAR_AGENDA_HEADER_HEIGHT as i16
+                    + CALENDAR_AGENDA_SEPARATOR_GAP as i16
+                    + index as i16 * CALENDAR_AGENDA_ROW_HEIGHT as i16;
+                let time = crate::calendar::format_agenda_time(item);
+                let title = crate::ui::layout::truncate_text_to_width(
+                    &item.title,
+                    agenda_title_width,
+                    &PopupMeasurer(&self.text),
+                )
+                .unwrap_or_default();
+                self.text.draw_popup_utf8(
+                    &time,
+                    (agenda_x - rect.x) as i32,
+                    (row_y - rect.y + 16) as i32,
+                    0x9daabd,
+                )?;
+                self.text.draw_popup_utf8(
+                    &title,
+                    (agenda_x - rect.x + agenda_title_offset as i16) as i32,
+                    (row_y - rect.y + 16) as i32,
+                    POPUP_STYLE.material.foreground,
+                )?;
+            }
+            if overflow > 0 {
+                let row_y = agenda_top
+                    + CALENDAR_AGENDA_HEADER_HEIGHT as i16
+                    + CALENDAR_AGENDA_SEPARATOR_GAP as i16
+                    + agenda_items.len() as i16 * CALENDAR_AGENDA_ROW_HEIGHT as i16;
+                self.text.draw_popup_utf8(
+                    &format!("+{overflow} eventos"),
+                    (agenda_x - rect.x) as i32,
+                    (row_y - rect.y + 16) as i32,
+                    0x9daabd,
                 )?;
             }
         }
@@ -10044,13 +10172,14 @@ mod tests {
     use super::super::surface::{FramePolicy, SurfaceRole};
     use super::{
         ai_usage_hit_target, ai_usage_popup_anchor_for_plugins, ai_usage_popup_height,
-        backing_matches, bar_backing_matches, blur_behind_rect, calendar_popup_height,
-        classify_attention_property_reply, classify_property_string_reply,
-        effect_owner_property_value, effect_owner_update, format_cache_age, format_reset_at,
-        frame_policy_property_value, install_passive_grabs, is_xbar_owned_window,
-        menu_accelerator_x, menu_popup_dirty_for_interaction_change, menu_popup_slot_for_window,
-        menu_popup_slots_for_item, network_primary_row_label, notification_body_hit,
-        notification_card_content_layout, notification_history_id_for,
+        backing_matches, bar_backing_matches, blur_behind_rect, calendar_agenda_label_width,
+        calendar_agenda_title_offset, calendar_agenda_title_width, calendar_popup_height,
+        calendar_popup_height_with_agenda, classify_attention_property_reply,
+        classify_property_string_reply, effect_owner_property_value, effect_owner_update,
+        format_cache_age, format_reset_at, frame_policy_property_value, install_passive_grabs,
+        is_xbar_owned_window, menu_accelerator_x, menu_popup_dirty_for_interaction_change,
+        menu_popup_slot_for_window, menu_popup_slots_for_item, network_primary_row_label,
+        notification_body_hit, notification_card_content_layout, notification_history_id_for,
         notification_hover_transition, notification_icon_source_over_rgb,
         notification_indicator_hit, notification_indicator_rect, notification_previous_scroll,
         notification_scroll_target, notification_text_phase_plan, notification_wheel_direction,
@@ -10065,8 +10194,8 @@ mod tests {
         ToastFitItem, X11Event, X11Platform, BAR_HEIGHT, CALENDAR_CELL_HEIGHT, CALENDAR_CELL_WIDTH,
         CALENDAR_HEADER_HEIGHT, CALENDAR_HEADER_WEEKDAY_GAP, CALENDAR_NAV_HEIGHT,
         CALENDAR_NAV_WIDTH, CALENDAR_OUTER_PADDING, CALENDAR_TODAY_HEIGHT, CALENDAR_TODAY_WIDTH,
-        CALENDAR_WEEKDAY_GRID_GAP, CALENDAR_WEEKDAY_HEIGHT, NOTIFICATION_CARD_SLOT_GAP,
-        NOTIFICATION_GROUP_INTERNAL_GAP, NOTIFICATION_OUTER_PADDING,
+        CALENDAR_WEEKDAY_GRID_GAP, CALENDAR_WEEKDAY_HEIGHT, CALENDAR_WIDTH,
+        NOTIFICATION_CARD_SLOT_GAP, NOTIFICATION_GROUP_INTERNAL_GAP, NOTIFICATION_OUTER_PADDING,
         XOMPOSITE_FRAME_POLICY_ATOM_NAME,
     };
     use crate::core::{
@@ -14545,5 +14674,54 @@ mod tests {
         assert!(today.x >= cell.x && today.y >= cell.y);
         assert!(today.x + today.width as i16 <= cell.x + cell.width as i16);
         assert!(today.y + today.height as i16 <= cell.y + cell.height as i16);
+    }
+
+    #[test]
+    fn m15a8c2_calendar_agenda_extends_only_below_frozen_grid() {
+        assert_eq!(calendar_popup_height_with_agenda(4, 1), 225);
+        assert_eq!(calendar_popup_height_with_agenda(5, 5), 337);
+        assert_eq!(calendar_popup_height_with_agenda(6, 6), 383);
+        assert_eq!(calendar_popup_height(5), 186);
+    }
+
+    #[test]
+    fn m15a8c2_agenda_columns_share_a_measured_label_width() {
+        let measurer = FixedWidthMeasurer;
+        let label_width = calendar_agenda_label_width(&measurer);
+        let title_offset = calendar_agenda_title_offset(&measurer);
+        let title_width = calendar_agenda_title_width(CALENDAR_WIDTH, &measurer);
+
+        assert_eq!(label_width, measurer.measure_width("Dia todo"));
+        assert!(label_width >= measurer.measure_width("23:59"));
+        assert_eq!(title_offset, CALENDAR_OUTER_PADDING + label_width + 8);
+        assert_eq!(title_width, 156);
+        assert!(title_offset >= CALENDAR_OUTER_PADDING + label_width + 8);
+        assert_eq!(CALENDAR_WIDTH, 244);
+    }
+
+    #[test]
+    fn m15a8c2_agenda_titles_truncate_inside_the_popup() {
+        let measurer = FixedWidthMeasurer;
+        let width = calendar_agenda_title_width(CALENDAR_WIDTH, &measurer);
+        let title = crate::ui::layout::truncate_text_to_width(
+            "Um compromisso deliberadamente muito longo",
+            width,
+            &measurer,
+        )
+        .expect("ellipsis fits in the agenda title column");
+
+        assert!(measurer.measure_width(&title) <= width);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn m15a8c2_agenda_columns_do_not_change_frozen_grid_geometry() {
+        assert_eq!(calendar_popup_height(4), 162);
+        assert_eq!(calendar_popup_height(5), 186);
+        assert_eq!(calendar_popup_height(6), 210);
+        assert_eq!(CALENDAR_CELL_WIDTH, 32);
+        assert_eq!(CALENDAR_CELL_HEIGHT, 24);
+        assert_eq!(CALENDAR_TODAY_WIDTH, 22);
+        assert_eq!(CALENDAR_TODAY_HEIGHT, 20);
     }
 }

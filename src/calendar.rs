@@ -1,4 +1,4 @@
-use crate::core::ClockState;
+use crate::core::{AgendaItem, ClockState, TodayAgenda};
 
 pub const MONTH_NAMES: [&str; 12] = [
     "janeiro",
@@ -113,9 +113,81 @@ pub fn format_month(year: i32, month: u8) -> String {
     format!("{title} {year}")
 }
 
+pub fn visible_agenda_items(agenda: &TodayAgenda, clock: Option<ClockState>) -> Vec<&AgendaItem> {
+    let now = clock.and_then(clock_epoch_seconds);
+    let mut items = agenda
+        .items
+        .iter()
+        .filter(|item| item.status != "cancelled")
+        .filter(|item| {
+            item.all_day
+                || item
+                    .end_epoch
+                    .is_some_and(|end| now.is_some_and(|now| end > now))
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        left.all_day
+            .cmp(&right.all_day)
+            .reverse()
+            .then_with(|| left.start_epoch.cmp(&right.start_epoch))
+            .then_with(|| left.occurrence_id.cmp(&right.occurrence_id))
+    });
+    items
+}
+
+pub fn clock_epoch_seconds(clock: ClockState) -> Option<i64> {
+    let mut local = libc::tm {
+        tm_sec: 0,
+        tm_min: i32::from(clock.minute),
+        tm_hour: i32::from(clock.hour),
+        tm_mday: i32::from(clock.day),
+        tm_mon: i32::from(clock.month).checked_sub(1)?,
+        tm_year: clock.year.checked_sub(1900)?,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: -1,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        tm_gmtoff: 0,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        tm_zone: std::ptr::null(),
+        #[cfg(target_os = "freebsd")]
+        tm_gmtoff: 0,
+        #[cfg(target_os = "freebsd")]
+        tm_zone: std::ptr::null(),
+    };
+    let epoch = unsafe { libc::mktime(&mut local) };
+    (epoch >= 0).then_some(epoch)
+}
+
+pub fn format_agenda_time(item: &AgendaItem) -> String {
+    if item.all_day {
+        "Dia todo".to_owned()
+    } else {
+        format!(
+            "{:02}:{:02}",
+            item.local_hour.unwrap_or(0),
+            item.local_minute.unwrap_or(0)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::AgendaStatus;
+
+    fn item(id: &str, start: i64, end: i64, all_day: bool, status: &str) -> AgendaItem {
+        AgendaItem {
+            occurrence_id: id.to_owned(),
+            start_epoch: Some(start),
+            end_epoch: Some(end),
+            all_day,
+            status: status.to_owned(),
+            title: id.to_owned(),
+            ..AgendaItem::default()
+        }
+    }
 
     #[test]
     fn portuguese_weekday_formatting_is_full_and_localized() {
@@ -196,5 +268,45 @@ mod tests {
                 .expect("last day must be present");
             assert!(grid[last_index + 1..].iter().all(Option::is_none));
         }
+    }
+
+    #[test]
+    fn agenda_filters_cancelled_and_ended_items_and_sorts_all_day_first() {
+        let agenda = TodayAgenda {
+            status: AgendaStatus::Fresh,
+            items: vec![
+                item("ended", 10, 20, false, "confirmed"),
+                item("future", 20_000, 30_000, false, "confirmed"),
+                item("all-day", 0, 0, true, "confirmed"),
+                item("cancelled", 10_000, 20_000, false, "cancelled"),
+            ],
+            ..TodayAgenda::default()
+        };
+        let clock = ClockState {
+            year: 1970,
+            weekday: 4,
+            hour: 0,
+            minute: 2,
+            day: 1,
+            month: 1,
+        };
+        let visible = visible_agenda_items(&agenda, Some(clock));
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| item.occurrence_id.as_str())
+                .collect::<Vec<_>>(),
+            ["all-day", "future"]
+        );
+    }
+
+    #[test]
+    fn agenda_time_uses_localized_parsed_fields() {
+        let event = item("event", 0, 100, false, "confirmed");
+        assert_eq!(format_agenda_time(&event), "00:00");
+        assert_eq!(
+            format_agenda_time(&item("all-day", 0, 0, true, "confirmed")),
+            "Dia todo"
+        );
     }
 }

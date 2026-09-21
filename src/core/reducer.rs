@@ -1544,6 +1544,31 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 true
             }
         }
+        Event::CalendarRefreshStarted => {
+            if state.today_agenda.status == super::AgendaStatus::Loading {
+                false
+            } else {
+                state.today_agenda.status = super::AgendaStatus::Loading;
+                true
+            }
+        }
+        Event::CalendarSnapshotUpdated(agenda) => {
+            state.today_agenda = agenda;
+            true
+        }
+        Event::CalendarSnapshotFailed(_) => {
+            if state.today_agenda.items.is_empty()
+                && !matches!(
+                    state.today_agenda.status,
+                    super::AgendaStatus::Fresh | super::AgendaStatus::Stale
+                )
+            {
+                state.today_agenda.status = super::AgendaStatus::Unavailable;
+            } else {
+                state.today_agenda.status = super::AgendaStatus::Stale;
+            }
+            true
+        }
         Event::AudioSnapshotReceived(audio) => {
             if state.audio == audio {
                 false
@@ -2034,7 +2059,8 @@ fn bluetooth_visual_state(bluetooth: &super::BluetoothState) -> u8 {
 mod tests {
     use super::*;
     use crate::core::{
-        HistoryEntryId, MenuEndpoint, OutputId, OutputState, WindowId, WorkspaceState,
+        AgendaItem, AgendaStatus, HistoryEntryId, MenuEndpoint, OutputId, OutputState, TodayAgenda,
+        WindowId, WorkspaceState,
     };
     fn ep() -> super::super::MenuEndpoint {
         super::super::MenuEndpoint {
@@ -2060,6 +2086,49 @@ mod tests {
         );
         assert!(!changed);
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn calendar_snapshot_replaces_state_and_failure_retains_it_as_stale() {
+        let mut state = State::default();
+        let mut registry = MenuRegistry::default();
+        let agenda = TodayAgenda {
+            local_date: "2026-09-21".into(),
+            status: AgendaStatus::Fresh,
+            items: vec![AgendaItem {
+                occurrence_id: "calendar-test:event:event-123:1".into(),
+                title: "Evento A".into(),
+                status: "confirmed".into(),
+                ..AgendaItem::default()
+            }],
+            ..TodayAgenda::default()
+        };
+
+        assert!(reduce(
+            &mut state,
+            Event::CalendarSnapshotUpdated(agenda.clone()),
+            &mut registry
+        ));
+        assert_eq!(state.today_agenda, agenda);
+
+        assert!(reduce(
+            &mut state,
+            Event::CalendarSnapshotFailed("adapter failed".into()),
+            &mut registry
+        ));
+        assert_eq!(state.today_agenda.items.len(), 1);
+        assert_eq!(state.today_agenda.status, AgendaStatus::Stale);
+    }
+
+    #[test]
+    fn calendar_initial_failure_becomes_unavailable() {
+        let mut state = State::default();
+        assert!(reduce(
+            &mut state,
+            Event::CalendarSnapshotFailed("adapter failed".into()),
+            &mut MenuRegistry::default()
+        ));
+        assert_eq!(state.today_agenda.status, AgendaStatus::Unavailable);
     }
     fn model() -> super::super::MenuModel {
         super::super::MenuModel {

@@ -1,8 +1,8 @@
 use super::{
     AudioDevice, AudioState, BluetoothPendingAction, ClockState, MenuItemId,
     MenuItemPropertiesUpdate, MenuModel, MenuSource, NetworkPendingAction, NetworkState,
-    OutputState, StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierItem, WindowId,
-    WorkspaceState,
+    OutputState, StatusNotifierAction, StatusNotifierEndpoint, StatusNotifierItem, TodayAgenda,
+    WindowId, WorkspaceState,
 };
 use crate::platform::x11::X11Event;
 
@@ -158,6 +158,9 @@ pub enum Event {
     },
     OutputsChanged(Vec<OutputState>),
     ClockUpdated(ClockState),
+    CalendarRefreshStarted,
+    CalendarSnapshotUpdated(TodayAgenda),
+    CalendarSnapshotFailed(String),
     AudioSnapshotReceived(AudioState),
     AudioInventoryReceived {
         outputs: Vec<AudioDevice>,

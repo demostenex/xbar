@@ -33,6 +33,47 @@ pub struct ClockState {
     pub month: u8,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum AgendaStatus {
+    #[default]
+    Disabled,
+    Loading,
+    Fresh,
+    Stale,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgendaItem {
+    pub occurrence_id: String,
+    pub calendar_id: String,
+    pub event_id: String,
+    pub recurring_event_id: Option<String>,
+    pub original_start: Option<String>,
+    pub start_epoch: Option<i64>,
+    pub end_epoch: Option<i64>,
+    pub local_hour: Option<u8>,
+    pub local_minute: Option<u8>,
+    pub all_day: bool,
+    pub title: String,
+    pub status: String,
+    pub timezone: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TodayAgenda {
+    pub local_date: String,
+    pub generated_at: String,
+    pub source_timezone: String,
+    pub items: Vec<AgendaItem>,
+    pub status: AgendaStatus,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CalendarSnapshot {
+    pub agenda: TodayAgenda,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AudioDevice {
     pub name: String,
@@ -732,6 +773,7 @@ pub struct State {
     pub calendar_popup_output: Option<OutputId>,
     pub calendar_year: i32,
     pub calendar_month: u8,
+    pub today_agenda: TodayAgenda,
     pub notifications: Vec<Notification>,
     pub notification_history: Vec<NotificationHistoryEntry>,
     pub notification_action_projections: Vec<NotificationActionProjection>,
