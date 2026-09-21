@@ -516,6 +516,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.audio_drag_input = false;
             state.bluetooth_popup_open = false;
             state.network_popup_open = false;
+            state.calendar_popup_open = false;
+            state.calendar_popup_output = None;
             state.network_popup_open_pending = false;
             true
         }
@@ -1286,6 +1288,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 || state.audio_popup_open
                 || state.bluetooth_popup_open
                 || state.network_popup_open
+                || state.calendar_popup_open
             {
                 if state.menu_navigation.is_some() {
                     teardown_navigation(state, registry);
@@ -1297,6 +1300,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.audio_drag_input = false;
                 state.bluetooth_popup_open = false;
                 state.network_popup_open = false;
+                state.calendar_popup_open = false;
+                state.calendar_popup_output = None;
                 true
             } else {
                 false
@@ -1305,6 +1310,7 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
         Event::PassivePopupDismissRequested {
             ai_usage,
             notification_center,
+            calendar,
         } => {
             let mut changed = false;
             if ai_usage && state.ai_usage_popup.take().is_some() {
@@ -1313,7 +1319,49 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             if notification_center && state.notification_center_open.take().is_some() {
                 changed = true;
             }
+            if calendar && state.calendar_popup_open {
+                state.calendar_popup_open = false;
+                state.calendar_popup_output = None;
+                changed = true;
+            }
             changed
+        }
+        Event::CalendarPopupToggledAt(output) => {
+            if state.calendar_popup_open && state.calendar_popup_output == Some(output) {
+                state.calendar_popup_open = false;
+                state.calendar_popup_output = None;
+            } else {
+                state.calendar_popup_open = true;
+                state.calendar_popup_output = Some(output);
+                if let Some(clock) = state.clock {
+                    state.calendar_year = clock.year;
+                    state.calendar_month = clock.month;
+                }
+                state.audio_popup_open = false;
+                state.bluetooth_popup_open = false;
+                state.network_popup_open = false;
+                state.ai_usage_popup = None;
+                dismiss_menu_presentation(state);
+            }
+            true
+        }
+        Event::CalendarPreviousMonth => {
+            if !state.calendar_popup_open {
+                false
+            } else {
+                (state.calendar_year, state.calendar_month) =
+                    crate::calendar::shift_month(state.calendar_year, state.calendar_month, -1);
+                true
+            }
+        }
+        Event::CalendarNextMonth => {
+            if !state.calendar_popup_open {
+                false
+            } else {
+                (state.calendar_year, state.calendar_month) =
+                    crate::calendar::shift_month(state.calendar_year, state.calendar_month, 1);
+                true
+            }
         }
         Event::TrayMenuOpenRequestedAt { endpoint, output } => {
             state.menu_popup_output = Some(output);
@@ -1328,6 +1376,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             state.audio_popup_open = false;
             state.bluetooth_popup_open = false;
             state.network_popup_open = false;
+            state.calendar_popup_open = false;
+            state.calendar_popup_output = None;
             state.audio_dragging = false;
             state.audio_drag_input = false;
             changed
@@ -1639,6 +1689,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.bluetooth_popup_open = false;
                 state.menu = MenuState::NoMenu;
                 state.menu_interaction = Default::default();
+                state.calendar_popup_open = false;
+                state.calendar_popup_output = None;
             }
             true
         }
@@ -1698,6 +1750,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.bluetooth_popup_open = false;
                 state.network_popup_open = false;
                 state.network_popup_open_pending = false;
+                state.calendar_popup_open = false;
+                state.calendar_popup_output = None;
                 dismiss_menu_presentation(state);
             } else {
                 return false;
@@ -1736,6 +1790,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
                 state.audio_drag_input = false;
                 dismiss_menu_presentation(state);
                 state.network_popup_open = false;
+                state.calendar_popup_open = false;
+                state.calendar_popup_output = None;
             }
             true
         }
@@ -1783,6 +1839,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             changed || before_groups != state.expanded_notification_groups.len()
         }
         Event::ToggleNotificationCenter(output) => {
+            state.calendar_popup_open = false;
+            state.calendar_popup_output = None;
             state.notification_center_open = match state.notification_center_open {
                 None => Some(output),
                 Some(current) if current == output => None,
@@ -1791,6 +1849,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             true
         }
         Event::EnsureNotificationCenterOpen { output, target } => {
+            state.calendar_popup_open = false;
+            state.calendar_popup_output = None;
             let expansion_changed = target
                 .and_then(|history_id| {
                     super::notification_group_for_history_id(
@@ -1838,6 +1898,8 @@ pub fn reduce(state: &mut State, event: Event, registry: &mut MenuRegistry) -> b
             if state.audio_popup_open {
                 state.bluetooth_popup_open = false;
                 state.network_popup_open = false;
+                state.calendar_popup_open = false;
+                state.calendar_popup_output = None;
                 dismiss_menu_presentation(state);
             }
             true
@@ -2982,6 +3044,8 @@ mod tests {
             focused_workspace: Some("1".into()),
             workspaces: vec![ws("1", true)],
             clock: Some(super::super::ClockState {
+                year: 2025,
+                weekday: 1,
                 hour: 12,
                 minute: 1,
                 day: 1,
@@ -3538,6 +3602,8 @@ mod tests {
     #[test]
     fn identical_clock_update_does_not_dirty() {
         let clock = super::super::ClockState {
+            year: 2025,
+            weekday: 0,
             hour: 18,
             minute: 42,
             day: 31,
@@ -5735,6 +5801,7 @@ mod tests {
             Event::PassivePopupDismissRequested {
                 ai_usage: true,
                 notification_center: false,
+                calendar: false,
             },
             &mut registry,
         ));
@@ -5745,6 +5812,7 @@ mod tests {
             Event::PassivePopupDismissRequested {
                 ai_usage: false,
                 notification_center: true,
+                calendar: false,
             },
             &mut registry,
         ));
@@ -5754,9 +5822,62 @@ mod tests {
             Event::PassivePopupDismissRequested {
                 ai_usage: true,
                 notification_center: true,
+                calendar: false,
             },
             &mut registry,
         ));
+    }
+
+    #[test]
+    fn calendar_toggle_navigation_and_outside_dismiss_are_output_owned() {
+        let mut state = State {
+            clock: Some(super::super::ClockState {
+                year: 2026,
+                weekday: 1,
+                hour: 11,
+                minute: 52,
+                day: 21,
+                month: 9,
+            }),
+            ..State::default()
+        };
+        let mut registry = MenuRegistry::default();
+        let output = OutputId(7);
+        assert!(reduce(
+            &mut state,
+            Event::CalendarPopupToggledAt(output),
+            &mut registry
+        ));
+        assert!(state.calendar_popup_open);
+        assert_eq!(state.calendar_popup_output, Some(output));
+        assert_eq!((state.calendar_year, state.calendar_month), (2026, 9));
+        assert!(reduce(
+            &mut state,
+            Event::CalendarPreviousMonth,
+            &mut registry
+        ));
+        assert_eq!((state.calendar_year, state.calendar_month), (2026, 8));
+        assert!(reduce(
+            &mut state,
+            Event::CalendarPopupToggledAt(output),
+            &mut registry
+        ));
+        assert!(!state.calendar_popup_open);
+        assert!(reduce(
+            &mut state,
+            Event::CalendarPopupToggledAt(output),
+            &mut registry
+        ));
+        assert!(reduce(
+            &mut state,
+            Event::PassivePopupDismissRequested {
+                ai_usage: false,
+                notification_center: false,
+                calendar: true,
+            },
+            &mut registry,
+        ));
+        assert!(!state.calendar_popup_open);
     }
 
     #[test]

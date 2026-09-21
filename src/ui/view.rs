@@ -691,10 +691,7 @@ fn truncate_text<M: TextMeasurer>(text: &str, width: u16, measurer: &M) -> Optio
 }
 
 pub fn format_clock(clock: &ClockState) -> String {
-    format!(
-        "{:02}:{:02} {:02}/{:02}",
-        clock.hour, clock.minute, clock.day, clock.month
-    )
+    crate::calendar::format_clock(clock)
 }
 
 /// DBusMenu uses `_x` for a mnemonic and `__` for a literal underscore.
@@ -778,6 +775,8 @@ mod tests {
             &workspace(),
             None,
             Some(&ClockState {
+                year: 2025,
+                weekday: 1,
                 hour: 12,
                 minute: 34,
                 day: 1,
@@ -1056,17 +1055,21 @@ mod tests {
     #[test]
     fn formats_clock_with_zero_padding() {
         let clock = ClockState {
+            year: 2025,
+            weekday: 1,
             hour: 8,
             minute: 3,
             day: 1,
             month: 9,
         };
-        assert_eq!(format_clock(&clock), "08:03 01/09");
+        assert_eq!(format_clock(&clock), "segunda-feira 01/09 08:03");
     }
 
     #[test]
     fn datetime_is_last_and_stays_at_output_edge() {
         let clock = ClockState {
+            year: 2025,
+            weekday: 0,
             hour: 18,
             minute: 42,
             day: 31,
@@ -1074,7 +1077,7 @@ mod tests {
         };
         let view = context_view(&output(640), &workspace(), None, Some(&clock), &[]);
         let datetime = view.datetime.unwrap();
-        assert_eq!(datetime.text, "18:42 31/08");
+        assert_eq!(datetime.text, "domingo 31/08 18:42");
         let notification = view.notification.rect;
         assert_eq!(
             notification.x,
@@ -1092,6 +1095,8 @@ mod tests {
     #[test]
     fn notification_indicator_is_single_final_right_item_for_empty_and_nonempty_history() {
         let clock = ClockState {
+            year: 2025,
+            weekday: 0,
             hour: 18,
             minute: 42,
             day: 31,
@@ -1122,13 +1127,15 @@ mod tests {
     #[test]
     fn focused_app_name_is_after_workspace_and_clipped() {
         let clock = ClockState {
+            year: 2025,
+            weekday: 0,
             hour: 18,
             minute: 42,
             day: 31,
             month: 8,
         };
         let view = context_view_with_app_name(
-            &output(240),
+            &output(360),
             &workspace(),
             None,
             Some(&clock),
@@ -1166,6 +1173,8 @@ mod tests {
     #[test]
     fn datetime_priority_preserves_workspace_when_menu_is_too_large() {
         let clock = ClockState {
+            year: 2025,
+            weekday: 0,
             hour: 18,
             minute: 42,
             day: 31,
@@ -1190,27 +1199,33 @@ mod tests {
     fn datetime_formats_date_boundaries() {
         assert_eq!(
             format_clock(&ClockState {
+                year: 2025,
+                weekday: 3,
                 hour: 23,
                 minute: 59,
                 day: 31,
                 month: 12,
             }),
-            "23:59 31/12"
+            "quarta-feira 31/12 23:59"
         );
         assert_eq!(
             format_clock(&ClockState {
+                year: 2025,
+                weekday: 3,
                 hour: 0,
                 minute: 0,
                 day: 1,
                 month: 1,
             }),
-            "00:00 01/01"
+            "quarta-feira 01/01 00:00"
         );
     }
 
     #[test]
     fn datetime_can_render_before_first_workspace_snapshot() {
         let clock = ClockState {
+            year: 2025,
+            weekday: 1,
             hour: 8,
             minute: 3,
             day: 1,
@@ -1218,12 +1233,14 @@ mod tests {
         };
         let view = context_view(&output(640), &[], None, Some(&clock), &[]);
         assert!(view.workspaces.is_empty());
-        assert_eq!(view.datetime.unwrap().text, "08:03 01/09");
+        assert_eq!(view.datetime.unwrap().text, "segunda-feira 01/09 08:03");
     }
 
     #[test]
     fn active_tray_item_occupies_future_area_before_datetime() {
         let clock = ClockState {
+            year: 2025,
+            weekday: 0,
             hour: 18,
             minute: 42,
             day: 31,
@@ -1262,6 +1279,8 @@ mod tests {
             &workspace(),
             None,
             Some(&ClockState {
+                year: 2025,
+                weekday: 1,
                 hour: 12,
                 minute: 34,
                 day: 1,
@@ -1341,6 +1360,8 @@ mod tests {
             &workspace(),
             None,
             Some(&ClockState {
+                year: 2025,
+                weekday: 1,
                 hour: 12,
                 minute: 34,
                 day: 1,
@@ -1358,6 +1379,8 @@ mod tests {
             &workspace(),
             None,
             Some(&ClockState {
+                year: 2025,
+                weekday: 1,
                 hour: 12,
                 minute: 34,
                 day: 1,

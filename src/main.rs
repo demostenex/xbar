@@ -1,4 +1,5 @@
 mod audio;
+mod calendar;
 mod clock;
 mod config;
 mod core;
@@ -585,6 +586,26 @@ fn run() -> Result<(), Box<dyn Error>> {
                     id: *id,
                     output: *output,
                 },
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::DateTime(output)),
+                ) => Event::CalendarPopupToggledAt(*output),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::CalendarPrevious),
+                ) => Event::CalendarPreviousMonth,
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
+                    Some(platform::x11::HitTarget::CalendarNext),
+                ) => Event::CalendarNextMonth,
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { .. }),
+                    Some(platform::x11::HitTarget::CalendarInside),
+                ) => event.clone(),
+                (
+                    Event::X11(platform::x11::X11Event::ButtonPress { .. }),
+                    Some(platform::x11::HitTarget::CalendarDay(_)),
+                ) => event.clone(),
                 (
                     Event::X11(platform::x11::X11Event::ButtonPress { button: 1, .. }),
                     Some(platform::x11::HitTarget::AiUsage(plugin, output)),
@@ -1747,6 +1768,8 @@ fn run() -> Result<(), Box<dyn Error>> {
 enum PassiveCoreTarget {
     AiOpener,
     AiPopupInside,
+    CalendarOpener,
+    CalendarInside,
     NotificationCenter,
     OtherXbar,
     External,
@@ -1756,6 +1779,11 @@ fn passive_core_target(target: &HitTarget) -> PassiveCoreTarget {
     match target {
         HitTarget::AiUsage(_, _) => PassiveCoreTarget::AiOpener,
         HitTarget::AiUsageInside => PassiveCoreTarget::AiPopupInside,
+        HitTarget::DateTime(_) => PassiveCoreTarget::CalendarOpener,
+        HitTarget::CalendarInside
+        | HitTarget::CalendarPrevious
+        | HitTarget::CalendarNext
+        | HitTarget::CalendarDay(_) => PassiveCoreTarget::CalendarInside,
         HitTarget::NotificationCenter(_)
         | HitTarget::NotificationCenterCard(_)
         | HitTarget::NotificationCenterDismiss(_)
@@ -1778,8 +1806,9 @@ fn eligible_passive_raw_button(detail: u32) -> bool {
 fn passive_dismiss_for_targets(
     ai_open: bool,
     notification_open: bool,
+    calendar_open: bool,
     core_targets: &[PassiveCoreTarget],
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let ai_protected = core_targets.iter().any(|target| {
         matches!(
             target,
@@ -1787,9 +1816,16 @@ fn passive_dismiss_for_targets(
         )
     });
     let notification_protected = core_targets.contains(&PassiveCoreTarget::NotificationCenter);
+    let calendar_protected = core_targets.iter().any(|target| {
+        matches!(
+            target,
+            PassiveCoreTarget::CalendarOpener | PassiveCoreTarget::CalendarInside
+        )
+    });
     (
         ai_open && !ai_protected,
         notification_open && !notification_protected,
+        calendar_open && !calendar_protected,
     )
 }
 
@@ -1811,10 +1847,15 @@ fn passive_core_targets_for_timestamp(
         .collect()
 }
 
-fn passive_dismiss_event(ai_usage: bool, notification_center: bool) -> Option<Event> {
-    (ai_usage || notification_center).then_some(Event::PassivePopupDismissRequested {
+fn passive_dismiss_event(
+    ai_usage: bool,
+    notification_center: bool,
+    calendar: bool,
+) -> Option<Event> {
+    (ai_usage || notification_center || calendar).then_some(Event::PassivePopupDismissRequested {
         ai_usage,
         notification_center,
+        calendar,
     })
 }
 
@@ -1858,41 +1899,48 @@ fn prepare_passive_batch(events: &mut Vec<Event>, state: &State, x11: &X11Platfo
 
     let ai_open = state.ai_usage_popup.is_some();
     let notification_open = state.notification_center_open.is_some();
-    let mut insertions = HashMap::<usize, (bool, bool)>::new();
+    let calendar_open = state.calendar_popup_open;
+    let mut insertions = HashMap::<usize, (bool, bool, bool)>::new();
     for (raw_index, timestamp) in &raw_presses {
         let targets = passive_core_targets_for_timestamp(&cores, *timestamp);
         if targets.is_empty() {
-            let (dismiss_ai, dismiss_notification) =
-                passive_dismiss_for_targets(ai_open, notification_open, &[]);
-            if dismiss_ai || dismiss_notification {
-                insertions.insert(*raw_index, (dismiss_ai, dismiss_notification));
+            let (dismiss_ai, dismiss_notification, dismiss_calendar) =
+                passive_dismiss_for_targets(ai_open, notification_open, calendar_open, &[]);
+            if dismiss_ai || dismiss_notification || dismiss_calendar {
+                insertions.insert(
+                    *raw_index,
+                    (dismiss_ai, dismiss_notification, dismiss_calendar),
+                );
             }
             continue;
         }
-        let (dismiss_ai, dismiss_notification) =
-            passive_dismiss_for_targets(ai_open, notification_open, &targets);
+        let (dismiss_ai, dismiss_notification, dismiss_calendar) =
+            passive_dismiss_for_targets(ai_open, notification_open, calendar_open, &targets);
         if let Some(index) = cores
             .iter()
             .filter(|core| core.timestamp == *timestamp)
             .map(|core| core.index)
             .min()
         {
-            if dismiss_ai || dismiss_notification {
+            if dismiss_ai || dismiss_notification || dismiss_calendar {
                 insertions
                     .entry(index)
                     .and_modify(|flags| {
                         flags.0 |= dismiss_ai;
                         flags.1 |= dismiss_notification;
+                        flags.2 |= dismiss_calendar;
                     })
-                    .or_insert((dismiss_ai, dismiss_notification));
+                    .or_insert((dismiss_ai, dismiss_notification, dismiss_calendar));
             }
         }
     }
 
     let mut insertions = insertions.into_iter().collect::<Vec<_>>();
     insertions.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
-    for (index, (dismiss_ai, dismiss_notification)) in insertions {
-        if let Some(dismiss) = passive_dismiss_event(dismiss_ai, dismiss_notification) {
+    for (index, (dismiss_ai, dismiss_notification, dismiss_calendar)) in insertions {
+        if let Some(dismiss) =
+            passive_dismiss_event(dismiss_ai, dismiss_notification, dismiss_calendar)
+        {
             events.insert(index, dismiss);
         }
     }
@@ -1965,6 +2013,7 @@ fn render_target_for(
         Event::PassivePopupDismissRequested {
             ai_usage,
             notification_center,
+            calendar,
         } => {
             let mut target = None;
             if *ai_usage {
@@ -1972,6 +2021,9 @@ fn render_target_for(
             }
             if *notification_center {
                 target = merge_render_target(target, Some(RenderTarget::Notification));
+            }
+            if *calendar {
+                target = merge_render_target(target, Some(RenderTarget::Popup));
             }
             target
         }
@@ -1991,6 +2043,9 @@ fn render_target_for(
         }
         Event::ActiveAiUsageChanged(_) => Some(RenderTarget::PluginZone),
         Event::AiUsagePopupToggled { .. } => Some(RenderTarget::Popup),
+        Event::CalendarPopupToggledAt(_)
+        | Event::CalendarPreviousMonth
+        | Event::CalendarNextMonth => Some(RenderTarget::Popup),
         Event::StatusNotifierRegistered(_)
         | Event::StatusNotifierUnregistered(_)
         | Event::StatusNotifierOwnerVanished(_)
@@ -2072,6 +2127,10 @@ fn hover_render_target_for(
         Some(HitTarget::TopLevel(_, _)) => Some(RenderTarget::DockContext),
         Some(HitTarget::AiUsage(_, _)) => None,
         Some(HitTarget::AiUsageInside) => None,
+        Some(HitTarget::DateTime(_)) | Some(HitTarget::CalendarInside) => None,
+        Some(HitTarget::CalendarPrevious)
+        | Some(HitTarget::CalendarNext)
+        | Some(HitTarget::CalendarDay(_)) => Some(RenderTarget::Popup),
         Some(HitTarget::Outside) | None => outside_target,
         Some(HitTarget::Tray(_, _)) => None,
         Some(HitTarget::AudioTrack) | Some(HitTarget::AudioInputTrack) => Some(RenderTarget::Popup),
@@ -2277,34 +2336,47 @@ mod scheduler_tests {
     #[test]
     fn passive_dismiss_classification_respects_protected_targets() {
         assert_eq!(
-            passive_dismiss_for_targets(true, false, &[PassiveCoreTarget::External]),
-            (true, false)
+            passive_dismiss_for_targets(true, false, false, &[PassiveCoreTarget::External]),
+            (true, false, false)
         );
         assert_eq!(
-            passive_dismiss_for_targets(false, true, &[PassiveCoreTarget::External]),
-            (false, true)
+            passive_dismiss_for_targets(false, true, false, &[PassiveCoreTarget::External]),
+            (false, true, false)
         );
         assert_eq!(
-            passive_dismiss_for_targets(true, true, &[PassiveCoreTarget::External]),
-            (true, true)
+            passive_dismiss_for_targets(true, true, false, &[PassiveCoreTarget::External]),
+            (true, true, false)
         );
         assert_eq!(
-            passive_dismiss_for_targets(true, false, &[PassiveCoreTarget::AiOpener]),
-            (false, false)
+            passive_dismiss_for_targets(true, false, false, &[PassiveCoreTarget::AiOpener]),
+            (false, false, false)
         );
         assert_eq!(
-            passive_dismiss_for_targets(false, true, &[PassiveCoreTarget::NotificationCenter]),
-            (false, false)
+            passive_dismiss_for_targets(
+                false,
+                true,
+                false,
+                &[PassiveCoreTarget::NotificationCenter]
+            ),
+            (false, false, false)
         );
         assert_eq!(
-            passive_dismiss_for_targets(true, true, &[PassiveCoreTarget::AiPopupInside]),
-            (false, true)
+            passive_dismiss_for_targets(true, true, false, &[PassiveCoreTarget::AiPopupInside]),
+            (false, true, false)
         );
         assert_eq!(
-            passive_dismiss_for_targets(true, true, &[PassiveCoreTarget::NotificationCenter]),
-            (true, false)
+            passive_dismiss_for_targets(
+                true,
+                true,
+                false,
+                &[PassiveCoreTarget::NotificationCenter]
+            ),
+            (true, false, false)
         );
-        assert_eq!(passive_dismiss_for_targets(true, false, &[]), (true, false));
+        assert_eq!(
+            passive_dismiss_for_targets(true, false, false, &[]),
+            (true, false, false)
+        );
     }
 
     #[test]
@@ -2323,9 +2395,10 @@ mod scheduler_tests {
             passive_dismiss_for_targets(
                 true,
                 false,
+                false,
                 &passive_core_targets_for_timestamp(&raw_then_core, 77)
             ),
-            (true, false)
+            (true, false, false)
         );
     }
 

@@ -89,6 +89,7 @@ pub enum Event {
     PassivePopupDismissRequested {
         ai_usage: bool,
         notification_center: bool,
+        calendar: bool,
     },
     PinCurrentMenuPresentation,
     UnpinMenuPresentation,
@@ -220,6 +221,9 @@ pub enum Event {
     },
     AudioPopupToggled,
     AudioPopupToggledAt(super::OutputId),
+    CalendarPopupToggledAt(super::OutputId),
+    CalendarPreviousMonth,
+    CalendarNextMonth,
     AudioTrackChanged {
         input: bool,
         percent: u32,

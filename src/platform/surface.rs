@@ -16,6 +16,7 @@ pub(crate) enum SurfaceRole {
     NetworkPopup,
     BluetoothPopup,
     AudioPopup,
+    CalendarPopup,
     AiUsagePopup,
     Notification,
 }
@@ -124,6 +125,7 @@ impl SurfaceRole {
             | Self::NetworkPopup
             | Self::BluetoothPopup
             | Self::AudioPopup => FramePolicy::Request,
+            Self::CalendarPopup => FramePolicy::Request,
             Self::AiUsagePopup => FramePolicy::Request,
             Self::Notification => FramePolicy::Default,
             Self::Dock => FramePolicy::Suppress,
@@ -142,6 +144,7 @@ impl SurfaceRole {
                 | Self::BluetoothPopup
                 | Self::AudioPopup
                 | Self::AiUsagePopup
+                | Self::CalendarPopup
                 | Self::Notification,
                 SurfaceKind::Argb,
             ) => Some(SurfaceEffect::BlurBehind),
@@ -159,6 +162,7 @@ impl SurfaceRole {
                 | Self::BluetoothPopup
                 | Self::AudioPopup
                 | Self::AiUsagePopup
+                | Self::CalendarPopup
                 | Self::Notification
         )
     }
@@ -172,6 +176,7 @@ impl SurfaceRole {
                 | Self::BluetoothPopup
                 | Self::AudioPopup
                 | Self::AiUsagePopup
+                | Self::CalendarPopup
         )
     }
 }

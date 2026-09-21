@@ -25,6 +25,8 @@ pub struct WorkspaceState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClockState {
+    pub year: i32,
+    pub weekday: u8,
     pub hour: u8,
     pub minute: u8,
     pub day: u8,
@@ -726,6 +728,10 @@ pub struct State {
     pub ai_usage_popup: Option<(PluginId, OutputId)>,
     pub audio_popup_open: bool,
     pub audio_popup_output: Option<OutputId>,
+    pub calendar_popup_open: bool,
+    pub calendar_popup_output: Option<OutputId>,
+    pub calendar_year: i32,
+    pub calendar_month: u8,
     pub notifications: Vec<Notification>,
     pub notification_history: Vec<NotificationHistoryEntry>,
     pub notification_action_projections: Vec<NotificationActionProjection>,

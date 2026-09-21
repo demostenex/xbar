@@ -608,6 +608,8 @@ pub struct X11Platform {
     bluetooth_backing: Option<PopupBacking>,
     network_popup: Option<NetworkPopupWindow>,
     network_backing: Option<PopupBacking>,
+    calendar_popup: Option<CalendarPopupWindow>,
+    calendar_backing: Option<PopupBacking>,
     ai_usage_popup: Option<AiUsagePopupWindow>,
     ai_usage_backing: Option<PopupBacking>,
     popup_hover: Option<PopupHover>,
@@ -782,6 +784,14 @@ struct AudioPopupWindow {
     input_devices: Vec<layout::AudioDeviceRow>,
 }
 
+struct CalendarPopupWindow {
+    window: u32,
+    rect: layout::MenuRect,
+    previous: layout::MenuRect,
+    next: layout::MenuRect,
+    cells: Vec<(Option<u8>, layout::MenuRect)>,
+}
+
 #[derive(Clone, Copy)]
 struct PopupBacking {
     pixmap: u32,
@@ -936,6 +946,9 @@ enum PopupHover {
     BluetoothManager,
     NetworkWifi(NetworkWifiTarget),
     NetworkWireless,
+    CalendarPrevious,
+    CalendarNext,
+    CalendarDay(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -943,6 +956,7 @@ enum BarPopupSource {
     Audio,
     Bluetooth,
     Network,
+    Calendar,
 }
 struct NotificationWindow {
     window: u32,
@@ -1217,6 +1231,27 @@ const BLUETOOTH_ROW_GAP: u16 = 2;
 const BLUETOOTH_ACTION_GAP: u16 = 10;
 const BLUETOOTH_ACTION_HEIGHT: u16 = 28;
 const BLUETOOTH_MANAGER_LABEL: &str = "Mais configurações…";
+const CALENDAR_WIDTH: u16 = 244;
+const CALENDAR_OUTER_PADDING: u16 = 8;
+const CALENDAR_HEADER_HEIGHT: u16 = 28;
+const CALENDAR_HEADER_WEEKDAY_GAP: u16 = 2;
+const CALENDAR_WEEKDAY_HEIGHT: u16 = 18;
+const CALENDAR_WEEKDAY_GRID_GAP: u16 = 2;
+const CALENDAR_CELL_WIDTH: u16 = 32;
+const CALENDAR_CELL_HEIGHT: u16 = 24;
+const CALENDAR_NAV_WIDTH: u16 = 22;
+const CALENDAR_NAV_HEIGHT: u16 = 20;
+const CALENDAR_TODAY_WIDTH: u16 = 22;
+const CALENDAR_TODAY_HEIGHT: u16 = 20;
+
+const fn calendar_popup_height(rows: u8) -> u16 {
+    CALENDAR_OUTER_PADDING * 2
+        + CALENDAR_HEADER_HEIGHT
+        + CALENDAR_HEADER_WEEKDAY_GAP
+        + CALENDAR_WEEKDAY_HEIGHT
+        + CALENDAR_WEEKDAY_GRID_GAP
+        + rows as u16 * CALENDAR_CELL_HEIGHT
+}
 
 const fn audio_control_card_height() -> u16 {
     AUDIO_CARD_TOP_PADDING
@@ -2473,6 +2508,7 @@ type BarHitMap = (
     Option<view::NetworkVisual>,
     Option<view::AudioVisual>,
     Option<view::BluetoothVisual>,
+    Option<view::DateTimeVisual>,
 );
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2508,6 +2544,11 @@ pub enum HitTarget {
     BluetoothManager,
     BluetoothInside,
     Network(OutputId),
+    DateTime(OutputId),
+    CalendarPrevious,
+    CalendarNext,
+    CalendarDay(usize),
+    CalendarInside,
     NetworkWifi(NetworkWifiTarget),
     NetworkWireless,
     NetworkInside,
@@ -2963,17 +3004,20 @@ impl X11Platform {
         self.bar_hits
             .iter()
             .find(|(_, id, ..)| *id == output_id)
-            .and_then(|(_, _, _, _, _, _, _, network, audio, bluetooth)| {
-                let rect = match source {
-                    BarPopupSource::Audio => audio.as_ref().map(|visual| visual.rect),
-                    BarPopupSource::Bluetooth => bluetooth.as_ref().map(|visual| visual.rect),
-                    BarPopupSource::Network => network.as_ref().map(|visual| visual.rect),
-                }?;
-                Some(layout::PopupAnchor {
-                    output_id,
-                    source_rect: rect,
-                })
-            })
+            .and_then(
+                |(_, _, _, _, _, _, _, network, audio, bluetooth, datetime)| {
+                    let rect = match source {
+                        BarPopupSource::Audio => audio.as_ref().map(|visual| visual.rect),
+                        BarPopupSource::Bluetooth => bluetooth.as_ref().map(|visual| visual.rect),
+                        BarPopupSource::Network => network.as_ref().map(|visual| visual.rect),
+                        BarPopupSource::Calendar => datetime.as_ref().map(|visual| visual.rect),
+                    }?;
+                    Some(layout::PopupAnchor {
+                        output_id,
+                        source_rect: rect,
+                    })
+                },
+            )
     }
 
     fn ai_usage_popup_anchor(
@@ -3580,6 +3624,8 @@ impl X11Platform {
             bluetooth_backing: None,
             network_popup: None,
             network_backing: None,
+            calendar_popup: None,
+            calendar_backing: None,
             ai_usage_popup: None,
             ai_usage_backing: None,
             popup_hover: None,
@@ -3951,6 +3997,7 @@ impl X11Platform {
             + usize::from(self.audio_popup.is_some())
             + usize::from(self.bluetooth_popup.is_some())
             + usize::from(self.network_popup.is_some())
+            + usize::from(self.calendar_popup.is_some())
             + usize::from(self.ai_usage_popup.is_some())
     }
 
@@ -3989,6 +4036,10 @@ impl X11Platform {
                 .is_some_and(|popup| popup.window == window)
             || self
                 .network_popup
+                .as_ref()
+                .is_some_and(|popup| popup.window == window)
+            || self
+                .calendar_popup
                 .as_ref()
                 .is_some_and(|popup| popup.window == window)
             || self
@@ -4930,7 +4981,11 @@ impl X11Platform {
             if !self.hover_repaint_active {
                 self.reconcile_interactive_popup_surfaces(state)?;
             }
-            if !state.audio_popup_open && !state.bluetooth_popup_open && !state.network_popup_open {
+            if !state.audio_popup_open
+                && !state.bluetooth_popup_open
+                && !state.network_popup_open
+                && !state.calendar_popup_open
+            {
                 // RenderTarget::Popup is shared by several popup domains. A
                 // None plan means this frame has no Global Menu work; only an
                 // explicit plan or topology reconciliation may select windows.
@@ -4956,6 +5011,7 @@ impl X11Platform {
                 self.render_audio_popup(state)?;
             }
             self.render_ai_usage_popup(state)?;
+            self.render_calendar_popup(state)?;
             self.hover_repaint_active = false;
         }
         if target.contains(RenderTarget::NOTIFICATION) {
@@ -4977,6 +5033,8 @@ impl X11Platform {
             "Bluetooth"
         } else if state.network_popup_open {
             "Network"
+        } else if state.calendar_popup_open {
+            "Calendar"
         } else if state.menu_interaction.open_root.is_some() {
             "Menu"
         } else if state.ai_usage_popup.is_some() {
@@ -4988,34 +5046,47 @@ impl X11Platform {
             "Audio" => {
                 self.bluetooth_popup.is_some()
                     || self.network_popup.is_some()
+                    || self.calendar_popup.is_some()
                     || !self.popups.is_empty()
             }
             "Bluetooth" => {
                 self.audio_popup.is_some()
                     || self.network_popup.is_some()
+                    || self.calendar_popup.is_some()
                     || !self.popups.is_empty()
             }
             "Network" => {
                 self.audio_popup.is_some()
                     || self.bluetooth_popup.is_some()
+                    || self.calendar_popup.is_some()
                     || !self.popups.is_empty()
             }
-            "Menu" => {
-                self.audio_popup.is_some()
-                    || self.bluetooth_popup.is_some()
-                    || self.network_popup.is_some()
-            }
-            "None" => {
+            "Calendar" => {
                 self.audio_popup.is_some()
                     || self.bluetooth_popup.is_some()
                     || self.network_popup.is_some()
                     || !self.popups.is_empty()
                     || self.ai_usage_popup.is_some()
             }
+            "Menu" => {
+                self.audio_popup.is_some()
+                    || self.bluetooth_popup.is_some()
+                    || self.network_popup.is_some()
+                    || self.calendar_popup.is_some()
+            }
+            "None" => {
+                self.audio_popup.is_some()
+                    || self.bluetooth_popup.is_some()
+                    || self.network_popup.is_some()
+                    || !self.popups.is_empty()
+                    || self.calendar_popup.is_some()
+                    || self.ai_usage_popup.is_some()
+            }
             "AiUsage" => {
                 self.audio_popup.is_some()
                     || self.bluetooth_popup.is_some()
                     || self.network_popup.is_some()
+                    || self.calendar_popup.is_some()
                     || !self.popups.is_empty()
             }
             _ => false,
@@ -6637,6 +6708,7 @@ impl X11Platform {
                 context.network.clone(),
                 context.audio.clone(),
                 context.bluetooth.clone(),
+                context.datetime.clone(),
             ));
             self.notification_hits
                 .push((bar_window, bar_output, context.notification.rect));
@@ -7073,6 +7145,16 @@ impl X11Platform {
                 eprintln!("xbar trace: UNMAP popup=Network xid={}", popup.window);
             }
         }
+        if let Some(popup) = self.calendar_popup.take() {
+            self.text.release_drawable(popup.window);
+            trace_x11_resource("WINDOW_DESTROY", "calendar-popup", popup.window);
+            self.conn.destroy_window(popup.window)?.check()?;
+            if let Some(backing) = self.calendar_backing.take() {
+                self.text.release_drawable(backing.pixmap);
+                self.conn.free_gc(backing.gc)?.check()?;
+                self.conn.free_pixmap(backing.pixmap)?.check()?;
+            }
+        }
         if let Some(popup) = self.ai_usage_popup.take() {
             self.text.release_drawable(popup.window);
             trace_x11_resource("WINDOW_DESTROY", "ai-usage-popup", popup.window);
@@ -7382,6 +7464,308 @@ impl X11Platform {
                 rect.height,
             )?
             .check()?;
+        Ok(())
+    }
+
+    fn render_calendar_popup(&mut self, state: &State) -> Result<(), Box<dyn Error>> {
+        if !state.calendar_popup_open {
+            if self.calendar_popup.is_some() {
+                self.close_popups(Some(state))?;
+            }
+            return Ok(());
+        }
+        let output_id = state
+            .calendar_popup_output
+            .ok_or("no calendar popup origin")?;
+        let anchor = self
+            .bar_popup_anchor(output_id, BarPopupSource::Calendar)
+            .ok_or("no datetime bar anchor")?;
+        let output = state
+            .outputs
+            .iter()
+            .find(|output| output.id == output_id)
+            .ok_or("no output for calendar popup")?;
+        let rows = crate::calendar::grid_rows(state.calendar_year, state.calendar_month);
+        let height = calendar_popup_height(rows);
+        let rect = layout::place_bar_popup(
+            anchor,
+            CALENDAR_WIDTH.min(output.width.max(1)),
+            height,
+            output,
+        )
+        .popup_rect;
+        let grid_x = rect.x + CALENDAR_OUTER_PADDING as i16;
+        let grid_y = rect.y
+            + CALENDAR_OUTER_PADDING as i16
+            + CALENDAR_HEADER_HEIGHT as i16
+            + CALENDAR_HEADER_WEEKDAY_GAP as i16
+            + CALENDAR_WEEKDAY_HEIGHT as i16
+            + CALENDAR_WEEKDAY_GRID_GAP as i16;
+        let previous = layout::MenuRect {
+            x: rect.x + CALENDAR_OUTER_PADDING as i16,
+            y: rect.y + 10,
+            width: CALENDAR_NAV_WIDTH,
+            height: CALENDAR_NAV_HEIGHT,
+        };
+        let next = layout::MenuRect {
+            x: rect.x + rect.width as i16
+                - CALENDAR_OUTER_PADDING as i16
+                - CALENDAR_NAV_WIDTH as i16,
+            y: rect.y + 10,
+            width: CALENDAR_NAV_WIDTH,
+            height: CALENDAR_NAV_HEIGHT,
+        };
+        let cells = crate::calendar::grid_days(state.calendar_year, state.calendar_month)
+            .into_iter()
+            .enumerate()
+            .map(|(index, day)| {
+                let col = (index % 7) as i16;
+                let row = (index / 7) as i16;
+                (
+                    day,
+                    layout::MenuRect {
+                        x: grid_x + col * CALENDAR_CELL_WIDTH as i16,
+                        y: grid_y + row * CALENDAR_CELL_HEIGHT as i16,
+                        width: CALENDAR_CELL_WIDTH,
+                        height: CALENDAR_CELL_HEIGHT,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let window = if let Some(popup) = &self.calendar_popup {
+            popup.window
+        } else {
+            let window = self.conn.generate_id()?;
+            trace_x11_resource("WINDOW_CREATE", "calendar-popup", window);
+            self.create_glass_popup_window(
+                SurfaceRole::CalendarPopup,
+                window,
+                rect,
+                POPUP_STYLE.border_width,
+                EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::POINTER_MOTION,
+            )?;
+            self.configure_auxiliary_effect_surface(SurfaceRole::CalendarPopup, window, output.id)?;
+            self.conn.map_window(window)?.check()?;
+            window
+        };
+        self.configure_auxiliary_effect_surface(SurfaceRole::CalendarPopup, window, output.id)?;
+        let resize = self
+            .calendar_popup
+            .as_ref()
+            .is_some_and(|popup| popup.rect != rect);
+        self.calendar_popup = Some(CalendarPopupWindow {
+            window,
+            rect,
+            previous,
+            next,
+            cells: cells.clone(),
+        });
+        let backing_replaced = !backing_matches(
+            self.calendar_backing,
+            rect.width,
+            rect.height,
+            self.glass_surface.depth,
+        );
+        if backing_replaced {
+            let pixmap = self.conn.generate_id()?;
+            self.conn
+                .create_pixmap(
+                    self.glass_surface.depth,
+                    pixmap,
+                    self.root,
+                    rect.width,
+                    rect.height,
+                )?
+                .check()?;
+            let gc = self.conn.generate_id()?;
+            self.conn
+                .create_gc(
+                    gc,
+                    pixmap,
+                    &xproto::CreateGCAux::new().foreground(
+                        self.glass_surface
+                            .background_pixel(POPUP_STYLE.material.background),
+                    ),
+                )?
+                .check()?;
+            if let Some(old) = self.calendar_backing.replace(PopupBacking {
+                pixmap,
+                gc,
+                width: rect.width,
+                height: rect.height,
+                depth: self.glass_surface.depth,
+            }) {
+                self.conn.free_gc(old.gc)?.check()?;
+                self.conn.free_pixmap(old.pixmap)?.check()?;
+            }
+        }
+        let backing = self.calendar_backing.expect("calendar backing created");
+        if resize || backing_replaced {
+            self.conn
+                .configure_window(
+                    window,
+                    &xproto::ConfigureWindowAux::new()
+                        .x(rect.x as i32)
+                        .y(rect.y as i32)
+                        .width(rect.width as u32)
+                        .height(rect.height as u32),
+                )?
+                .check()?;
+        }
+        self.text
+            .prepare_drawable("calendar-popup", backing.pixmap, self.glass_surface)?;
+        let gc = backing.gc;
+        self.fill_glass_background(backing.pixmap, gc, rect.width, rect.height)?;
+        self.draw_popup_frame(backing.pixmap, gc, rect.width, rect.height)?;
+        let title = crate::calendar::format_month(state.calendar_year, state.calendar_month);
+        let title_width = self.text.measure_popup_width(&title);
+        let title_x = rect.x + ((rect.width as i16 - title_width as i16) / 2);
+        self.text.draw_popup_utf8(
+            &title,
+            (title_x - rect.x) as i32,
+            22,
+            POPUP_STYLE.material.foreground,
+        )?;
+        let hover_pixel = self.glass_surface.opaque_pixel(0x3f4958);
+        for (hovered, control) in [
+            (
+                matches!(self.popup_hover, Some(PopupHover::CalendarPrevious)),
+                previous,
+            ),
+            (
+                matches!(self.popup_hover, Some(PopupHover::CalendarNext)),
+                next,
+            ),
+        ] {
+            if hovered {
+                self.conn
+                    .change_gc(gc, &xproto::ChangeGCAux::new().foreground(hover_pixel))?
+                    .check()?;
+                self.fill_rounded_popup_card_with_radius(
+                    backing.pixmap,
+                    gc,
+                    control.x - rect.x,
+                    control.y - rect.y,
+                    control.width,
+                    control.height,
+                    4,
+                )?;
+            }
+        }
+        self.text.draw_popup_utf8(
+            "‹",
+            (previous.x - rect.x + 6) as i32,
+            22,
+            POPUP_STYLE.material.foreground,
+        )?;
+        self.text.draw_popup_utf8(
+            "›",
+            (next.x - rect.x + 6) as i32,
+            22,
+            POPUP_STYLE.material.foreground,
+        )?;
+        for (column, label) in ["D", "S", "T", "Q", "Q", "S", "S"].into_iter().enumerate() {
+            let label_width = self.text.measure_popup_width(label);
+            self.text.draw_popup_utf8(
+                label,
+                (grid_x - rect.x
+                    + column as i16 * CALENDAR_CELL_WIDTH as i16
+                    + ((CALENDAR_CELL_WIDTH - label_width) / 2) as i16) as i32,
+                50,
+                0x9daabd,
+            )?;
+        }
+        self.conn
+            .change_gc(
+                gc,
+                &xproto::ChangeGCAux::new().foreground(self.glass_surface.opaque_pixel(0x3a4352)),
+            )?
+            .check()?;
+        for (day, cell) in &cells {
+            if let Some(day) = day {
+                if state.clock.is_some_and(|clock| {
+                    clock.year == state.calendar_year
+                        && clock.month == state.calendar_month
+                        && clock.day == *day
+                }) {
+                    self.fill_rounded_popup_card_with_radius(
+                        backing.pixmap,
+                        gc,
+                        cell.x - rect.x + ((cell.width - CALENDAR_TODAY_WIDTH) / 2) as i16,
+                        cell.y - rect.y + ((cell.height - CALENDAR_TODAY_HEIGHT) / 2) as i16,
+                        CALENDAR_TODAY_WIDTH,
+                        CALENDAR_TODAY_HEIGHT,
+                        5,
+                    )?;
+                }
+            }
+        }
+        if let Some(PopupHover::CalendarDay(index)) = self.popup_hover {
+            if let Some((Some(day), cell)) = cells.get(index) {
+                let is_today = state.clock.is_some_and(|clock| {
+                    clock.year == state.calendar_year
+                        && clock.month == state.calendar_month
+                        && clock.day == *day
+                });
+                if !is_today {
+                    self.conn
+                        .change_gc(gc, &xproto::ChangeGCAux::new().foreground(hover_pixel))?
+                        .check()?;
+                    self.fill_rounded_popup_card_with_radius(
+                        backing.pixmap,
+                        gc,
+                        cell.x - rect.x + 5,
+                        cell.y - rect.y + 2,
+                        cell.width - 10,
+                        cell.height - 4,
+                        4,
+                    )?;
+                }
+            }
+        }
+        self.conn.flush()?;
+        self.conn.get_input_focus()?.reply()?;
+        for (day, cell) in &cells {
+            if let Some(day) = day {
+                let text = day.to_string();
+                let width = self.text.measure_popup_width(&text);
+                self.text.draw_popup_utf8(
+                    &text,
+                    (cell.x - rect.x + ((cell.width - width) / 2) as i16) as i32,
+                    (cell.y - rect.y + 17) as i32,
+                    POPUP_STYLE.material.foreground,
+                )?;
+            }
+        }
+        self.text.release_drawable(backing.pixmap);
+        self.conn
+            .copy_area(
+                backing.pixmap,
+                window,
+                gc,
+                0,
+                0,
+                0,
+                0,
+                rect.width,
+                rect.height,
+            )?
+            .check()?;
+        if !self.pointer_grabbed {
+            self.conn
+                .grab_pointer(
+                    false,
+                    self.root,
+                    EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+                    xproto::GrabMode::ASYNC,
+                    xproto::GrabMode::ASYNC,
+                    x11rb::NONE,
+                    x11rb::NONE,
+                    0_u32,
+                )?
+                .reply()?;
+            self.pointer_grabbed = true;
+        }
         Ok(())
     }
 
@@ -8609,8 +8993,8 @@ impl X11Platform {
         let Some(top_rect) = self
             .bar_hits
             .iter()
-            .find(|(_, id, _, _, _, _, _, _, _, _)| *id == output_id)
-            .and_then(|(_, _, _, _, items, _, tray, _, _, _)| {
+            .find(|(_, id, _, _, _, _, _, _, _, _, _)| *id == output_id)
+            .and_then(|(_, _, _, _, items, _, tray, _, _, _, _)| {
                 if let Some(endpoint) = tray_endpoint {
                     tray.iter()
                         .find(|item| item.endpoint.service == endpoint.service)
@@ -9134,10 +9518,54 @@ impl X11Platform {
                 return HitTarget::AiUsageInside;
             }
         }
-        if let Some((_bar, output, ox, oy, items, plugins, tray, network, audio, bluetooth)) = self
+        if let Some(popup) = &self.calendar_popup {
+            let inside = popup.window == window
+                || (self.root == window
+                    && root_x >= popup.rect.x
+                    && root_x < popup.rect.x + popup.rect.width as i16
+                    && root_y >= popup.rect.y
+                    && root_y < popup.rect.y + popup.rect.height as i16);
+            if inside {
+                let (px, py) = if self.root == window {
+                    (root_x, root_y)
+                } else {
+                    (x + popup.rect.x, y + popup.rect.y)
+                };
+                if popup.previous.contains(px, py) {
+                    return HitTarget::CalendarPrevious;
+                }
+                if popup.next.contains(px, py) {
+                    return HitTarget::CalendarNext;
+                }
+                if let Some((index, (_, _cell))) = popup
+                    .cells
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (_, cell))| cell.contains(px, py))
+                {
+                    if popup.cells[index].0.is_some() {
+                        return HitTarget::CalendarDay(index);
+                    }
+                }
+                return HitTarget::CalendarInside;
+            }
+        }
+        if let Some((
+            _bar,
+            output,
+            ox,
+            oy,
+            items,
+            plugins,
+            tray,
+            network,
+            audio,
+            bluetooth,
+            datetime,
+        )) = self
             .bar_hits
             .iter()
-            .find(|(bar, _, _, _, _, _, _, _, _, _)| {
+            .find(|(bar, _, _, _, _, _, _, _, _, _, _)| {
                 *bar == window || (self.root == window && root_y < BAR_HEIGHT as i16)
             })
         {
@@ -9194,6 +9622,15 @@ impl X11Platform {
                     && root_y < bluetooth.rect.y + bluetooth.rect.height as i16
                 {
                     return HitTarget::Bluetooth(*output);
+                }
+            }
+            if let Some(datetime) = datetime {
+                if root_x >= datetime.rect.x
+                    && root_x < datetime.rect.x + datetime.rect.width as i16
+                    && root_y >= datetime.rect.y
+                    && root_y < datetime.rect.y + datetime.rect.height as i16
+                {
+                    return HitTarget::DateTime(*output);
                 }
             }
             return tray_hit(tray, root_x, root_y)
@@ -9407,6 +9844,9 @@ fn popup_hover_for(target: Option<&HitTarget>) -> Option<PopupHover> {
         Some(HitTarget::BluetoothManager) => Some(PopupHover::BluetoothManager),
         Some(HitTarget::NetworkWifi(target)) => Some(PopupHover::NetworkWifi(target.clone())),
         Some(HitTarget::NetworkWireless) => Some(PopupHover::NetworkWireless),
+        Some(HitTarget::CalendarPrevious) => Some(PopupHover::CalendarPrevious),
+        Some(HitTarget::CalendarNext) => Some(PopupHover::CalendarNext),
+        Some(HitTarget::CalendarDay(index)) => Some(PopupHover::CalendarDay(*index)),
         _ => None,
     }
 }
@@ -9480,6 +9920,7 @@ impl Drop for X11Platform {
             self.audio_popup.take().map(|popup| popup.window),
             self.bluetooth_popup.take().map(|popup| popup.window),
             self.network_popup.take().map(|popup| popup.window),
+            self.calendar_popup.take().map(|popup| popup.window),
             self.ai_usage_popup.take().map(|popup| popup.window),
             self.instance_window.take(),
         ]
@@ -9603,12 +10044,13 @@ mod tests {
     use super::super::surface::{FramePolicy, SurfaceRole};
     use super::{
         ai_usage_hit_target, ai_usage_popup_anchor_for_plugins, ai_usage_popup_height,
-        backing_matches, bar_backing_matches, blur_behind_rect, classify_attention_property_reply,
-        classify_property_string_reply, effect_owner_property_value, effect_owner_update,
-        format_cache_age, format_reset_at, frame_policy_property_value, install_passive_grabs,
-        is_xbar_owned_window, menu_accelerator_x, menu_popup_dirty_for_interaction_change,
-        menu_popup_slot_for_window, menu_popup_slots_for_item, network_primary_row_label,
-        notification_body_hit, notification_card_content_layout, notification_history_id_for,
+        backing_matches, bar_backing_matches, blur_behind_rect, calendar_popup_height,
+        classify_attention_property_reply, classify_property_string_reply,
+        effect_owner_property_value, effect_owner_update, format_cache_age, format_reset_at,
+        frame_policy_property_value, install_passive_grabs, is_xbar_owned_window,
+        menu_accelerator_x, menu_popup_dirty_for_interaction_change, menu_popup_slot_for_window,
+        menu_popup_slots_for_item, network_primary_row_label, notification_body_hit,
+        notification_card_content_layout, notification_history_id_for,
         notification_hover_transition, notification_icon_source_over_rgb,
         notification_indicator_hit, notification_indicator_rect, notification_previous_scroll,
         notification_scroll_target, notification_text_phase_plan, notification_wheel_direction,
@@ -9620,7 +10062,10 @@ mod tests {
         union_menu_rects, workspace_as_menu, workspace_indicator_rect, AttentionPropertyRead,
         BarBacking, BarWindow, EffectOwnerUpdate, GlobalPinShortcut, HitTarget, MenuPopupDirty,
         PopupBacking, PopupHover, PopupSlot, PopupWindow, RenderTarget, SurfaceWindowGeometry,
-        ToastFitItem, X11Event, X11Platform, BAR_HEIGHT, NOTIFICATION_CARD_SLOT_GAP,
+        ToastFitItem, X11Event, X11Platform, BAR_HEIGHT, CALENDAR_CELL_HEIGHT, CALENDAR_CELL_WIDTH,
+        CALENDAR_HEADER_HEIGHT, CALENDAR_HEADER_WEEKDAY_GAP, CALENDAR_NAV_HEIGHT,
+        CALENDAR_NAV_WIDTH, CALENDAR_OUTER_PADDING, CALENDAR_TODAY_HEIGHT, CALENDAR_TODAY_WIDTH,
+        CALENDAR_WEEKDAY_GRID_GAP, CALENDAR_WEEKDAY_HEIGHT, NOTIFICATION_CARD_SLOT_GAP,
         NOTIFICATION_GROUP_INTERNAL_GAP, NOTIFICATION_OUTER_PADDING,
         XOMPOSITE_FRAME_POLICY_ATOM_NAME,
     };
@@ -14032,5 +14477,73 @@ mod tests {
         let content = super::notification_grouped_content_height(&items);
         assert!(content > 100);
         assert!(super::notification_grouped_max_scroll(&items, 100) > 0);
+    }
+
+    #[test]
+    fn m15a8a_r3_calendar_compact_heights_are_deterministic() {
+        assert_eq!(calendar_popup_height(4), 162);
+        assert_eq!(calendar_popup_height(5), 186);
+        assert_eq!(calendar_popup_height(6), 210);
+        assert_eq!(CALENDAR_OUTER_PADDING, 8);
+        assert_eq!(CALENDAR_CELL_WIDTH, 32);
+        assert_eq!(CALENDAR_CELL_HEIGHT, 24);
+    }
+
+    #[test]
+    fn m15a8a_r3_calendar_vertical_rhythm_and_final_row_fit() {
+        let grid_y = CALENDAR_OUTER_PADDING
+            + CALENDAR_HEADER_HEIGHT
+            + CALENDAR_HEADER_WEEKDAY_GAP
+            + CALENDAR_WEEKDAY_HEIGHT
+            + CALENDAR_WEEKDAY_GRID_GAP;
+        assert_eq!(grid_y, 58);
+        let final_row_y = grid_y + 4 * CALENDAR_CELL_HEIGHT;
+        assert_eq!(final_row_y, 154);
+        assert_eq!(
+            calendar_popup_height(5) - (final_row_y + CALENDAR_CELL_HEIGHT),
+            8
+        );
+    }
+
+    #[test]
+    fn m15a8a_r3_calendar_controls_and_today_chip_stay_inside_cells() {
+        let popup = MenuRect {
+            x: 100,
+            y: 200,
+            width: 244,
+            height: calendar_popup_height(5),
+        };
+        let previous = MenuRect {
+            x: popup.x + CALENDAR_OUTER_PADDING as i16,
+            y: popup.y + 10,
+            width: CALENDAR_NAV_WIDTH,
+            height: CALENDAR_NAV_HEIGHT,
+        };
+        let next = MenuRect {
+            x: popup.x + popup.width as i16
+                - CALENDAR_OUTER_PADDING as i16
+                - CALENDAR_NAV_WIDTH as i16,
+            ..previous
+        };
+        assert_eq!((previous.x - popup.x, previous.y - popup.y), (8, 10));
+        assert_eq!((next.x - popup.x, next.y - popup.y), (214, 10));
+        assert!(previous.x + previous.width as i16 <= popup.x + popup.width as i16);
+        assert!(next.x + next.width as i16 <= popup.x + popup.width as i16);
+
+        let cell = MenuRect {
+            x: popup.x + 32,
+            y: popup.y + 130,
+            width: CALENDAR_CELL_WIDTH,
+            height: CALENDAR_CELL_HEIGHT,
+        };
+        let today = MenuRect {
+            x: cell.x + ((cell.width - CALENDAR_TODAY_WIDTH) / 2) as i16,
+            y: cell.y + ((cell.height - CALENDAR_TODAY_HEIGHT) / 2) as i16,
+            width: CALENDAR_TODAY_WIDTH,
+            height: CALENDAR_TODAY_HEIGHT,
+        };
+        assert!(today.x >= cell.x && today.y >= cell.y);
+        assert!(today.x + today.width as i16 <= cell.x + cell.width as i16);
+        assert!(today.y + today.height as i16 <= cell.y + cell.height as i16);
     }
 }

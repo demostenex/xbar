@@ -32,6 +32,8 @@ impl ClockSource {
             return Err(io::Error::last_os_error());
         }
         Ok(ClockState {
+            year: local.tm_year + 1900,
+            weekday: local.tm_wday as u8,
             hour: local.tm_hour as u8,
             minute: local.tm_min as u8,
             day: local.tm_mday as u8,
